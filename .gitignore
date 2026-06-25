@@ -2,6 +2,9 @@
 .zig-cache/
 zig-out/
 
+# Downloaded model weights
+models/
+
 # Local environment
 .env
 .env.*
