@@ -1,0 +1,41 @@
+{
+  "api_version": 1,
+  "request_id": "fixture-success-001",
+  "ok": true,
+  "events": [
+    {
+      "type": "send_enabled_changed",
+      "request_id": "fixture-success-001",
+      "enabled": false
+    },
+    {
+      "type": "chat_message",
+      "request_id": "fixture-success-001",
+      "role": "brain",
+      "title": "AffectiveCore",
+      "text": "I found one memory about soldering."
+    },
+    {
+      "type": "speech_requested",
+      "request_id": "fixture-success-001",
+      "text": "I found one memory about soldering."
+    },
+    {
+      "type": "send_enabled_changed",
+      "request_id": "fixture-success-001",
+      "enabled": true
+    }
+  ],
+  "result": {
+    "event_type": "speech_transcript",
+    "value": {
+      "conversation_turn": {
+        "user_text": "What do you remember about soldering?",
+        "spoken_text": "I found one memory about soldering.",
+        "user_summary": "Asked for soldering memories.",
+        "brain_summary": "Shared a soldering memory.",
+        "interrupted_by": null
+      }
+    }
+  }
+}

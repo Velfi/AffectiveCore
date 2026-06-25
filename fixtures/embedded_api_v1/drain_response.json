@@ -1,0 +1,23 @@
+{
+  "api_version": 1,
+  "request_id": "",
+  "ok": true,
+  "events": [
+    {
+      "type": "command_log",
+      "request_id": "fixture-tool-call-001",
+      "kind": "result",
+      "title": "remember_memory",
+      "body": "memory_saved"
+    },
+    {
+      "type": "state_changed",
+      "request_id": "fixture-tool-call-001",
+      "state": "ready",
+      "text": "Ready"
+    }
+  ],
+  "result": {
+    "kind": "drain"
+  }
+}

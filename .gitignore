@@ -1,0 +1,9 @@
+.zig-cache/
+zig-out/
+.env
+data/events.jsonl
+data/email.json
+data/runtime_options.json
+data/memory/*.json
+data/audio/
+.DS_Store

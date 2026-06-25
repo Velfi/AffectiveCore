@@ -1,0 +1,6 @@
+[
+  { "filename": "empty_room_01.jpg", "person_present": false, "match_status": "none", "confidence": 0.0 },
+  { "filename": "unknown_01.jpg", "person_present": true, "match_status": "unknown", "confidence": 0.40 },
+  { "filename": "known_01.jpg", "person_present": true, "match_status": "known", "person_id": "person_001", "confidence": 0.91, "candidate_name": "Mara" },
+  { "filename": "known_changed_01.jpg", "person_present": true, "match_status": "uncertain", "person_id": "person_001", "confidence": 0.72, "candidate_name": "Mara" }
+]

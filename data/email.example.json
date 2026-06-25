@@ -1,0 +1,6 @@
+{
+  "smtp_url": "smtps://smtp.example.com:465",
+  "from": "brain@example.com",
+  "username": "brain@example.com",
+  "password": "app-password"
+}

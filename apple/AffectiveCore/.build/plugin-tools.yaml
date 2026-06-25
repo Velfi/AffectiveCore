@@ -1,0 +1,81 @@
+client:
+  name: basic
+  file-system: device-agnostic
+tools: {}
+targets:
+  "AffectiveCoreApple-arm64-apple-macosx-debug.exe": ["<AffectiveCoreApple-arm64-apple-macosx-debug.exe>"]
+  "AffectiveCoreApple-arm64-apple-macosx-debug.module": ["<AffectiveCoreApple-arm64-apple-macosx-debug.module>"]
+  "PackageStructure": ["<PackageStructure>"]
+  "main": ["<AffectiveCoreApple-arm64-apple-macosx-debug.exe>","<AffectiveCoreApple-arm64-apple-macosx-debug.module>"]
+  "test": ["<AffectiveCoreApple-arm64-apple-macosx-debug.exe>","<AffectiveCoreApple-arm64-apple-macosx-debug.module>"]
+default: "main"
+nodes:
+  "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+  "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple":
+    is-mutated: true
+commands:
+  "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple-entitlement.plist":
+    tool: write-auxiliary-file
+    inputs: ["<entitlement-plist>","<com.apple.security.get-task-allow>"]
+    outputs: ["/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple-entitlement.plist"]
+    description: "Write auxiliary file /Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple-entitlement.plist"
+
+  "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/AffectiveCoreAppleApp.swift","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardSnapshot.swift","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardView.swift","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/MCPClient.swift"]
+    outputs: ["/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/sources"]
+    description: "Write auxiliary file /Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/sources"
+
+  "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.product/Objects.LinkFileList":
+    tool: write-auxiliary-file
+    inputs: ["<link-file-list>","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/AffectiveCoreAppleApp.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardSnapshot.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardView.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/MCPClient.swift.o"]
+    outputs: ["/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.product/Objects.LinkFileList"]
+    description: "Write auxiliary file /Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.product/Objects.LinkFileList"
+
+  "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt":
+    tool: write-auxiliary-file
+    inputs: ["<swift-get-version>","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"]
+    outputs: ["/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"]
+    always-out-of-date: "true"
+    description: "Write auxiliary file /Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+
+  "<AffectiveCoreApple-arm64-apple-macosx-debug.exe>":
+    tool: phony
+    inputs: ["<AffectiveCoreApple-arm64-apple-macosx-debug.exe-CodeSigning>"]
+    outputs: ["<AffectiveCoreApple-arm64-apple-macosx-debug.exe>"]
+
+  "<AffectiveCoreApple-arm64-apple-macosx-debug.module>":
+    tool: phony
+    inputs: ["/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/AffectiveCoreAppleApp.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardSnapshot.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardView.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/MCPClient.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/Modules/AffectiveCoreApple.swiftmodule"]
+    outputs: ["<AffectiveCoreApple-arm64-apple-macosx-debug.module>"]
+
+  "C.AffectiveCoreApple-arm64-apple-macosx-debug.exe":
+    tool: shell
+    inputs: ["/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/AffectiveCoreAppleApp.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardSnapshot.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardView.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/MCPClient.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.product/Objects.LinkFileList"]
+    outputs: ["/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple"]
+    description: "Linking ./.build/arm64-apple-macosx/debug/AffectiveCoreApple"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-L","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug","-o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple","-module-name","AffectiveCoreApple","-Xlinker","-no_warn_duplicate_libraries","-emit-executable","-Xlinker","-alias","-Xlinker","_AffectiveCoreApple_main","-Xlinker","_main","-Xlinker","-rpath","-Xlinker","@loader_path","@/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.product/Objects.LinkFileList","-Xlinker","-rpath","-Xlinker","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-6.2/macosx","-target","arm64-apple-macosx14.0","-Xlinker","-add_ast_path","-Xlinker","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/Modules/AffectiveCoreApple.swiftmodule","-plugin-path","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g"]
+
+  "C.AffectiveCoreApple-arm64-apple-macosx-debug.exe-entitlements":
+    tool: shell
+    inputs: ["/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple-entitlement.plist"]
+    outputs: ["<AffectiveCoreApple-arm64-apple-macosx-debug.exe-CodeSigning>"]
+    description: "Applying debug entitlements to ./.build/arm64-apple-macosx/debug/AffectiveCoreApple"
+    args: ["codesign","--force","--sign","-","--entitlements","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple-entitlement.plist","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple"]
+
+  "C.AffectiveCoreApple-arm64-apple-macosx-debug.module":
+    tool: shell
+    inputs: ["/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/AffectiveCoreAppleApp.swift","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardSnapshot.swift","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardView.swift","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/MCPClient.swift","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/sources"]
+    outputs: ["/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/AffectiveCoreAppleApp.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardSnapshot.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardView.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/MCPClient.swift.o","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/Modules/AffectiveCoreApple.swiftmodule"]
+    description: "Compiling Swift Module 'AffectiveCoreApple' (4 sources)"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-module-name","AffectiveCoreApple","-emit-dependencies","-emit-module","-emit-module-path","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/Modules/AffectiveCoreApple.swiftmodule","-output-file-map","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/output-file-map.json","-incremental","-c","@/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/sources","-I","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/Modules","-target","arm64-apple-macosx14.0","-incremental","-enable-batch-mode","-serialize-diagnostics","-index-store-path","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/index/store","-Onone","-enable-testing","-j14","-DSWIFT_PACKAGE","-DDEBUG","-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE","-module-cache-path","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/ModuleCache","-parseable-output","-Xfrontend","-entry-point-function-name","-Xfrontend","AffectiveCoreApple_main","-swift-version","6","-plugin-path","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g","-Xcc","-isysroot","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-Xcc","-fPIC","-Xcc","-g","-package-name","affectivecore"]
+
+  "PackageStructure":
+    tool: package-structure-tool
+    inputs: ["/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Package.swift","/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Package.resolved"]
+    outputs: ["<PackageStructure>"]
+    description: "Planning build"
+    allow-missing-inputs: true
+

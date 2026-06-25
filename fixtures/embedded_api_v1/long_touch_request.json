@@ -1,0 +1,7 @@
+{
+  "api_version": 1,
+  "request_id": "fixture-long-touch-001",
+  "event": {
+    "type": "long_touch"
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "mode": "random",
+  "reasoning_effort": "auto",
+  "psyche_reasoning_effort": "low",
+  "models": [
+    {
+      "provider": "openai",
+      "model": "gpt-4.1-nano"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5-20251001"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.1-flash-lite"
+    }
+  ],
+  "psyche_models": [
+    {
+      "provider": "openai",
+      "model": "gpt-4.1-nano"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5-20251001"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.1-flash-lite"
+    }
+  ]
+}

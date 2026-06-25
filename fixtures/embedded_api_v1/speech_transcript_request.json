@@ -1,0 +1,8 @@
+{
+  "api_version": 1,
+  "request_id": "fixture-speech-transcript-001",
+  "event": {
+    "type": "speech_transcript",
+    "text": "What do you remember about soldering?"
+  }
+}

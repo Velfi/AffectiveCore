@@ -1,0 +1,3 @@
+- This project uses zig v0.16.0
+- Write no fallbacks. I want things to fail loudly and quickly.
+- this project does not use git for version control.

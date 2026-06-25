@@ -1,0 +1,9 @@
+[
+  {
+    "filename": "known_changed_01.jpg",
+    "description": "Wearing a blue jacket and carrying a small bag.",
+    "change_summary": "a blue jacket and small bag are visible",
+    "durable_notes": ["often carries a small bag"],
+    "temporary_notes": ["blue jacket"]
+  }
+]

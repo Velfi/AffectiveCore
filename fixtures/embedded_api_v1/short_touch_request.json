@@ -1,0 +1,7 @@
+{
+  "api_version": 1,
+  "request_id": "fixture-short-touch-001",
+  "event": {
+    "type": "short_touch"
+  }
+}

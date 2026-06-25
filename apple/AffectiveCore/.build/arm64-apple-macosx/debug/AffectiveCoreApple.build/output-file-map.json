@@ -1,0 +1,33 @@
+{
+  "": {
+    "swift-dependencies": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/primary.swiftdeps"
+  },
+  "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/AffectiveCoreAppleApp.swift": {
+    "dependencies": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/AffectiveCoreAppleApp.d",
+    "object": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/AffectiveCoreAppleApp.swift.o",
+    "swiftmodule": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/AffectiveCoreAppleApp~partial.swiftmodule",
+    "swift-dependencies": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/AffectiveCoreAppleApp.swiftdeps",
+    "diagnostics": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/AffectiveCoreAppleApp.dia"
+  },
+  "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardSnapshot.swift": {
+    "dependencies": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardSnapshot.d",
+    "object": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardSnapshot.swift.o",
+    "swiftmodule": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardSnapshot~partial.swiftmodule",
+    "swift-dependencies": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardSnapshot.swiftdeps",
+    "diagnostics": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardSnapshot.dia"
+  },
+  "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardView.swift": {
+    "dependencies": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardView.d",
+    "object": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardView.swift.o",
+    "swiftmodule": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardView~partial.swiftmodule",
+    "swift-dependencies": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardView.swiftdeps",
+    "diagnostics": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardView.dia"
+  },
+  "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/MCPClient.swift": {
+    "dependencies": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/MCPClient.d",
+    "object": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/MCPClient.swift.o",
+    "swiftmodule": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/MCPClient~partial.swiftmodule",
+    "swift-dependencies": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/MCPClient.swiftdeps",
+    "diagnostics": "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/MCPClient.dia"
+  }
+}

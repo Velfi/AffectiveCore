@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import math
+from pathlib import Path
+import sqlite3
+import time
+import sys
+
+import cv2
+import numpy as np
+
+
+def fail(message):
+    print(f"affective-face-recognizer: {message}", file=sys.stderr)
+    return 1
+
+
+def load_image(path):
+    image = cv2.imread(str(path))
+    if image is None:
+        raise RuntimeError(f"could not read image: {path}")
+    return image
+
+
+def detect_faces(detector_model, image):
+    height, width = image.shape[:2]
+    detector = cv2.FaceDetectorYN.create(str(detector_model), "", (width, height), 0.7, 0.3, 5000)
+    _, faces = detector.detect(image)
+    if faces is None:
+        return []
+    return list(faces)
+
+
+def face_embedding(detector_model, recognizer_model, image_path):
+    image = load_image(image_path)
+    faces = detect_faces(detector_model, image)
+    if len(faces) != 1:
+        return None, len(faces), 0.0
+
+    recognizer = cv2.FaceRecognizerSF.create(str(recognizer_model), "")
+    aligned = recognizer.alignCrop(image, faces[0])
+    feature = recognizer.feature(aligned).reshape(-1).astype(np.float32)
+    norm = float(np.linalg.norm(feature))
+    if norm == 0 or math.isnan(norm):
+        raise RuntimeError(f"empty face embedding for image: {image_path}")
+    score = float(faces[0][-1])
+    if math.isnan(score) or score < 0.0 or score > 1.0:
+        raise RuntimeError(f"invalid face detection score for image: {image_path}")
+    return feature / norm, 1, score
+
+
+def embedding_paths(embeddings_dir, person_id):
+    person_dir = embeddings_dir / person_id
+    if not person_dir.exists():
+        return []
+    return sorted(person_dir.glob("*.npy"))
+
+
+def cached_embeddings(embeddings_dir, person_id):
+    embeddings = []
+    for path in embedding_paths(embeddings_dir, person_id):
+        value = np.load(path).reshape(-1).astype(np.float32)
+        norm = float(np.linalg.norm(value))
+        if norm == 0 or math.isnan(norm):
+            raise RuntimeError(f"empty cached embedding: {path}")
+        embeddings.append(value / norm)
+    return embeddings
+
+
+def person_id(person):
+    return person.get("person_id") or person.get("subject_id")
+
+
+def cache_representative_embedding(args, person):
+    image_path = person.get("representative_image_path")
+    if not image_path:
+        return []
+
+    feature, count, _ = face_embedding(args.detector, args.recognizer, Path(image_path))
+    if feature is None:
+        return []
+
+    person_dir = args.embeddings_dir / person_id(person)
+    person_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(image_path).stem.replace("/", "_")
+    cache_path = person_dir / f"representative_{safe_name}.npy"
+    np.save(cache_path, feature)
+    return [feature]
+
+
+def person_embeddings(args, person):
+    embeddings = cached_embeddings(args.embeddings_dir, person_id(person))
+    if embeddings:
+        return embeddings
+    return cache_representative_embedding(args, person)
+
+
+def load_people(memory_path):
+    data = load_memory(memory_path)
+    return [
+        subject_as_person(subject) for subject in data["subjects"]
+        if subject.get("relationship_status") != "forgotten"
+    ]
+
+
+def load_memory(memory_path):
+    with sqlite3.connect(memory_path) as db:
+        ensure_schema(db)
+        row = db.execute("SELECT schema_version, data_json FROM cognitive_memory WHERE id = 1").fetchone()
+    if row is None:
+        data = {"schema_version": 2, "traces": [], "beliefs": [], "subjects": [], "artifacts": [], "dreams": []}
+    else:
+        schema_version, data_json = row
+        if schema_version != 2:
+            raise RuntimeError(f"unsupported cognitive schema version {schema_version}: {memory_path}")
+        data = json.loads(data_json)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"memory root must be an object: {memory_path}")
+    if data.get("schema_version") != 2:
+        raise RuntimeError(f"memory schema_version must be 2: {memory_path}")
+    subjects = data.get("subjects")
+    if not isinstance(subjects, list):
+        raise RuntimeError(f"memory subjects field must be a list: {memory_path}")
+    return data
+
+
+def write_memory(memory_path, data):
+    memory_path.parent.mkdir(parents=True, exist_ok=True)
+    if data.get("schema_version") != 2:
+        raise RuntimeError(f"memory schema_version must be 2: {memory_path}")
+    with sqlite3.connect(memory_path) as db:
+        ensure_schema(db)
+        db.execute(
+            """
+            INSERT INTO cognitive_memory (id, schema_version, data_json)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET schema_version=excluded.schema_version, data_json=excluded.data_json
+            """,
+            (2, json.dumps(data, indent=2)),
+        )
+
+
+def ensure_schema(db):
+    db.executescript(
+        """
+        PRAGMA foreign_keys = ON;
+        PRAGMA user_version = 2;
+        CREATE TABLE IF NOT EXISTS cognitive_memory (
+          id INTEGER PRIMARY KEY CHECK(id = 1),
+          schema_version INTEGER NOT NULL,
+          data_json TEXT NOT NULL
+        );
+        """
+    )
+
+
+def subject_as_person(subject):
+    lifecycle = subject.get("lifecycle")
+    if not isinstance(lifecycle, dict):
+        raise RuntimeError(f"subject lifecycle field must be an object: {person_label(subject)}")
+    return {
+        "person_id": subject.get("subject_id"),
+        "display_name": subject.get("display_name"),
+        "relationship_status": subject.get("relationship_status", "unknown"),
+        "created_at": lifecycle.get("created_at"),
+        "last_seen_at": lifecycle.get("updated_at"),
+        "embeddings": subject.get("embeddings", []),
+        "representative_image_path": subject.get("representative_image_path"),
+        "representative_quality_score": subject.get("representative_quality_score", 0.0),
+    }
+
+
+def person_label(person):
+    return f'{person.get("display_name", "")} ({person_id(person) or ""})'
+
+
+def find_person(data, person_id, name):
+    people = [
+        person for person in data["subjects"]
+        if person.get("relationship_status") != "forgotten"
+    ]
+    if person_id is not None:
+        matches = [person for person in people if person.get("subject_id") == person_id]
+        if not matches:
+            raise RuntimeError(f"no active person with person_id: {person_id}")
+        return matches[0]
+
+    wanted = name.casefold()
+    matches = [
+        person for person in people
+        if str(person.get("display_name", "")).casefold() == wanted
+    ]
+    if not matches:
+        raise RuntimeError(f"no active person named: {name}")
+    if len(matches) > 1:
+        labels = ", ".join(person_label(person) for person in matches)
+        raise RuntimeError(f"multiple active people named {name}; use --person-id. Matches: {labels}")
+    return matches[0]
+
+
+def require_paths(args, labels):
+    for attr, label in labels:
+        path = getattr(args, attr)
+        if not path.exists():
+            raise RuntimeError(f"missing {label}: {path}")
+
+
+def safe_stem(path):
+    stem = path.stem.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    return stem or "image"
+
+
+def remove_cached_embeddings(person_dir):
+    removed = 0
+    if not person_dir.exists():
+        return removed
+    for path in sorted(person_dir.glob("*.npy")):
+        path.unlink()
+        removed += 1
+    return removed
+
+
+def next_embedding_id(person):
+    existing = person.get("embeddings", [])
+    if not isinstance(existing, list):
+        raise RuntimeError(f"person embeddings field must be a list: {person_label(person)}")
+    return f"emb_{len(existing) + 1}"
+
+
+def enroll(args):
+    require_paths(args, [
+        ("image", "image"),
+        ("memory", "memory"),
+        ("detector", "detector"),
+        ("recognizer", "recognizer"),
+    ])
+    if args.person_id is None and args.name is None:
+        raise RuntimeError("provide --person-id or --name")
+
+    feature, people_count, quality_score = face_embedding(args.detector, args.recognizer, args.image)
+    if people_count != 1:
+        raise RuntimeError(f"expected exactly one face in {args.image}; found {people_count}")
+
+    data = load_memory(args.memory)
+    person = find_person(data, args.person_id, args.name)
+    person_id_value = person_id(person)
+    person_dir = args.embeddings_dir / person_id_value
+    person_dir.mkdir(parents=True, exist_ok=True)
+
+    removed = 0
+    if not args.keep_existing:
+        removed = remove_cached_embeddings(person_dir)
+
+    created_at = str(int(time.time()))
+    cache_path = person_dir / f"manual_{safe_stem(args.image)}_{created_at}.npy"
+    np.save(cache_path, feature)
+
+    embedding_ref = {
+        "embedding_id": next_embedding_id(person),
+        "quality_score": quality_score,
+        "created_at": created_at,
+        "source": "manual_merge",
+    }
+    embeddings = person.get("embeddings", [])
+    if args.keep_existing:
+        embeddings.append(embedding_ref)
+    else:
+        embeddings = [embedding_ref]
+
+    person["embeddings"] = embeddings
+    person["representative_image_path"] = str(args.image)
+    person["representative_quality_score"] = quality_score
+    person["lifecycle"]["updated_at"] = created_at
+    write_memory(args.memory, data)
+
+    return {
+        "person_id": person_id_value,
+        "display_name": person.get("display_name"),
+        "representative_image_path": str(args.image),
+        "embedding_path": str(cache_path),
+        "quality_score": quality_score,
+        "removed_embeddings": removed,
+        "kept_existing": args.keep_existing,
+    }
+
+
+def confidence_from_similarity(similarity):
+    return max(0.0, min(1.0, (similarity + 1.0) / 2.0))
+
+
+def identify(args):
+    for path, label in [
+        (args.image, "image"),
+        (args.memory, "memory"),
+        (args.detector, "detector"),
+        (args.recognizer, "recognizer"),
+    ]:
+        if not path.exists():
+            raise RuntimeError(f"missing {label}: {path}")
+
+    current, people_count, _ = face_embedding(args.detector, args.recognizer, args.image)
+    if people_count == 0:
+        return {
+            "person_present": False,
+            "match_status": "none",
+            "confidence": 0.0,
+            "people_count": 0,
+        }
+    if people_count > 1:
+        return {
+            "person_present": True,
+            "match_status": "multiple",
+            "confidence": 0.0,
+            "people_count": people_count,
+        }
+
+    best = None
+    for person in load_people(args.memory):
+        for candidate in person_embeddings(args, person):
+            similarity = float(np.dot(current, candidate))
+            confidence = confidence_from_similarity(similarity)
+            if best is None or confidence > best["confidence"]:
+                best = {
+                    "person_id": person["person_id"],
+                    "candidate_name": person.get("display_name"),
+                    "confidence": confidence,
+                }
+
+    if best is None:
+        return {
+            "person_present": True,
+            "match_status": "unknown",
+            "confidence": 0.0,
+            "people_count": 1,
+        }
+
+    if best["confidence"] >= args.known_threshold:
+        status = "known"
+    elif best["confidence"] >= args.uncertain_threshold:
+        status = "uncertain"
+    else:
+        status = "unknown"
+
+    result = {
+        "person_present": True,
+        "match_status": status,
+        "confidence": best["confidence"],
+        "people_count": 1,
+    }
+    if status in ("known", "uncertain"):
+        result["person_id"] = best["person_id"]
+        result["candidate_name"] = best["candidate_name"]
+    return result
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="AffectiveCore OpenCV face recognizer")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+    identify_cmd = subcommands.add_parser("identify")
+    identify_cmd.add_argument("--image", required=True, type=Path)
+    identify_cmd.add_argument("--memory", required=True, type=Path)
+    identify_cmd.add_argument("--embeddings-dir", required=True, type=Path)
+    identify_cmd.add_argument("--detector", required=True, type=Path)
+    identify_cmd.add_argument("--recognizer", required=True, type=Path)
+    identify_cmd.add_argument("--known-threshold", required=True, type=float)
+    identify_cmd.add_argument("--uncertain-threshold", required=True, type=float)
+    enroll_cmd = subcommands.add_parser("enroll")
+    enroll_cmd.add_argument("--image", required=True, type=Path)
+    enroll_cmd.add_argument("--memory", required=True, type=Path)
+    enroll_cmd.add_argument("--embeddings-dir", required=True, type=Path)
+    enroll_cmd.add_argument("--detector", required=True, type=Path)
+    enroll_cmd.add_argument("--recognizer", required=True, type=Path)
+    person = enroll_cmd.add_mutually_exclusive_group(required=True)
+    person.add_argument("--person-id")
+    person.add_argument("--name")
+    enroll_cmd.add_argument(
+        "--keep-existing",
+        action="store_true",
+        help="add this picture beside existing cached embeddings instead of replacing them",
+    )
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        if args.command == "identify":
+            print(json.dumps(identify(args), separators=(",", ":")))
+            return 0
+        if args.command == "enroll":
+            print(json.dumps(enroll(args), separators=(",", ":")))
+            return 0
+        raise RuntimeError(f"unknown command: {args.command}")
+    except Exception as exc:
+        return fail(str(exc))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

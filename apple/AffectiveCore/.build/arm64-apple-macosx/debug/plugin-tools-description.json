@@ -1,0 +1,308 @@
+{
+  "builtTestProducts" : [
+
+  ],
+  "copyCommands" : {
+
+  },
+  "explicitTargetDependencyImportCheckingMode" : {
+    "none" : {
+
+    }
+  },
+  "generatedSourceTargetSet" : [
+
+  ],
+  "pluginDescriptions" : [
+
+  ],
+  "swiftCommands" : {
+    "C.AffectiveCoreApple-arm64-apple-macosx-debug.module" : {
+      "executable" : "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "fileList" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/sources",
+      "importPath" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/Modules",
+      "inputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/AffectiveCoreAppleApp.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardSnapshot.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardView.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/MCPClient.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/sources"
+        }
+      ],
+      "isLibrary" : false,
+      "moduleName" : "AffectiveCoreApple",
+      "moduleOutputPath" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/Modules/AffectiveCoreApple.swiftmodule",
+      "objects" : [
+        "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/AffectiveCoreAppleApp.swift.o",
+        "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardSnapshot.swift.o",
+        "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardView.swift.o",
+        "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/MCPClient.swift.o"
+      ],
+      "otherArguments" : [
+        "-target",
+        "arm64-apple-macosx14.0",
+        "-incremental",
+        "-enable-batch-mode",
+        "-serialize-diagnostics",
+        "-index-store-path",
+        "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/index/store",
+        "-Onone",
+        "-enable-testing",
+        "-j14",
+        "-DSWIFT_PACKAGE",
+        "-DDEBUG",
+        "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+        "-module-cache-path",
+        "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/ModuleCache",
+        "-parseable-output",
+        "-Xfrontend",
+        "-entry-point-function-name",
+        "-Xfrontend",
+        "AffectiveCoreApple_main",
+        "-swift-version",
+        "6",
+        "-plugin-path",
+        "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+        "-sdk",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-F",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-I",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-L",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-g",
+        "-Xcc",
+        "-isysroot",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-Xcc",
+        "-F",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-Xcc",
+        "-fPIC",
+        "-Xcc",
+        "-g",
+        "-package-name",
+        "affectivecore"
+      ],
+      "outputFileMapPath" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/output-file-map.json",
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/AffectiveCoreAppleApp.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardSnapshot.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardView.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/MCPClient.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/Modules/AffectiveCoreApple.swiftmodule"
+        }
+      ],
+      "prepareForIndexing" : false,
+      "sources" : [
+        "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/AffectiveCoreAppleApp.swift",
+        "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardSnapshot.swift",
+        "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardView.swift",
+        "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/MCPClient.swift"
+      ],
+      "tempsPath" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build",
+      "wholeModuleOptimization" : false
+    }
+  },
+  "swiftFrontendCommands" : {
+
+  },
+  "swiftTargetScanArgs" : {
+    "AffectiveCoreApple" : [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "-module-name",
+      "AffectiveCoreApple",
+      "-package-name",
+      "affectivecore",
+      "-c",
+      "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/AffectiveCoreAppleApp.swift",
+      "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardSnapshot.swift",
+      "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardView.swift",
+      "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/MCPClient.swift",
+      "-I",
+      "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/Modules",
+      "-target",
+      "arm64-apple-macosx14.0",
+      "-incremental",
+      "-enable-batch-mode",
+      "-serialize-diagnostics",
+      "-index-store-path",
+      "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/index/store",
+      "-Onone",
+      "-enable-testing",
+      "-j14",
+      "-DSWIFT_PACKAGE",
+      "-DDEBUG",
+      "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+      "-module-cache-path",
+      "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/ModuleCache",
+      "-parseable-output",
+      "-Xfrontend",
+      "-entry-point-function-name",
+      "-Xfrontend",
+      "AffectiveCoreApple_main",
+      "-swift-version",
+      "6",
+      "-plugin-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+      "-sdk",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-F",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-I",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-L",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-g",
+      "-Xcc",
+      "-isysroot",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-Xcc",
+      "-F",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-Xcc",
+      "-fPIC",
+      "-Xcc",
+      "-g",
+      "-package-name",
+      "affectivecore",
+      "-driver-use-frontend-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+    ]
+  },
+  "targetDependencyMap" : {
+    "AffectiveCoreApple" : [
+
+    ]
+  },
+  "testDiscoveryCommands" : {
+
+  },
+  "testEntryPointCommands" : {
+
+  },
+  "traitConfiguration" : {
+    "default" : {
+
+    }
+  },
+  "writeCommands" : {
+    "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple-entitlement.plist" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<entitlement-plist>"
+        },
+        {
+          "kind" : "virtual",
+          "name" : "<com.apple.security.get-task-allow>"
+        }
+      ],
+      "outputFilePath" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple-entitlement.plist"
+    },
+    "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/sources" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<sources-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/AffectiveCoreAppleApp.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardSnapshot.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/DashboardView.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/Sources/AffectiveCoreApple/MCPClient.swift"
+        }
+      ],
+      "outputFilePath" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/sources"
+    },
+    "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.product/Objects.LinkFileList" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<link-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/AffectiveCoreAppleApp.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardSnapshot.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/DashboardView.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.build/MCPClient.swift.o"
+        }
+      ],
+      "outputFilePath" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/AffectiveCoreApple.product/Objects.LinkFileList"
+    },
+    "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt" : {
+      "alwaysOutOfDate" : true,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<swift-get-version>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+        }
+      ],
+      "outputFilePath" : "/Users/zelda/Documents/AffectiveCore/apple/AffectiveCore/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+    }
+  }
+}

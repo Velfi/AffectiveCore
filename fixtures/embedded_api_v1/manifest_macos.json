@@ -1,0 +1,36 @@
+{
+  "api_version": 1,
+  "platform": "macos",
+  "storage_provider": "file_backed_migration",
+  "capabilities": [
+    "speech_transcript",
+    "typed_text",
+    "poke_sequence",
+    "short_touch",
+    "long_touch",
+    "tool_call",
+    "speech_output",
+    "event_envelope",
+    "event_drain",
+    "uploaded_media_read",
+    "stored_memory_read",
+    "stored_memory_write",
+    "stored_image_read",
+    "identity_recognition",
+    "introspection",
+    "time_lookup",
+    "power_status",
+    "storage_fullness",
+    "database_stats",
+    "reminder_io",
+    "image_generation",
+    "face_picture_update",
+    "local_process_io",
+    "facial_expression_output"
+  ],
+  "feature_flags": {
+    "streaming_events": true,
+    "logical_store": false,
+    "migration_fallback": true
+  }
+}

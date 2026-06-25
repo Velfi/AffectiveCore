@@ -1,0 +1,17 @@
+{
+  "api_version": 1,
+  "request_id": "fixture-poke-sequence-001",
+  "event": {
+    "type": "poke_sequence",
+    "pulses": [
+      {
+        "press_ms": 80,
+        "pause_before_ms": 0
+      },
+      {
+        "press_ms": 120,
+        "pause_before_ms": 160
+      }
+    ]
+  }
+}

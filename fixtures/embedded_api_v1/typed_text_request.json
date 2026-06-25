@@ -1,0 +1,8 @@
+{
+  "api_version": 1,
+  "request_id": "fixture-typed-text-001",
+  "event": {
+    "type": "typed_text",
+    "text": "List today's reminders."
+  }
+}

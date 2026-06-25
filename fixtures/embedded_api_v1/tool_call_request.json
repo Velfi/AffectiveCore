@@ -1,0 +1,12 @@
+{
+  "api_version": 1,
+  "request_id": "fixture-tool-call-001",
+  "event": {
+    "type": "tool_call",
+    "name": "remember_memory",
+    "arguments": {
+      "text": "Papa taught me to solder patiently.",
+      "tags": ["fixture", "memory"]
+    }
+  }
+}

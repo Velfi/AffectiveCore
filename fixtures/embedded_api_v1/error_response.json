@@ -1,0 +1,11 @@
+{
+  "api_version": 1,
+  "request_id": "fixture-error-001",
+  "ok": false,
+  "events": [],
+  "error": {
+    "code": "unknown_event_type",
+    "message": "unknown embedded event type",
+    "recoverable": false
+  }
+}
