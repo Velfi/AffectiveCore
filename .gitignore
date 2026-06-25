@@ -1,9 +1,36 @@
+# Zig build outputs
 .zig-cache/
 zig-out/
+
+# Local environment
 .env
+.env.*
+!.env.example
+
+# Runtime data
 data/events.jsonl
 data/email.json
 data/runtime_options.json
+data/brains/
 data/memory/*.json
+data/memory/*.sqlite*
+data/memory/face_embeddings/
 data/audio/
+
+# Test outputs
+data/test/*.json
+data/test/*.jsonl
+data/test/*.log
+data/test/*.sqlite*
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# OS/editor metadata
 .DS_Store
+.idea/
+.vscode/
