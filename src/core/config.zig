@@ -1,5 +1,7 @@
 const std = @import("std");
-const files = @import("../platform/common/files.zig");
+const ports = @import("ports.zig");
+const files = ports.files;
+const FileSystem = files.FileSystem;
 const config_files = @import("config_files.zig");
 
 pub const Config = struct {
@@ -35,13 +37,9 @@ pub const Config = struct {
     transcription_command: []const u8 = "tools/whisper.cpp-v1.9.1-bin/whisper-cli",
     transcription_model: []const u8 = "models/ggml-base.en.bin",
     speaker_command: []const u8 = "aplay",
-    recognition_mode: []const u8 = "auto",
-    recognition_command: []const u8 = "tools/affective-face-recognizer",
     description_mode: []const u8 = "random",
     identity_comparison_mode: []const u8 = "random",
     identity_comparison_model: []const u8 = "gpt-4.1-nano",
-    face_detector_model: []const u8 = "models/face_detection_yunet_2023mar_int8.onnx",
-    face_recognition_model: []const u8 = "models/face_recognition_sface_2021dec_int8.onnx",
     face_embeddings_dir: []const u8 = "",
     known_threshold: f32 = 0.85,
     uncertain_threshold: f32 = 0.60,
@@ -185,12 +183,6 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, args[i], "--conversation-idle-timeout-seconds") and i + 1 < args.len) {
                 i += 1;
                 cfg.conversation_idle_timeout_seconds = try std.fmt.parseInt(u64, args[i], 10);
-            } else if (std.mem.eql(u8, args[i], "--recognition") and i + 1 < args.len) {
-                i += 1;
-                cfg.recognition_mode = args[i];
-            } else if (std.mem.eql(u8, args[i], "--recognition-command") and i + 1 < args.len) {
-                i += 1;
-                cfg.recognition_command = args[i];
             } else if (std.mem.eql(u8, args[i], "--description") and i + 1 < args.len) {
                 i += 1;
                 cfg.description_mode = args[i];
@@ -200,28 +192,12 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, args[i], "--identity-comparison-model") and i + 1 < args.len) {
                 i += 1;
                 cfg.identity_comparison_model = args[i];
-            } else if (std.mem.eql(u8, args[i], "--face-detector-model") and i + 1 < args.len) {
-                i += 1;
-                cfg.face_detector_model = args[i];
-            } else if (std.mem.eql(u8, args[i], "--face-recognition-model") and i + 1 < args.len) {
-                i += 1;
-                cfg.face_recognition_model = args[i];
             } else if (std.mem.eql(u8, args[i], "--face-embeddings-dir") and i + 1 < args.len) {
                 i += 1;
                 cfg.face_embeddings_dir = args[i];
             }
         }
         return cfg;
-    }
-
-    pub fn withBrainPaths(self: Config, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !Config {
-        const home = env.get("HOME") orelse return error.MissingHome;
-        if (home.len == 0) return error.MissingHome;
-        const tmp = env.get("TMPDIR") orelse return error.MissingTmpDir;
-        if (tmp.len == 0) return error.MissingTmpDir;
-        const persistent_root = try std.fs.path.join(allocator, &.{ home, "Library", "Application Support", "AffectiveCore" });
-        const tmp_root = try std.fs.path.join(allocator, &.{ tmp, "affective-core" });
-        return self.withBrainPathsForRoots(allocator, persistent_root, tmp_root);
     }
 
     pub fn withBrainPathsForRoots(self: Config, allocator: std.mem.Allocator, persistent_root: []const u8, tmp_root: []const u8) !Config {
@@ -245,9 +221,9 @@ pub const Config = struct {
         return cfg;
     }
 
-    pub fn withLlmConfig(self: Config, allocator: std.mem.Allocator, io: std.Io) !Config {
+    pub fn withLlmConfig(self: Config, allocator: std.mem.Allocator, fs: FileSystem, io: std.Io) !Config {
         var cfg = self;
-        const loaded = try config_files.loadLlmConfig(allocator, io);
+        const loaded = try config_files.loadLlmConfig(allocator, fs, io);
         if (loaded.mode) |mode| cfg.ai_mode = mode;
         if (loaded.reasoning_effort) |effort| cfg.conversation_reasoning_effort = effort;
         if (loaded.psyche_reasoning_effort) |effort| cfg.psyche_reasoning_effort = effort;
@@ -259,9 +235,9 @@ pub const Config = struct {
         return cfg;
     }
 
-    pub fn withEmailConfig(self: Config, allocator: std.mem.Allocator, io: std.Io) !Config {
+    pub fn withEmailConfig(self: Config, allocator: std.mem.Allocator, fs: FileSystem, io: std.Io) !Config {
         var cfg = self;
-        const loaded = try config_files.loadEmailConfig(allocator, io);
+        const loaded = try config_files.loadEmailConfig(allocator, fs, io);
         cfg.email_smtp_url = loaded.smtp_url;
         cfg.email_from = loaded.from;
         cfg.email_username = loaded.username;
@@ -269,8 +245,8 @@ pub const Config = struct {
         return cfg;
     }
 
-    pub fn withRuntimeOptions(self: Config, allocator: std.mem.Allocator, io: std.Io) !Config {
-        const bytes = files.readFileAllocPath(io, self.runtime_options_path, allocator, .limited(64 * 1024)) catch |err| switch (err) {
+    pub fn withRuntimeOptions(self: Config, allocator: std.mem.Allocator, fs: FileSystem, io: std.Io) !Config {
+        const bytes = fs.readFileAllocPath(io, self.runtime_options_path, allocator, .limited(64 * 1024)) catch |err| switch (err) {
             error.FileNotFound => return self,
             else => return err,
         };
@@ -325,13 +301,9 @@ pub const Config = struct {
             .psyche_mode = self.psyche_mode,
             .psyche_models = self.psyche_models,
             .psyche_reasoning_effort = self.psyche_reasoning_effort,
-            .recognition_mode = self.recognition_mode,
-            .recognition_command = self.recognition_command,
             .description_mode = self.description_mode,
             .identity_comparison_mode = self.identity_comparison_mode,
             .identity_comparison_model = self.identity_comparison_model,
-            .face_detector_model = self.face_detector_model,
-            .face_recognition_model = self.face_recognition_model,
             .face_embeddings_dir = self.face_embeddings_dir,
             .known_threshold = self.known_threshold,
             .uncertain_threshold = self.uncertain_threshold,
@@ -392,13 +364,9 @@ pub const Config = struct {
         if (settings.psyche_mode.len > 0) cfg.psyche_mode = settings.psyche_mode;
         if (settings.psyche_models.len > 0) cfg.psyche_models = settings.psyche_models;
         if (settings.psyche_reasoning_effort.len > 0) cfg.psyche_reasoning_effort = settings.psyche_reasoning_effort;
-        if (settings.recognition_mode.len > 0) cfg.recognition_mode = settings.recognition_mode;
-        if (settings.recognition_command.len > 0) cfg.recognition_command = settings.recognition_command;
         if (settings.description_mode.len > 0) cfg.description_mode = settings.description_mode;
         if (settings.identity_comparison_mode.len > 0) cfg.identity_comparison_mode = settings.identity_comparison_mode;
         if (settings.identity_comparison_model.len > 0) cfg.identity_comparison_model = settings.identity_comparison_model;
-        if (settings.face_detector_model.len > 0) cfg.face_detector_model = settings.face_detector_model;
-        if (settings.face_recognition_model.len > 0) cfg.face_recognition_model = settings.face_recognition_model;
         if (settings.face_embeddings_dir.len > 0) cfg.face_embeddings_dir = settings.face_embeddings_dir;
         if (settings.known_threshold) |v| cfg.known_threshold = v;
         if (settings.uncertain_threshold) |v| cfg.uncertain_threshold = v;
@@ -459,13 +427,9 @@ pub const BrainSettings = struct {
     psyche_mode: []const u8 = "",
     psyche_models: []const u8 = "",
     psyche_reasoning_effort: []const u8 = "",
-    recognition_mode: []const u8 = "",
-    recognition_command: []const u8 = "",
     description_mode: []const u8 = "",
     identity_comparison_mode: []const u8 = "",
     identity_comparison_model: []const u8 = "",
-    face_detector_model: []const u8 = "",
-    face_recognition_model: []const u8 = "",
     face_embeddings_dir: []const u8 = "",
     known_threshold: ?f32 = null,
     uncertain_threshold: ?f32 = null,
@@ -480,20 +444,10 @@ pub const BrainSettings = struct {
     conversation_idle_timeout_seconds: ?u64 = null,
 };
 
-pub const RecognitionPlatform = enum { macos, radxa };
-
-pub fn effectiveRecognitionMode(cfg: Config, platform: RecognitionPlatform) []const u8 {
-    if (!std.mem.eql(u8, cfg.recognition_mode, "auto")) return cfg.recognition_mode;
-    return switch (platform) {
-        .macos => "command",
-        .radxa => "command",
-    };
-}
-
 pub const LoadedEmailConfig = config_files.LoadedEmailConfig;
 
-pub fn loadEmailConfig(allocator: std.mem.Allocator, io: std.Io) !LoadedEmailConfig {
-    return config_files.loadEmailConfig(allocator, io);
+pub fn loadEmailConfig(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io) !LoadedEmailConfig {
+    return config_files.loadEmailConfig(allocator, fs, io);
 }
 
 pub fn parseEmailConfig(allocator: std.mem.Allocator, bytes: []const u8) !LoadedEmailConfig {
@@ -504,6 +458,6 @@ pub fn parseRuntimeOptionsConfig(allocator: std.mem.Allocator, base: Config, byt
     return config_files.parseRuntimeOptionsConfig(allocator, base, bytes);
 }
 
-pub fn saveRuntimeOptions(io: std.Io, cfg: Config) !void {
-    return config_files.saveRuntimeOptions(io, cfg);
+pub fn saveRuntimeOptions(fs: FileSystem, io: std.Io, cfg: Config) !void {
+    return config_files.saveRuntimeOptions(fs, io, cfg);
 }

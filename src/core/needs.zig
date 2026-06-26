@@ -1,6 +1,7 @@
 const std = @import("std");
-const schema = @import("../storage/schema.zig");
-const senses_mod = @import("../platform/common/system_senses.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
+const senses_mod = ports.system_senses;
 
 pub const NeedUrgency = enum {
     satisfied,

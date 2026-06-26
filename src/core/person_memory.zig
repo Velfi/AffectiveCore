@@ -1,5 +1,6 @@
-const schema = @import("../storage/schema.zig");
-const store = @import("../storage/store.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
+const store = ports.store;
 
 pub const Person = schema.Person;
 pub const Sighting = schema.Sighting;

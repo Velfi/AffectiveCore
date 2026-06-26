@@ -1,6 +1,7 @@
 const std = @import("std");
-const schema = @import("../storage/schema.zig");
-const process = @import("../platform/common/process.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
+const process = ports.process;
 
 pub const PollContext = struct {
     now_seconds: i64,
@@ -72,10 +73,10 @@ pub const Manager = struct {
     }
 };
 
-pub fn runExternalMonitor(allocator: std.mem.Allocator, io: std.Io, monitor_id: []const u8, command: []const u8) ![]schema.RuntimeEvent {
+pub fn runExternalMonitor(allocator: std.mem.Allocator, io: std.Io, runner: process.ProcessRunner, monitor_id: []const u8, command: []const u8) ![]schema.RuntimeEvent {
     const argv = try parseCommandArgv(allocator, command);
     if (argv.len == 0) return error.EmptyExternalMonitorCommand;
-    const stdout = try process.runCapture(allocator, io, argv);
+    const stdout = try runner.runCapture(allocator, io, argv);
     defer allocator.free(stdout);
     return parseExternalEvents(allocator, monitor_id, stdout);
 }

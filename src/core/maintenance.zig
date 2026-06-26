@@ -1,5 +1,7 @@
 const std = @import("std");
-const files = @import("../platform/common/files.zig");
+const ports = @import("ports.zig");
+const files = ports.files;
+const FileSystem = files.FileSystem;
 
 pub const ScheduleKind = enum { every_hours, daily_at, once_at };
 
@@ -33,8 +35,8 @@ pub const AutonomyState = struct {
     last_reason: ?[]const u8 = null,
 };
 
-pub fn loadTasks(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]Task {
-    const bytes = files.readFileAllocPath(io, path, allocator, .limited(128 * 1024)) catch |err| switch (err) {
+pub fn loadTasks(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, path: []const u8) ![]Task {
+    const bytes = fs.readFileAllocPath(io, path, allocator, .limited(128 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return &.{},
         else => return err,
     };
@@ -51,9 +53,9 @@ pub fn loadTasks(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]
     return tasks.toOwnedSlice(allocator);
 }
 
-pub fn dueTasks(allocator: std.mem.Allocator, io: std.Io, schedule_path: []const u8, state_path: []const u8, now_seconds: i64) ![]Task {
-    const tasks = try loadTasks(allocator, io, schedule_path);
-    const state = try loadState(allocator, io, state_path);
+pub fn dueTasks(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, schedule_path: []const u8, state_path: []const u8, now_seconds: i64) ![]Task {
+    const tasks = try loadTasks(allocator, fs, io, schedule_path);
+    const state = try loadState(allocator, fs, io, state_path);
     var due = std.ArrayList(Task).empty;
     for (tasks) |task| {
         const last_run = findLastRun(state, task.task_id);
@@ -62,8 +64,8 @@ pub fn dueTasks(allocator: std.mem.Allocator, io: std.Io, schedule_path: []const
     return due.toOwnedSlice(allocator);
 }
 
-pub fn markRun(allocator: std.mem.Allocator, io: std.Io, state_path: []const u8, task_id: []const u8, now_seconds: i64) !void {
-    var state = try loadState(allocator, io, state_path);
+pub fn markRun(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, state_path: []const u8, task_id: []const u8, now_seconds: i64) !void {
+    var state = try loadState(allocator, fs, io, state_path);
     var replaced = false;
     for (state.runs, 0..) |run, i| {
         if (std.mem.eql(u8, run.task_id, task_id)) {
@@ -78,11 +80,11 @@ pub fn markRun(allocator: std.mem.Allocator, io: std.Io, state_path: []const u8,
         next[state.runs.len] = .{ .task_id = try allocator.dupe(u8, task_id), .last_run = now_seconds };
         state.runs = next;
     }
-    try saveState(allocator, io, state_path, state);
+    try saveState(allocator, fs, io, state_path, state);
 }
 
-pub fn loadAutonomyState(allocator: std.mem.Allocator, io: std.Io, state_path: []const u8, default_sleeping: bool, daily_energy: u32, day_key: []const u8) !AutonomyState {
-    const state = try loadState(allocator, io, state_path);
+pub fn loadAutonomyState(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, state_path: []const u8, default_sleeping: bool, daily_energy: u32, day_key: []const u8) !AutonomyState {
+    const state = try loadState(allocator, fs, io, state_path);
     const existing = state.autonomy orelse return .{
         .sleeping = default_sleeping,
         .energy_remaining = daily_energy,
@@ -98,14 +100,14 @@ pub fn loadAutonomyState(allocator: std.mem.Allocator, io: std.Io, state_path: [
     return existing;
 }
 
-pub fn saveAutonomyState(allocator: std.mem.Allocator, io: std.Io, state_path: []const u8, autonomy: AutonomyState) !void {
-    var state = try loadState(allocator, io, state_path);
+pub fn saveAutonomyState(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, state_path: []const u8, autonomy: AutonomyState) !void {
+    var state = try loadState(allocator, fs, io, state_path);
     state.autonomy = try cloneAutonomyState(allocator, autonomy);
-    try saveState(allocator, io, state_path, state);
+    try saveState(allocator, fs, io, state_path, state);
 }
 
-pub fn addReminder(allocator: std.mem.Allocator, io: std.Io, schedule_path: []const u8, schedule: []const u8, text: []const u8, now_seconds: i64) ![]const u8 {
-    try files.ensureParentDir(io, schedule_path);
+pub fn addReminder(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, schedule_path: []const u8, schedule: []const u8, text: []const u8, now_seconds: i64) ![]const u8 {
+    try fs.ensureParentDir(io, schedule_path);
     const normalized_schedule = try normalizeReminderSchedule(allocator, schedule, now_seconds);
     errdefer allocator.free(normalized_schedule);
     const validation_text = try std.fmt.allocPrint(allocator, "{s} run say:{s}", .{ normalized_schedule, text });
@@ -114,7 +116,7 @@ pub fn addReminder(allocator: std.mem.Allocator, io: std.Io, schedule_path: []co
     defer allocator.free(validation_task.task_id);
     defer allocator.free(validation_task.command);
 
-    const previous_result = files.readFileAllocPath(io, schedule_path, allocator, .limited(128 * 1024));
+    const previous_result = fs.readFileAllocPath(io, schedule_path, allocator, .limited(128 * 1024));
     const previous = previous_result catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
@@ -123,7 +125,7 @@ pub fn addReminder(allocator: std.mem.Allocator, io: std.Io, schedule_path: []co
     const previous_text = previous orelse "";
     const line = try std.fmt.allocPrint(allocator, "{s}- {s} run say:{s}\n", .{ previous_text, normalized_schedule, text });
     defer allocator.free(line);
-    try files.writeFilePath(io, schedule_path, line);
+    try fs.writeFilePath(io, schedule_path, line);
     return normalized_schedule;
 }
 
@@ -249,8 +251,8 @@ fn trimMarkdownBullet(line: []const u8) []const u8 {
     return trimmed;
 }
 
-fn loadState(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !StateFile {
-    const bytes = files.readFileAllocPath(io, path, allocator, .limited(128 * 1024)) catch |err| switch (err) {
+fn loadState(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, path: []const u8) !StateFile {
+    const bytes = fs.readFileAllocPath(io, path, allocator, .limited(128 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
@@ -278,11 +280,11 @@ fn cloneAutonomyState(allocator: std.mem.Allocator, autonomy: AutonomyState) !Au
     };
 }
 
-fn saveState(allocator: std.mem.Allocator, io: std.Io, path: []const u8, state: StateFile) !void {
-    try files.ensureParentDir(io, path);
+fn saveState(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, path: []const u8, state: StateFile) !void {
+    try fs.ensureParentDir(io, path);
     const json = try std.json.Stringify.valueAlloc(allocator, state, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
-    try files.writeFilePath(io, path, json);
+    try fs.writeFilePath(io, path, json);
 }
 
 fn findLastRun(state: StateFile, task_id: []const u8) ?i64 {
@@ -291,6 +293,78 @@ fn findLastRun(state: StateFile, task_id: []const u8) ?i64 {
     }
     return null;
 }
+
+const TestFileSystem = struct {
+    const max_files = 8;
+
+    allocator: std.mem.Allocator,
+    files: [max_files]File = [_]File{.{}} ** max_files,
+
+    const File = struct {
+        path: []const u8 = "",
+        data: []const u8 = "",
+    };
+
+    fn deinit(self: *TestFileSystem) void {
+        for (&self.files) |*file| {
+            if (file.path.len == 0) continue;
+            self.allocator.free(file.path);
+            self.allocator.free(file.data);
+            file.* = .{};
+        }
+    }
+
+    fn hasFile(self: *TestFileSystem, path: []const u8) bool {
+        return self.find(path) != null;
+    }
+
+    fn find(self: *TestFileSystem, path: []const u8) ?*File {
+        for (&self.files) |*file| {
+            if (std.mem.eql(u8, file.path, path)) return file;
+        }
+        return null;
+    }
+
+    fn emptySlot(self: *TestFileSystem) !*File {
+        for (&self.files) |*file| {
+            if (file.path.len == 0) return file;
+        }
+        return error.TestFileSystemFull;
+    }
+
+    fn filesystem(self: *TestFileSystem) FileSystem {
+        return .{
+            .ctx = self,
+            .ensureParentDirFn = ensureParentDir,
+            .readFileAllocPathFn = readFileAllocPath,
+            .writeFilePathFn = writeFilePath,
+            .ensureDirFn = ensureDir,
+            .sweepSpeechArtifactsFn = sweepSpeechArtifacts,
+        };
+    }
+
+    fn ensureParentDir(_: *anyopaque, _: std.Io, _: []const u8) !void {}
+
+    fn readFileAllocPath(ctx: *anyopaque, _: std.Io, path: []const u8, allocator: std.mem.Allocator, _: std.Io.Limit) ![]u8 {
+        const self: *TestFileSystem = @ptrCast(@alignCast(ctx));
+        const file = self.find(path) orelse return error.FileNotFound;
+        return allocator.dupe(u8, file.data);
+    }
+
+    fn writeFilePath(ctx: *anyopaque, _: std.Io, path: []const u8, data: []const u8) !void {
+        const self: *TestFileSystem = @ptrCast(@alignCast(ctx));
+        const file = self.find(path) orelse try self.emptySlot();
+        if (file.path.len == 0) file.path = try self.allocator.dupe(u8, path);
+        self.allocator.free(file.data);
+        file.data = try self.allocator.dupe(u8, data);
+    }
+
+    fn ensureDir(_: *anyopaque, _: std.Io, _: []const u8) !void {}
+
+    fn sweepSpeechArtifacts(_: *anyopaque, _: std.Io, _: files.SpeechArtifactSweepRequest) !files.SpeechArtifactSweepResult {
+        return .{};
+    }
+};
 
 test "parses plain markdown maintenance tasks" {
     const allocator = std.testing.allocator;
@@ -319,32 +393,24 @@ test "relative reminder writes one shot timer and runs once" {
     const allocator = arena.allocator();
     const path = "data/test/relative_timer_maintenance.md";
     const state_path = "data/test/relative_timer_maintenance_state.json";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "data/test");
-    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch {};
+    var test_fs = TestFileSystem{ .allocator = allocator };
+    defer test_fs.deinit();
+    const fs = test_fs.filesystem();
 
-    const schedule = try addReminder(allocator, std.testing.io, path, "in 5 minutes", "Check the kettle.", 1_000);
+    const schedule = try addReminder(allocator, fs, std.testing.io, path, "in 5 minutes", "Check the kettle.", 1_000);
     try std.testing.expectEqualStrings("at unix 1300", schedule);
 
-    const early = try dueTasks(allocator, std.testing.io, path, state_path, 1_299);
+    const early = try dueTasks(allocator, fs, std.testing.io, path, state_path, 1_299);
     try std.testing.expectEqual(@as(usize, 0), early.len);
 
-    const due = try dueTasks(allocator, std.testing.io, path, state_path, 1_300);
+    const due = try dueTasks(allocator, fs, std.testing.io, path, state_path, 1_300);
     try std.testing.expectEqual(@as(usize, 1), due.len);
     try std.testing.expectEqual(ScheduleKind.once_at, due[0].kind);
     try std.testing.expectEqual(@as(i64, 1_300), due[0].run_at_seconds);
     try std.testing.expectEqualStrings("say:Check the kettle", due[0].command);
 
-    try markRun(allocator, std.testing.io, state_path, due[0].task_id, 1_300);
-    const later = try dueTasks(allocator, std.testing.io, path, state_path, 1_900);
+    try markRun(allocator, fs, std.testing.io, state_path, due[0].task_id, 1_300);
+    const later = try dueTasks(allocator, fs, std.testing.io, path, state_path, 1_900);
     try std.testing.expectEqual(@as(usize, 0), later.len);
 }
 
@@ -353,13 +419,10 @@ test "invalid reminder schedule fails before writing" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const path = "data/test/invalid_timer_maintenance.md";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "data/test");
-    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    try std.testing.expectError(error.InvalidReminderSchedule, addReminder(allocator, std.testing.io, path, "whenever later", "Do something.", 1_000));
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
+    var test_fs = TestFileSystem{ .allocator = allocator };
+    defer test_fs.deinit();
+    try std.testing.expectError(error.InvalidReminderSchedule, addReminder(allocator, test_fs.filesystem(), std.testing.io, path, "whenever later", "Do something.", 1_000));
+    try std.testing.expect(!test_fs.hasFile(path));
 }
 
 test "autonomy state resets energy on a new local day key" {
@@ -367,10 +430,11 @@ test "autonomy state resets energy on a new local day key" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const path = "data/test/autonomy_state_test.json";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "data/test");
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var test_fs = TestFileSystem{ .allocator = allocator };
+    defer test_fs.deinit();
+    const fs = test_fs.filesystem();
 
-    try saveAutonomyState(allocator, std.testing.io, path, .{
+    try saveAutonomyState(allocator, fs, std.testing.io, path, .{
         .sleeping = true,
         .energy_remaining = 0,
         .energy_day_key = "2026-06-22",
@@ -378,7 +442,7 @@ test "autonomy state resets energy on a new local day key" {
         .last_reason = "energy exhausted",
     });
 
-    const reset = try loadAutonomyState(allocator, std.testing.io, path, false, 20, "2026-06-23");
+    const reset = try loadAutonomyState(allocator, fs, std.testing.io, path, false, 20, "2026-06-23");
     try std.testing.expect(!reset.sleeping);
     try std.testing.expect(!reset.energy_exhausted);
     try std.testing.expectEqual(@as(u32, 20), reset.energy_remaining);

@@ -2,17 +2,18 @@ const std = @import("std");
 const brain_mod = @import("brain.zig");
 const support = @import("brain_test_support.zig");
 const store_support = @import("brain_test_store.zig");
-const schema = @import("../storage/schema.zig");
-const chat_mod = @import("../api/chat_client.zig");
-const openai = @import("../api/openai_client.zig");
-const audio_mod = @import("../api/audio_client.zig");
-const autonomy_mod = @import("../api/autonomy_client.zig");
-const image_mod = @import("../api/image_client.zig");
-const email_mod = @import("../api/email_client.zig");
-const want_achievement_mod = @import("../api/want_achievement_client.zig");
-const psyche_client = @import("../api/psyche_client.zig");
-const input_mod = @import("../platform/common/input.zig");
-const facial_expression = @import("../platform/common/facial_expression.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
+const chat_mod = ports.chat;
+const openai = ports.openai;
+const audio_mod = ports.audio;
+const autonomy_mod = ports.autonomy;
+const image_mod = ports.image;
+const email_mod = ports.email;
+const want_achievement_mod = ports.want_achievement;
+const psyche_client = ports.psyche;
+const input_mod = ports.input;
+const facial_expression = ports.facial_expression;
 const maintenance = @import("maintenance.zig");
 const id_monitor = @import("id_monitor.zig");
 const interrupt_mod = @import("interrupt.zig");
@@ -273,8 +274,6 @@ test "introspection reports autonomy energy state" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const state_path = "data/test/autonomy_introspect_state.json";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "data/test");
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch {};
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
@@ -282,7 +281,7 @@ test "introspection reports autonomy energy state" {
     brain.cfg.autonomy_daily_energy = 20;
     brain.cfg.maintenance_state_path = state_path;
     brain.deps.io = std.testing.io;
-    try maintenance.saveAutonomyState(allocator, std.testing.io, state_path, .{
+    try maintenance.saveAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, .{
         .sleeping = false,
         .energy_remaining = 13,
         .energy_day_key = try brain.localDayKey(std.testing.io),
@@ -297,7 +296,7 @@ test "introspection reports autonomy energy state" {
 
 fn seedDueAutonomyState(allocator: std.mem.Allocator, brain: *Brain, state_path: []const u8, energy_remaining: u32) !void {
     const day_key = try brain.localDayKey(std.testing.io);
-    try maintenance.saveAutonomyState(allocator, std.testing.io, state_path, .{
+    try maintenance.saveAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, .{
         .sleeping = false,
         .energy_remaining = energy_remaining,
         .energy_day_key = day_key,
@@ -310,12 +309,6 @@ test "autonomy first enabled poll arms interval without spending energy" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const state_path = "data/test/autonomy_armed_state.json";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "data/test");
-    std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch {};
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
@@ -328,7 +321,7 @@ test "autonomy first enabled poll arms interval without spending energy" {
 
     try brain.runAutonomyTick(std.testing.io);
     const day_key = try brain.localDayKey(std.testing.io);
-    const state = try maintenance.loadAutonomyState(allocator, std.testing.io, state_path, false, 20, day_key);
+    const state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, 20, day_key);
     try std.testing.expectEqual(@as(usize, 0), scripted.calls);
     try std.testing.expectEqual(@as(u32, 20), state.energy_remaining);
     try std.testing.expectEqual(brain.now_seconds, state.last_autonomy_tick_at.?);
@@ -340,12 +333,6 @@ test "waking autonomy starts interval without immediate planner spend" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const state_path = "data/test/autonomy_wake_state.json";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "data/test");
-    std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch {};
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
@@ -354,7 +341,7 @@ test "waking autonomy starts interval without immediate planner spend" {
     brain.cfg.maintenance_state_path = state_path;
     brain.deps.io = std.testing.io;
     const day_key = try brain.localDayKey(std.testing.io);
-    try maintenance.saveAutonomyState(allocator, std.testing.io, state_path, .{
+    try maintenance.saveAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, .{
         .sleeping = true,
         .energy_remaining = 20,
         .energy_day_key = day_key,
@@ -365,7 +352,7 @@ test "waking autonomy starts interval without immediate planner spend" {
 
     try brain.setAutonomySleeping(false, "user requested wake");
     try brain.runAutonomyTick(std.testing.io);
-    const state = try maintenance.loadAutonomyState(allocator, std.testing.io, state_path, false, 20, day_key);
+    const state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, 20, day_key);
     try std.testing.expectEqual(@as(usize, 0), scripted.calls);
     try std.testing.expectEqual(@as(u32, 20), state.energy_remaining);
     try std.testing.expectEqual(brain.now_seconds, state.last_autonomy_tick_at.?);
@@ -377,12 +364,6 @@ test "autonomy tick deducts planner and quiet action energy" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const state_path = "data/test/autonomy_energy_state.json";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "data/test");
-    std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch {};
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
@@ -405,7 +386,7 @@ test "autonomy tick deducts planner and quiet action energy" {
 
     try brain.runAutonomyTick(std.testing.io);
     const day_key = try brain.localDayKey(std.testing.io);
-    const state = try maintenance.loadAutonomyState(allocator, std.testing.io, state_path, false, 20, day_key);
+    const state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, 20, day_key);
     try std.testing.expectEqual(@as(usize, 1), scripted.calls);
     try std.testing.expectEqual(@as(usize, 1), psyche.id_calls);
     try std.testing.expectEqual(@as(usize, 1), psyche.superego_calls);
@@ -419,12 +400,6 @@ test "autonomy facial expression costs zero and respects cooldown" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const state_path = "data/test/autonomy_expression_state.json";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "data/test");
-    std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch {};
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
@@ -447,12 +422,12 @@ test "autonomy facial expression costs zero and respects cooldown" {
     try std.testing.expectEqual(@as(usize, 1), expression_output.calls);
     try std.testing.expectEqualStrings("neutral", expression_output.eyes.?);
     const day_key = try brain.localDayKey(std.testing.io);
-    var state = try maintenance.loadAutonomyState(allocator, std.testing.io, state_path, false, 20, day_key);
+    var state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, 20, day_key);
     try std.testing.expectEqual(@as(u32, 19), state.energy_remaining);
 
     brain.now_seconds += 1;
     try brain.runAutonomyTick(std.testing.io);
-    state = try maintenance.loadAutonomyState(allocator, std.testing.io, state_path, false, 20, day_key);
+    state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, 20, day_key);
     try std.testing.expectEqual(@as(usize, 2), scripted.calls);
     try std.testing.expectEqual(@as(usize, 1), expression_output.calls);
     try std.testing.expectEqual(@as(u32, 18), state.energy_remaining);
@@ -464,12 +439,6 @@ test "autonomy suppresses low salience speech without spending speech energy" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const state_path = "data/test/autonomy_speech_state.json";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "data/test");
-    std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch {};
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
@@ -492,7 +461,7 @@ test "autonomy suppresses low salience speech without spending speech energy" {
 
     try brain.runAutonomyTick(std.testing.io);
     const day_key = try brain.localDayKey(std.testing.io);
-    const state = try maintenance.loadAutonomyState(allocator, std.testing.io, state_path, false, 20, day_key);
+    const state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, 20, day_key);
     try std.testing.expectEqual(@as(u32, 19), state.energy_remaining);
     try std.testing.expect(state.last_autonomous_speech_at == null);
     try std.testing.expect(std.mem.indexOf(u8, state.last_reason.?, "salience") != null);
@@ -503,12 +472,6 @@ test "autonomy pauses while human input is active" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const state_path = "data/test/autonomy_input_active_state.json";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "data/test");
-    std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch {};
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
@@ -528,7 +491,7 @@ test "autonomy pauses while human input is active" {
 
     try brain.runAutonomyTick(std.testing.io);
     const day_key = try brain.localDayKey(std.testing.io);
-    const state = try maintenance.loadAutonomyState(allocator, std.testing.io, state_path, false, 20, day_key);
+    const state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, 20, day_key);
     try std.testing.expectEqual(@as(usize, 0), scripted.calls);
     try std.testing.expectEqual(@as(u32, 20), state.energy_remaining);
     try std.testing.expect(std.mem.indexOf(u8, state.last_reason.?, "human input active") != null);
@@ -539,12 +502,6 @@ test "autonomy ask_human logs chat question and sleeps" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const state_path = "data/test/autonomy_ask_human_state.json";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "data/test");
-    std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch {};
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
@@ -565,7 +522,7 @@ test "autonomy ask_human logs chat question and sleeps" {
 
     try brain.runAutonomyTick(std.testing.io);
     const day_key = try brain.localDayKey(std.testing.io);
-    const state = try maintenance.loadAutonomyState(allocator, std.testing.io, state_path, false, 20, day_key);
+    const state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, 20, day_key);
     try std.testing.expect(state.sleeping);
     try std.testing.expectEqualStrings("Should I keep self-directed actions paused?", log.brain_body.?);
     try std.testing.expect(std.mem.indexOf(u8, state.last_reason.?, "waiting for a response") != null);

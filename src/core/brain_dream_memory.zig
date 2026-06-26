@@ -7,28 +7,29 @@ const greeting = @import("greeting_policy.zig");
 const identity = @import("identity.zig");
 const interrupt_mod = @import("interrupt.zig");
 const state_mod = @import("state.zig");
-const schema = @import("../storage/schema.zig");
-const store_mod = @import("../storage/store.zig");
-const graph_store = @import("../storage/graph_store.zig");
-const intent_mod = @import("../api/intent_client.zig");
-const openai = @import("../api/openai_client.zig");
-const greeting_client = @import("../api/greeting_client.zig");
-const speech_mod = @import("../api/speech_client.zig");
-const chat_mod = @import("../api/chat_client.zig");
-const skills_mod = @import("../api/skills.zig");
-const email_mod = @import("../api/email_client.zig");
-const autonomy_mod = @import("../api/autonomy_client.zig");
-const psyche_client = @import("../api/psyche_client.zig");
-const want_achievement_mod = @import("../api/want_achievement_client.zig");
-const image_mod = @import("../api/image_client.zig");
-const audio_mod = @import("../api/audio_client.zig");
-const camera_mod = @import("../platform/common/camera.zig");
-const speaker_mod = @import("../platform/common/speaker.zig");
-const input_mod = @import("../platform/common/input.zig");
-const button_mod = @import("../platform/common/button.zig");
-const command_log_mod = @import("../platform/common/command_log.zig");
-const facial_expression = @import("../platform/common/facial_expression.zig");
-const system_senses_mod = @import("../platform/common/system_senses.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
+const store_mod = ports.store;
+const graph_store = ports.graph_store;
+const intent_mod = ports.intent;
+const openai = ports.openai;
+const greeting_client = ports.greeting;
+const speech_mod = ports.speech;
+const chat_mod = ports.chat;
+const skills_mod = ports.skills;
+const email_mod = ports.email;
+const autonomy_mod = ports.autonomy;
+const psyche_client = ports.psyche;
+const want_achievement_mod = ports.want_achievement;
+const image_mod = ports.image;
+const audio_mod = ports.audio;
+const camera_mod = ports.camera;
+const speaker_mod = ports.speaker;
+const input_mod = ports.input;
+const button_mod = ports.button;
+const command_log_mod = ports.command_log;
+const facial_expression = ports.facial_expression;
+const system_senses_mod = ports.system_senses;
 const time_mod = @import("time.zig");
 const maintenance = @import("maintenance.zig");
 const id_monitor = @import("id_monitor.zig");
@@ -37,7 +38,7 @@ const psyche_mod = @import("psyche.zig");
 const seed_mod = @import("seed.zig");
 const vector_index = @import("vector_index.zig");
 const emotion = @import("emotion.zig");
-const process = @import("../platform/common/process.zig");
+const process = ports.process;
 const helpers = @import("brain_helpers.zig");
 
 const Brain = brain_mod.Brain;
@@ -60,7 +61,7 @@ pub fn dream(self: *Brain, optional_text: ?[]const u8, tags: []const []const u8,
     const memories = try self.deps.store.loadMemoryRecords(self.allocator);
     const summaries = try self.deps.store.loadConversationSummaries(self.allocator);
     const pending_flexible_identity = try helpers.pendingFlexibleIdentityMemories(self.allocator, memories);
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(@max(self.now_seconds, 0))) ^ @as(u64, memories.len * 97 + summaries.len * 13));
     const heat = helpers.rollDreamHeat(prng.random(), heat_bias);
     const confidence = helpers.dreamConfidence(heat);
@@ -246,12 +247,12 @@ pub fn runMaintenanceCommand(self: *Brain, command: []const u8) !bool {
     }
     if (std.mem.startsWith(u8, command, "say:")) {
         const text = std.mem.trim(u8, command["say:".len..], " \t");
-        std.debug.print("\nBRAIN REMINDER:\n{s}\n", .{text});
+        self.outputFmt("\nBRAIN REMINDER:\n{s}\n", .{text});
         try self.say(text);
         try self.logMaintenanceCommandResult(command, text);
         return true;
     }
-    std.debug.print("Unknown maintenance command: {s}\n", .{command});
+    self.outputFmt("Unknown maintenance command: {s}\n", .{command});
     try self.logMaintenanceCommandResult(command, "unknown maintenance command");
     return false;
 }
@@ -260,9 +261,28 @@ pub fn buildConversationMemory(self: *Brain) ![]const u8 {
     return buildConversationMemoryWithSpeaker(self, null);
 }
 
+/// Lead the context with the bot's working memory. When focused (high attention
+/// or an active plan) the focus is prominent; otherwise a single low-key line
+/// signals the bot is open rather than fixed on anything.
+fn appendFocusBlock(self: *Brain, out: *std.ArrayList(u8)) !void {
+    if (self.focusMode() == .focused) {
+        if (self.current_focus) |focus| {
+            const level = self.currentFocusAttention() orelse focus.base_attention;
+            try out.print(
+                self.allocator,
+                "CURRENT FOCUS: {s}\n- source: {s}\n- attention: {d:.3}\n\n",
+                .{ focus.text, @tagName(focus.source), level },
+            );
+            return;
+        }
+    }
+    try out.appendSlice(self.allocator, "focus: unfocused — open to whatever comes; no strong focus right now.\n");
+}
+
 pub fn buildConversationMemoryWithSpeaker(self: *Brain, speaker_context: ?[]const u8) ![]const u8 {
     const summaries = try self.deps.store.loadConversationSummaries(self.allocator);
     var out = std.ArrayList(u8).empty;
+    try appendFocusBlock(self, &out);
     if (speaker_context) |context| {
         try out.appendSlice(self.allocator, context);
     }
@@ -327,7 +347,7 @@ pub fn setFact(self: *Brain, key_text: []const u8, value_text: []const u8, tags:
     const value = std.mem.trim(u8, value_text, " \r\n\t");
     if (key.len == 0) return error.EmptyFactKey;
     if (value.len == 0) return error.EmptyFactValue;
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     const records = try self.deps.store.loadFactRecords(self.allocator);
     var target: ?schema.FactRecord = null;
     for (records) |record| {
@@ -413,7 +433,7 @@ pub fn invalidateFact(self: *Brain, fact_id_text: []const u8, key_text: []const 
         }
     }
     const id = target_id orelse return error.FactNotFound;
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     const invalidated = try self.deps.store.invalidateFactRecord(id, now);
     if (!invalidated) return error.FactNotFound;
     const interpretation = try std.fmt.allocPrint(self.allocator, "invalidated fact {s}", .{id});
@@ -436,7 +456,7 @@ pub fn invalidateFact(self: *Brain, fact_id_text: []const u8, key_text: []const 
 }
 
 pub fn createMemoryRecord(self: *Brain, text: []const u8, tags: []const []const u8) !schema.MemoryRecord {
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     const existing = try self.deps.store.loadMemoryRecords(self.allocator);
     return .{
         .memory_id = try std.fmt.allocPrint(self.allocator, "memory_{d}_{d}_{d}", .{ self.now_seconds, existing.len, text.len }),
@@ -458,7 +478,7 @@ pub fn createMemoryRecord(self: *Brain, text: []const u8, tags: []const []const 
 }
 
 pub fn seedEntryMemory(self: *Brain, doc: seed_mod.SeedDocument, entry: seed_mod.SeedEntry) !schema.MemoryRecord {
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     const seed_slug = try helpers.slugify(self.allocator, doc.name);
     const tags = try helpers.seedEntryTags(self.allocator, entry.kind, seed_slug);
     const salience: f32 = switch (entry.kind) {
@@ -503,7 +523,7 @@ pub fn addExperience(
     derived_memory_ids: []const []const u8,
     tags: []const []const u8,
 ) ![]const u8 {
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     const existing = try self.deps.store.loadExperiences(self.allocator);
     const experience_id = try std.fmt.allocPrint(self.allocator, "experience_{d}_{d}_{d}", .{ self.now_seconds, existing.len, raw.len });
     const expires_at = try self.experienceExpiry(retention);

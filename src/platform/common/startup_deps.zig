@@ -1,5 +1,4 @@
 const std = @import("std");
-const config_mod = @import("config.zig");
 
 pub fn checkMacos(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, cfg: config_mod.Config) !void {
     if (std.mem.eql(u8, cfg.activation_mode, "webview")) {
@@ -12,11 +11,7 @@ pub fn checkMacos(allocator: std.mem.Allocator, io: std.Io, env: *const std.proc
         try requireCommand(allocator, io, env, "afplay", "speech playback");
     }
 
-    if (std.mem.eql(u8, config_mod.effectiveRecognitionMode(cfg, .macos), "command")) {
-        try requireCommand(allocator, io, env, cfg.recognition_command, "face recognition");
-        try requireFile(io, cfg.face_detector_model, "face detection model");
-        try requireFile(io, cfg.face_recognition_model, "face recognition model");
-    }
+
 
     if (cfg.email_smtp_url.len > 0) {
         try requireCommand(allocator, io, env, "curl", "email delivery");
@@ -35,11 +30,7 @@ pub fn checkRadxa(allocator: std.mem.Allocator, io: std.Io, env: *const std.proc
     try requireCommand(allocator, io, env, "say", "speech synthesis");
     try requireCommand(allocator, io, env, cfg.speaker_command, "speech playback");
 
-    if (std.mem.eql(u8, config_mod.effectiveRecognitionMode(cfg, .radxa), "command")) {
-        try requireCommand(allocator, io, env, cfg.recognition_command, "face recognition");
-        try requireFile(io, cfg.face_detector_model, "face detection model");
-        try requireFile(io, cfg.face_recognition_model, "face recognition model");
-    }
+
 
     if (cfg.email_smtp_url.len > 0) {
         try requireCommand(allocator, io, env, "curl", "email delivery");

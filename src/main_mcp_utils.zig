@@ -1,6 +1,6 @@
 const std = @import("std");
 const schema = @import("storage/schema.zig");
-const time_mod = @import("core/time.zig");
+const clock_mod = @import("platform/common/clock.zig");
 
 pub fn requireString(args: std.json.Value, key: []const u8) ![]const u8 {
     return getString(args, key) orelse error.MissingRequiredString;
@@ -77,8 +77,8 @@ pub fn appendRevision(allocator: std.mem.Allocator, revisions: []const schema.Me
     return out;
 }
 
-pub fn nowTimestamp(allocator: std.mem.Allocator) ![]const u8 {
-    return time_mod.nowTimestamp(allocator);
+pub fn nowTimestamp(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
+    return clock_mod.nowTimestamp(allocator, io);
 }
 
 pub fn tagInSlice(tags: []const []const u8, candidate: []const u8) bool {

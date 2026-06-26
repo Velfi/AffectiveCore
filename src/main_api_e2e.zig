@@ -1,9 +1,11 @@
 const std = @import("std");
 const config_mod = @import("core/config.zig");
-const ai = @import("api/random_provider_client.zig");
+const config_paths = @import("app/config_paths.zig");
+const ai = @import("harness/direct_provider_client.zig");
 const http_transport_mod = @import("api/http_transport.zig");
-const image_api = @import("api/image_client.zig");
+const image_api = @import("harness/direct_image_client.zig");
 const main_http_transport = @import("main_http_transport.zig");
+const files_mod = @import("platform/common/files.zig");
 
 const Provider = enum {
     openai,
@@ -33,7 +35,8 @@ pub fn main(init: std.process.Init) !void {
     while (args_iter.next()) |arg| try args_list.append(allocator, arg);
 
     const args_cfg = try config_mod.Config.fromArgs(args_list.items);
-    const cfg = try (try args_cfg.withLlmConfig(allocator, init.io)).withBrainPaths(allocator, init.environ_map);
+    var local_filesystem = files_mod.LocalFileSystem{};
+    const cfg = try config_paths.withBrainPathsFromEnv(try args_cfg.withLlmConfig(allocator, local_filesystem.filesystem(), init.io), allocator, init.environ_map);
     const models = try parseProviderModels(allocator, cfg.conversation_models);
     try requireProviderKeys(init.environ_map, models);
     var http_transport = main_http_transport.StdHttpTransport.init(init.io);
@@ -47,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
         try runVisionJsonContract(allocator, init.io, http, init.environ_map, model, image_path);
     }
 
-    var health_client = ai.RandomProviderClient.init(init.io, http, init.environ_map, cfg.conversation_models);
+    var health_client = ai.DirectRandomProviderClient.initDirectFromEnv(init.io, http, init.environ_map, cfg.conversation_models);
     var health_total: usize = 0;
     health_total += try health_client.checkTextRoutes(allocator, "conversation", cfg.conversation_models);
     if (cfg.psyche_models.len > 0) {
@@ -63,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
 fn runTextJsonContract(allocator: std.mem.Allocator, io: std.Io, http: http_transport_mod.Client, env: *const std.process.Environ.Map, model: ProviderModel) !void {
     std.debug.print("API_E2E start kind=text-json provider={s} model={s}\n", .{ providerName(model.provider), model.model });
     const spec = try modelSpec(allocator, model);
-    var client = ai.RandomProviderClient.init(io, http, env, spec);
+    var client = ai.DirectRandomProviderClient.initDirectFromEnv(io, http, env, spec);
     const content = try client.completeText(allocator, .{
         .subsystem = "api_e2e_text",
         .system_prompt = "You are a live API contract test. Return only the requested JSON object.",
@@ -80,7 +83,7 @@ fn runTextJsonContract(allocator: std.mem.Allocator, io: std.Io, http: http_tran
 fn runVisionJsonContract(allocator: std.mem.Allocator, io: std.Io, http: http_transport_mod.Client, env: *const std.process.Environ.Map, model: ProviderModel, image_path: []const u8) !void {
     std.debug.print("API_E2E start kind=vision-json provider={s} model={s}\n", .{ providerName(model.provider), model.model });
     const spec = try modelSpec(allocator, model);
-    var client = ai.RandomProviderClient.init(io, http, env, spec);
+    var client = ai.DirectRandomProviderClient.initDirectFromEnv(io, http, env, spec);
     const content = try client.completeVision(allocator, .{
         .subsystem = "api_e2e_vision",
         .prompt = "This is a live API contract test. Return exactly this JSON object and nothing else: {\"ok\":true}",
@@ -96,7 +99,7 @@ fn runVisionJsonContract(allocator: std.mem.Allocator, io: std.Io, http: http_tr
 
 fn runImageGenerationContract(allocator: std.mem.Allocator, io: std.Io, http: http_transport_mod.Client, env: *const std.process.Environ.Map, model: []const u8, output_dir: []const u8) !void {
     std.debug.print("API_E2E start kind=image-generation provider=google model={s}\n", .{model});
-    var service_impl = image_api.NanoBananaImageService.init(io, http, env, model, output_dir);
+    var service_impl = image_api.DirectNanoBananaImageService.initDirectFromEnv(io, http, env, model, output_dir);
     const service = service_impl.service();
     const image = try service.generate(allocator, "Live API contract test: generate a single small plain blue square on a white background. No text.");
     if (!isKnownImageMime(image.mime_type)) return error.UnexpectedGeneratedImageMimeType;

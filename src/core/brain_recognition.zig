@@ -7,28 +7,29 @@ const greeting = @import("greeting_policy.zig");
 const identity = @import("identity.zig");
 const interrupt_mod = @import("interrupt.zig");
 const state_mod = @import("state.zig");
-const schema = @import("../storage/schema.zig");
-const store_mod = @import("../storage/store.zig");
-const graph_store = @import("../storage/graph_store.zig");
-const intent_mod = @import("../api/intent_client.zig");
-const openai = @import("../api/openai_client.zig");
-const greeting_client = @import("../api/greeting_client.zig");
-const speech_mod = @import("../api/speech_client.zig");
-const chat_mod = @import("../api/chat_client.zig");
-const skills_mod = @import("../api/skills.zig");
-const email_mod = @import("../api/email_client.zig");
-const autonomy_mod = @import("../api/autonomy_client.zig");
-const psyche_client = @import("../api/psyche_client.zig");
-const want_achievement_mod = @import("../api/want_achievement_client.zig");
-const image_mod = @import("../api/image_client.zig");
-const audio_mod = @import("../api/audio_client.zig");
-const camera_mod = @import("../platform/common/camera.zig");
-const speaker_mod = @import("../platform/common/speaker.zig");
-const input_mod = @import("../platform/common/input.zig");
-const button_mod = @import("../platform/common/button.zig");
-const command_log_mod = @import("../platform/common/command_log.zig");
-const facial_expression = @import("../platform/common/facial_expression.zig");
-const system_senses_mod = @import("../platform/common/system_senses.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
+const store_mod = ports.store;
+const graph_store = ports.graph_store;
+const intent_mod = ports.intent;
+const openai = ports.openai;
+const greeting_client = ports.greeting;
+const speech_mod = ports.speech;
+const chat_mod = ports.chat;
+const skills_mod = ports.skills;
+const email_mod = ports.email;
+const autonomy_mod = ports.autonomy;
+const psyche_client = ports.psyche;
+const want_achievement_mod = ports.want_achievement;
+const image_mod = ports.image;
+const audio_mod = ports.audio;
+const camera_mod = ports.camera;
+const speaker_mod = ports.speaker;
+const input_mod = ports.input;
+const button_mod = ports.button;
+const command_log_mod = ports.command_log;
+const facial_expression = ports.facial_expression;
+const system_senses_mod = ports.system_senses;
 const time_mod = @import("time.zig");
 const maintenance = @import("maintenance.zig");
 const id_monitor = @import("id_monitor.zig");
@@ -37,7 +38,7 @@ const psyche_mod = @import("psyche.zig");
 const seed_mod = @import("seed.zig");
 const vector_index = @import("vector_index.zig");
 const emotion = @import("emotion.zig");
-const process = @import("../platform/common/process.zig");
+const process = ports.process;
 const helpers = @import("brain_helpers.zig");
 
 const Brain = brain_mod.Brain;
@@ -64,13 +65,13 @@ pub fn handleKnown(self: *Brain, capture: events.ImageCapture, result: identity.
     try recordKnownGreetingInteriorEvent(self, person, result, description);
     const text = try generateKnownGreeting(self, person, description);
 
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     person.last_seen_at = now;
     person.sighting_count += 1;
     try self.deps.store.savePerson(person);
     try self.addSighting(id, now, result.confidence, capture.path, description.description, description.change_summary);
 
-    std.debug.print("\nBRAIN:\n{s}\n", .{text});
+    self.outputBrain(text);
     try self.say(text);
     try self.logSimple(.KnownGreeting, capture.path, id, text, "sighting_created,last_seen_updated");
 }
@@ -201,7 +202,7 @@ pub fn handleUncertain(self: *Brain, capture: events.ImageCapture, result: ident
         if (confirmation.action == .grant_memory_permission) {
             try self.logState(.MergeOrConfirm);
             var updated = try self.ensureCreatorIfFirstRecognized(person);
-            const now = try time_mod.nowTimestamp(self.allocator);
+            const now = try self.timestampNow();
             const description = try self.deps.description_service.describePerson(self.allocator, capture.path, try helpers.personProfileDescription(self.allocator, updated));
             updated.last_seen_at = now;
             updated.sighting_count += 1;
@@ -210,7 +211,7 @@ pub fn handleUncertain(self: *Brain, capture: events.ImageCapture, result: ident
             try self.deps.store.savePerson(updated);
             try self.addSighting(updated.person_id, now, result.confidence, capture.path, description.description, description.change_summary);
             const text = try std.fmt.allocPrint(self.allocator, "Thank you, {s}. I will update your memory.", .{updated.display_name});
-            std.debug.print("\nBRAIN:\n{s}\n", .{text});
+            self.outputBrain(text);
             try self.say(text);
             try self.logSimple(.MergeOrConfirm, capture.path, updated.person_id, text, "confirmed_sighting,embedding_reference_added,last_seen_updated");
             return;
@@ -230,14 +231,14 @@ pub fn handleImmediateIntent(self: *Brain, intent: intent_mod.IntentResult) !boo
         .sleep_autonomy => {
             try self.setAutonomySleeping(true, "user requested sleep");
             const text = "I will sleep my self-directed actions for now.";
-            std.debug.print("\nBRAIN:\n{s}\n", .{text});
+            self.outputBrain(text);
             try self.say(text);
             return true;
         },
         .wake_autonomy => {
             try self.setAutonomySleeping(false, "user requested wake");
             const text = "I am awake for self-directed actions again.";
-            std.debug.print("\nBRAIN:\n{s}\n", .{text});
+            self.outputBrain(text);
             try self.say(text);
             return true;
         },
@@ -283,14 +284,14 @@ pub fn continueFromRecognitionPrompt(self: *Brain, capture: events.ImageCapture,
 
     if (spoken_text.len == 0 and pending_interrupt == null) {
         spoken_text = "I am listening. Tell me what I should know or check next.";
-        std.debug.print("\nBRAIN:\n{s}\n", .{spoken_text});
+        self.outputBrain(spoken_text);
         try self.say(spoken_text);
     }
 
     const summary_turn = final_turn orelse try self.deps.chat_service.respond(self.allocator, memory, user_text, observations.items);
     try self.deps.store.addConversationSummary(.{
         .summary_id = try std.fmt.allocPrint(self.allocator, "recognition_conversation_{d}_{d}", .{ self.now_seconds, self.now_seconds + @as(i64, @intCast(user_text.len)) }),
-        .time = try time_mod.nowTimestamp(self.allocator),
+        .time = try self.timestampNow(),
         .user_summary = summary_turn.user_summary,
         .brain_summary = summary_turn.brain_summary,
     });
@@ -306,13 +307,11 @@ pub fn recognizeConversationSpeaker(self: *Brain) !ConversationSpeakerContext {
     var capture = try self.deps.camera.capture(self.allocator);
     self.rememberVisualUpdate(capture.path);
     self.last_visual_observation_uploaded = false;
-    std.debug.print("Image: {s}\n", .{capture.path});
+    self.outputImageCapture(capture);
 
     try self.logState(.Identify);
     const result = try self.deps.recognizer.identify(self.allocator, capture.path);
-    std.debug.print("Recognition: {s}, confidence={d:.2}", .{ @tagName(result.match_status), result.confidence });
-    if (result.candidate_name) |candidate| std.debug.print(", candidate={s}", .{candidate});
-    std.debug.print("\n", .{});
+    self.outputRecognitionResult(result);
 
     if (!result.person_present or result.match_status == .none) {
         try self.logSimple(.DetectPerson, capture.path, null, null, "conversation_no_person");
@@ -325,7 +324,7 @@ pub fn recognizeConversationSpeaker(self: *Brain) !ConversationSpeakerContext {
             const id = result.person_id orelse return .{ .capture = capture, .result = result, .memory_line = try conversationSpeakerLine(self, capture.path, result, null, "known match without a stored person id"), .chat_label = result.candidate_name orelse "Unknown speaker" };
             var person = (try self.deps.store.findById(self.allocator, id)) orelse try self.seedKnownPerson(id, result.candidate_name orelse "Mara");
             person = try self.ensureCreatorIfFirstRecognized(person);
-            const now = try time_mod.nowTimestamp(self.allocator);
+            const now = try self.timestampNow();
             person.last_seen_at = now;
             person.sighting_count += 1;
             try self.deps.store.savePerson(person);
@@ -555,7 +554,7 @@ pub fn handleIdentityClaim(self: *Brain, intent: intent_mod.IntentResult, speake
 
     const person = (try self.deps.store.findByName(self.allocator, name)) orelse {
         const prompt = try std.fmt.allocPrint(self.allocator, "I do not have a stored profile for {s} yet. Would you like me to create one now?", .{name});
-        std.debug.print("\nBRAIN:\n{s}\n", .{prompt});
+        self.outputBrain(prompt);
         try self.say(prompt);
         try self.logSimple(.TransientConversation, speaker_context.capture.path, null, prompt, "identity_claim_profile_not_found,profile_creation_offered");
 
@@ -564,14 +563,14 @@ pub fn handleIdentityClaim(self: *Brain, intent: intent_mod.IntentResult, speake
         if (try handleImmediateIntent(self, confirmation)) return true;
         if (confirmation.action == .deny_memory_permission) {
             const text = try std.fmt.allocPrint(self.allocator, "Okay. I will not create a profile for {s}.", .{name});
-            std.debug.print("\nBRAIN:\n{s}\n", .{text});
+            self.outputBrain(text);
             try self.say(text);
             try self.logSimple(.TransientConversation, speaker_context.capture.path, null, text, "identity_claim_profile_creation_declined");
             return true;
         }
         if (confirmation.action != .grant_memory_permission) {
             const text = "I need a clear yes before I create a new profile.";
-            std.debug.print("\nBRAIN:\n{s}\n", .{text});
+            self.outputBrain(text);
             try self.say(text);
             try self.logSimple(.TransientConversation, speaker_context.capture.path, null, text, "identity_claim_profile_creation_unconfirmed");
             return true;
@@ -602,7 +601,7 @@ pub fn handleIdentityClaim(self: *Brain, intent: intent_mod.IntentResult, speake
         };
 
         const text = try std.fmt.allocPrint(self.allocator, "Got it, {s}. I created your profile and will use this sighting to recognize you.", .{created.display_name});
-        std.debug.print("\nBRAIN:\n{s}\n", .{text});
+        self.outputBrain(text);
         try self.say(text);
         try self.logSimple(.RegisterPerson, speaker_context.capture.path, created.person_id, text, "identity_claim_profile_created,sighting_created");
         return true;
@@ -610,7 +609,7 @@ pub fn handleIdentityClaim(self: *Brain, intent: intent_mod.IntentResult, speake
 
     try self.logState(.MergeOrConfirm);
     var updated = try self.ensureCreatorIfFirstRecognized(person);
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     const description = try self.deps.description_service.describePerson(self.allocator, speaker_context.capture.path, try helpers.personProfileDescription(self.allocator, updated));
     updated.last_seen_at = now;
     updated.sighting_count += 1;
@@ -634,7 +633,7 @@ pub fn handleIdentityClaim(self: *Brain, intent: intent_mod.IntentResult, speake
     };
 
     const text = try std.fmt.allocPrint(self.allocator, "Got it, {s}. I will use this sighting to recognize you.", .{updated.display_name});
-    std.debug.print("\nBRAIN:\n{s}\n", .{text});
+    self.outputBrain(text);
     try self.say(text);
     try self.logSimple(.MergeOrConfirm, speaker_context.capture.path, updated.person_id, text, "identity_claim_confirmed,embedding_reference_added,last_seen_updated");
     return true;
@@ -660,7 +659,7 @@ pub fn resolveIdentityClaimName(self: *Brain, intent: intent_mod.IntentResult) !
     }
 
     const text = "I need the name I would know you by before I can update that memory.";
-    std.debug.print("\nBRAIN:\n{s}\n", .{text});
+    self.outputBrain(text);
     try self.say(text);
     return null;
 }

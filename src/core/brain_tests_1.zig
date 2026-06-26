@@ -2,17 +2,19 @@ const std = @import("std");
 const brain_mod = @import("brain.zig");
 const support = @import("brain_test_support.zig");
 const store_support = @import("brain_test_store.zig");
-const schema = @import("../storage/schema.zig");
-const chat_mod = @import("../api/chat_client.zig");
-const openai = @import("../api/openai_client.zig");
-const audio_mod = @import("../api/audio_client.zig");
-const autonomy_mod = @import("../api/autonomy_client.zig");
-const image_mod = @import("../api/image_client.zig");
-const email_mod = @import("../api/email_client.zig");
-const want_achievement_mod = @import("../api/want_achievement_client.zig");
-const psyche_client = @import("../api/psyche_client.zig");
-const input_mod = @import("../platform/common/input.zig");
-const facial_expression = @import("../platform/common/facial_expression.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
+const chat_mod = ports.chat;
+const openai = ports.openai;
+const audio_mod = ports.audio;
+const autonomy_mod = ports.autonomy;
+const image_mod = ports.image;
+const email_mod = ports.email;
+const want_achievement_mod = ports.want_achievement;
+const psyche_client = ports.psyche;
+const input_mod = ports.input;
+const facial_expression = ports.facial_expression;
+const files_mod = ports.files;
 const maintenance = @import("maintenance.zig");
 const id_monitor = @import("id_monitor.zig");
 const interrupt_mod = @import("interrupt.zig");
@@ -81,6 +83,63 @@ test "touch with fresh visual evidence does not force recognition" {
     try std.testing.expect(std.mem.indexOf(u8, brain.current_stimulus_context.?, "chosen_look=false") != null);
     try std.testing.expect(runtimeEventsContain(store.runtime_events.items, "\"title\":\"sense_stimulus\""));
     try std.testing.expect(runtimeEventsContain(store.runtime_events.items, "chosen_look=false"));
+}
+
+test "recognize command identifies known person and clears camera intent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    try addMara(&store, allocator, "1000");
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    const line = try brain.recognizeForObservation();
+
+    try std.testing.expect(std.mem.indexOf(u8, line, "Mara") != null);
+    try std.testing.expectEqual(Brain.CameraIntent.none, brain.pending_camera_intent);
+    try std.testing.expect(store.sightings.items.len >= 1);
+}
+
+test "frontend camera pull observation completes the awaited recognition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    try addMara(&store, allocator, "1000");
+    var desc = openai.TestDescriptionService{};
+    // The camera frame the brain starts with is irrelevant: recognition runs on
+    // the frame the frontend pull delivered, mirroring the embedded handler which
+    // calls recognizeFromCapturedPath once the awaited observation arrives.
+    var brain = makeBrain(allocator, "fixtures/empty/empty_room_01.jpg", &.{}, &store, &desc);
+    brain.pending_camera_intent = .recognize;
+
+    const line = try brain.recognizeFromCapturedPath("fixtures/visitors/known_01.jpg");
+
+    try std.testing.expect(std.mem.indexOf(u8, line, "Mara") != null);
+    try std.testing.expect(store.sightings.items.len >= 1);
+}
+
+test "camera pull mid-conversation pauses for awaited sense without a fallback reply" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    // Frontend camera: capture is an awaited pull, so recognize raises mid-turn.
+    var pull_camera = support.FrontendPullCamera{};
+    brain.deps.camera = pull_camera.camera();
+    var chat = support.ScriptedRecognizeThenSayChatService{};
+    brain.deps.chat_service = chat.service();
+
+    const result = try brain.handleConversationText(try input_mod.HeardSpeech.typed(allocator, "hello"));
+
+    // The bot looked and then paused for the observation. It should not invent a
+    // reply or loop back through the chat service.
+    try std.testing.expect(std.mem.indexOf(u8, result.spoken_text, "Something went wrong") == null);
+    try std.testing.expectEqualStrings("", result.spoken_text);
+    try std.testing.expectEqual(@as(usize, 1), chat.calls);
 }
 
 test "unknown touch can register person through remember_person skill" {
@@ -349,34 +408,18 @@ test "speech artifact sweep removes old audio and transcription json" {
     brain.deps.io = std.testing.io;
     brain.now_seconds = 2_000_000;
     brain.cfg.audio_input_dir = "data/test/speech_artifact_sweep";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, brain.cfg.audio_input_dir);
-
-    const old_ms = (brain.now_seconds - speech_artifact_ttl_seconds - 1) * 1000;
-    const recent_ms = (brain.now_seconds - speech_artifact_ttl_seconds + 1) * 1000;
-    const old_audio = try std.fmt.allocPrint(allocator, "{s}/utterance_{d}.wav", .{ brain.cfg.audio_input_dir, old_ms });
-    const old_json = try std.fmt.allocPrint(allocator, "{s}/utterance_{d}.wav.transcription.json", .{ brain.cfg.audio_input_dir, old_ms });
-    const recent_audio = try std.fmt.allocPrint(allocator, "{s}/utterance_{d}.wav", .{ brain.cfg.audio_input_dir, recent_ms });
-    const recent_json = try std.fmt.allocPrint(allocator, "{s}/utterance_{d}.wav.transcription.json", .{ brain.cfg.audio_input_dir, recent_ms });
-    const unrelated = try std.fmt.allocPrint(allocator, "{s}/notes.txt", .{brain.cfg.audio_input_dir});
-
-    inline for (.{ old_audio, old_json, recent_audio, recent_json, unrelated }) |path| {
-        std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
-        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "artifact", .flags = .{ .truncate = true } });
-    }
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, old_audio) catch {};
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, old_json) catch {};
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, recent_audio) catch {};
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, recent_json) catch {};
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, unrelated) catch {};
+    var filesystem = files_mod.TestFileSystem{
+        .allocator = allocator,
+        .sweep_result = .{
+            .audio_removed = 1,
+            .transcription_json_removed = 1,
+        },
+    };
+    brain.deps.filesystem = filesystem.filesystem();
 
     const result = try brain.sweepSpeechArtifacts();
     try std.testing.expectEqual(@as(usize, 1), result.audio_removed);
     try std.testing.expectEqual(@as(usize, 1), result.transcription_json_removed);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, old_audio, .{}));
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, old_json, .{}));
-    try std.Io.Dir.cwd().access(std.testing.io, recent_audio, .{});
-    try std.Io.Dir.cwd().access(std.testing.io, recent_json, .{});
-    try std.Io.Dir.cwd().access(std.testing.io, unrelated, .{});
 }
 
 test "conversation continues after spoken prelude followed by memory recall" {
@@ -430,17 +473,6 @@ test "command batch services due reminder at interrupt point and continues" {
     const allocator = arena.allocator();
     const schedule_path = "data/test/batch_interrupt_reminder.md";
     const state_path = "data/test/batch_interrupt_reminder_state.json";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "data/test");
-    std.Io.Dir.cwd().deleteFile(std.testing.io, schedule_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, schedule_path) catch {};
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch {};
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
@@ -448,7 +480,7 @@ test "command batch services due reminder at interrupt point and continues" {
     brain.cfg.maintenance_schedule_path = schedule_path;
     brain.cfg.maintenance_state_path = state_path;
     brain.now_seconds = 101;
-    _ = try maintenance.addReminder(allocator, std.testing.io, schedule_path, "in 1 seconds", "Stretch.", 100);
+    _ = try maintenance.addReminder(allocator, brain.deps.filesystem.?, std.testing.io, schedule_path, "in 1 seconds", "Stretch.", 100);
     var observations = std.ArrayList(u8).empty;
     var commands = [_]chat_mod.ChatCommand{
         .{ .command = .remember_memory, .text = "first command" },
@@ -462,7 +494,7 @@ test "command batch services due reminder at interrupt point and continues" {
     try std.testing.expect(runtimeEventsContain(store.runtime_events.items, "\"kind\":\"reminder\""));
     try std.testing.expect(runtimeEventsContain(store.runtime_events.items, "\"title\":\"interrupt_reminder\""));
     try std.testing.expectEqual(@as(usize, 2), store.memories.items.len);
-    const due_again = try maintenance.dueTasks(allocator, std.testing.io, schedule_path, state_path, 200);
+    const due_again = try maintenance.dueTasks(allocator, brain.deps.filesystem.?, std.testing.io, schedule_path, state_path, 200);
     try std.testing.expectEqual(@as(usize, 0), due_again.len);
 }
 

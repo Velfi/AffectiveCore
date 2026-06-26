@@ -4,23 +4,27 @@ const config_mod = @import("config.zig");
 const events = @import("events.zig");
 const identity = @import("identity.zig");
 const interrupt_mod = @import("interrupt.zig");
-const schema = @import("../storage/schema.zig");
-const store_mod = @import("../storage/store.zig");
-const graph_store = @import("../storage/graph_store.zig");
-const intent_mod = @import("../api/intent_client.zig");
-const openai = @import("../api/openai_client.zig");
-const greeting_client = @import("../api/greeting_client.zig");
-const chat_mod = @import("../api/chat_client.zig");
-const speech_mod = @import("../api/speech_client.zig");
-const audio_mod = @import("../api/audio_client.zig");
-const image_mod = @import("../api/image_client.zig");
-const want_achievement_mod = @import("../api/want_achievement_client.zig");
-const camera_mod = @import("../platform/common/camera.zig");
-const input_mod = @import("../platform/common/input.zig");
-const speaker_mod = @import("../platform/common/speaker.zig");
-const system_senses_mod = @import("../platform/common/system_senses.zig");
-const command_log_mod = @import("../platform/common/command_log.zig");
-const facial_expression = @import("../platform/common/facial_expression.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
+const store_mod = ports.store;
+const graph_store = ports.graph_store;
+const intent_mod = ports.intent;
+const openai = ports.openai;
+const greeting_client = ports.greeting;
+const chat_mod = ports.chat;
+const speech_mod = ports.speech;
+const audio_mod = ports.audio;
+const image_mod = ports.image;
+const want_achievement_mod = ports.want_achievement;
+const camera_mod = ports.camera;
+const input_mod = ports.input;
+const speaker_mod = ports.speaker;
+const system_senses_mod = ports.system_senses;
+const files_mod = ports.files;
+const clock_mod = ports.clock;
+const command_log_mod = ports.command_log;
+const facial_expression = ports.facial_expression;
+const process_mod = ports.process;
 const id_monitor = @import("id_monitor.zig");
 const maintenance = @import("maintenance.zig");
 
@@ -36,6 +40,90 @@ pub const TestCamera = struct {
     fn capture(ctx: *anyopaque, _: std.mem.Allocator) !events.ImageCapture {
         const self: *TestCamera = @ptrCast(@alignCast(ctx));
         return .{ .path = self.image, .temporary = true };
+    }
+};
+
+/// Mirrors the real frontend camera: every capture is an awaited pull, signalled
+/// by raising FrontendCaptureRequested rather than returning a frame inline.
+pub const FrontendPullCamera = struct {
+    pub fn camera(self: *FrontendPullCamera) camera_mod.Camera {
+        return .{ .ctx = self, .captureFn = capture };
+    }
+    fn capture(_: *anyopaque, _: std.mem.Allocator) !events.ImageCapture {
+        return error.FrontendCaptureRequested;
+    }
+};
+
+/// Chooses to look (recognize) on the first turn; the awaited host sense should
+/// pause the conversation until the observation arrives.
+pub const ScriptedRecognizeThenSayChatService = struct {
+    calls: usize = 0,
+
+    pub fn service(self: *ScriptedRecognizeThenSayChatService) chat_mod.ChatService {
+        return .{ .ctx = self, .respondFn = respond };
+    }
+
+    fn respond(ctx: *anyopaque, allocator: std.mem.Allocator, _: []const u8, user_text: []const u8, observations: []const u8) !chat_mod.ChatTurn {
+        const self: *ScriptedRecognizeThenSayChatService = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (self.calls == 1) {
+            try std.testing.expect(std.mem.indexOf(u8, observations, "social_context:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, observations, "camera_pullable: true") != null);
+            const commands = try allocator.alloc(chat_mod.ChatCommand, 1);
+            commands[0] = .{ .command = .recognize };
+            return .{
+                .commands = commands,
+                .user_summary = try allocator.dupe(u8, user_text),
+                .brain_summary = try allocator.dupe(u8, "Chose to look at who is here."),
+                .conversation_done = false,
+            };
+        }
+        return error.UnexpectedSecondSensePullTurn;
+    }
+};
+
+pub const TestRecognitionClient = struct {
+    known_threshold: f32 = 0.85,
+    uncertain_threshold: f32 = 0.60,
+
+    pub fn recognizer(self: *TestRecognitionClient) identity.IdentityRecognizer {
+        return .{ .ctx = self, .identifyFn = identify };
+    }
+
+    fn identify(ctx: *anyopaque, _: std.mem.Allocator, path: []const u8) !identity.IdentityResult {
+        const self: *TestRecognitionClient = @ptrCast(@alignCast(ctx));
+        if (std.mem.indexOf(u8, path, "empty") != null) {
+            return .{ .person_present = false, .match_status = .none, .confidence = 0, .people_count = 0 };
+        }
+        if (std.mem.indexOf(u8, path, "known_changed") != null) {
+            const confidence: f32 = 0.72;
+            return .{
+                .person_present = true,
+                .match_status = identity.statusFromConfidence(true, confidence, self.known_threshold, self.uncertain_threshold),
+                .person_id = "person_001",
+                .confidence = confidence,
+                .candidate_name = "Mara",
+                .people_count = 1,
+            };
+        }
+        if (std.mem.indexOf(u8, path, "unknown") != null) {
+            return .{ .person_present = true, .match_status = .unknown, .confidence = 0.40, .people_count = 1 };
+        }
+        if (std.mem.indexOf(u8, path, "known") != null) {
+            const confidence: f32 = 0.91;
+            return .{
+                .person_present = true,
+                .match_status = identity.statusFromConfidence(true, confidence, self.known_threshold, self.uncertain_threshold),
+                .person_id = "person_001",
+                .confidence = confidence,
+                .candidate_name = "Mara",
+                .people_count = 1,
+            };
+        }
+        if (std.mem.indexOf(u8, path, "multiple") != null) {
+            return .{ .person_present = true, .match_status = .multiple, .confidence = 0.66, .people_count = 2 };
+        }
+        return .{ .person_present = true, .match_status = .unknown, .confidence = 0.40, .people_count = 1 };
     }
 };
 
@@ -115,6 +203,55 @@ pub const TestIdMonitor = struct {
         return monitor_events;
     }
 };
+
+pub const TestProcessRunner = struct {
+    pub fn runner(self: *TestProcessRunner) process_mod.ProcessRunner {
+        return .{
+            .ctx = self,
+            .runCommandFn = runCommand,
+            .runOptionalCommandFn = runOptionalCommand,
+            .runCaptureFn = runCapture,
+            .runCaptureLargeFn = runCapture,
+        };
+    }
+
+    fn runCommand(_: *anyopaque, _: std.mem.Allocator, _: std.Io, _: []const []const u8) !void {}
+
+    fn runOptionalCommand(_: *anyopaque, _: std.mem.Allocator, _: std.Io, _: []const []const u8) !void {}
+
+    fn runCapture(_: *anyopaque, allocator: std.mem.Allocator, _: std.Io, argv: []const []const u8) ![]u8 {
+        if (argv.len == 2 and std.mem.eql(u8, argv[0], "date") and std.mem.eql(u8, argv[1], "+%F")) {
+            return allocator.dupe(u8, "2026-06-23\n");
+        }
+        if (argv.len == 2 and std.mem.eql(u8, argv[0], "date") and std.mem.eql(u8, argv[1], "+%H:%M")) {
+            return allocator.dupe(u8, "12:30\n");
+        }
+        return error.UnexpectedTestProcessCommand;
+    }
+
+    fn runCaptureLarge(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
+        return runCapture(ctx, allocator, io, argv);
+    }
+};
+
+pub const TestClock = struct {
+    now_seconds: i64 = 1_781_222_400,
+
+    pub fn clock(self: *TestClock) clock_mod.Clock {
+        return .{ .ctx = self, .nowSecondsFn = nowSeconds };
+    }
+
+    fn nowSeconds(ctx: *anyopaque, _: std.Io) !i64 {
+        const self: *TestClock = @ptrCast(@alignCast(ctx));
+        return self.now_seconds;
+    }
+};
+
+pub fn localFileSystem(allocator: std.mem.Allocator) files_mod.FileSystem {
+    var filesystem = allocator.create(files_mod.TestFileSystem) catch unreachable;
+    filesystem.* = .{ .allocator = allocator };
+    return filesystem.filesystem();
+}
 
 pub const ScriptedRecallChatService = struct {
     calls: usize = 0,
@@ -352,7 +489,7 @@ pub fn makeBrain(allocator: std.mem.Allocator, image: []const u8, answers: []con
     camera.* = .{ .image = image };
     var input = allocator.create(TestInput) catch unreachable;
     input.* = .{ .answers = answers };
-    var recog = allocator.create(@import("../api/recognition_client.zig").TestRecognitionClient) catch unreachable;
+    var recog = allocator.create(TestRecognitionClient) catch unreachable;
     recog.* = .{};
     var intent = allocator.create(intent_mod.TestIntentService) catch unreachable;
     intent.* = .{};
@@ -368,6 +505,10 @@ pub fn makeBrain(allocator: std.mem.Allocator, image: []const u8, answers: []con
     speech.* = .{};
     var speaker = allocator.create(speaker_mod.TestSpeaker) catch unreachable;
     speaker.* = .{};
+    var process_runner = allocator.create(TestProcessRunner) catch unreachable;
+    process_runner.* = .{};
+    var clock = allocator.create(TestClock) catch unreachable;
+    clock.* = .{};
     var senses = allocator.create(system_senses_mod.StaticSystemSenses) catch unreachable;
     senses.* = .{ .snapshot_value = .{
         .datetime = .{
@@ -386,8 +527,8 @@ pub fn makeBrain(allocator: std.mem.Allocator, image: []const u8, answers: []con
             .{ .label = "relationship_graph", .path = "data/memory/relationships.sqlite", .page_count = 12, .page_size = 4096, .freelist_count = 0, .total_bytes = 49152, .table_count = 4 },
         } },
     } };
-    var graph_impl = allocator.create(graph_store.SqliteGraphStore) catch unreachable;
-    graph_impl.* = graph_store.SqliteGraphStore.init(allocator, std.testing.io, ":memory:") catch unreachable;
+    var graph_impl = allocator.create(graph_store.TestGraphStore) catch unreachable;
+    graph_impl.* = .{};
 
     return Brain.init(allocator, .{}, .{
         .io = null,
@@ -407,6 +548,9 @@ pub fn makeBrain(allocator: std.mem.Allocator, image: []const u8, answers: []con
         .store = store.store(),
         .graph = graph_impl.store(),
         .system_senses = senses.senses(),
+        .clock = clock.clock(),
+        .filesystem = localFileSystem(allocator),
+        .process_runner = process_runner.runner(),
     });
 }
 

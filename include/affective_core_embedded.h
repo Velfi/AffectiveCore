@@ -22,9 +22,6 @@ typedef struct AffectiveCoreEmbeddedConfig {
     AffectiveCoreEmbeddedString conversation_reasoning_effort;
     AffectiveCoreEmbeddedString image_generation_model;
     AffectiveCoreEmbeddedString image_generation_output_dir;
-    AffectiveCoreEmbeddedString openai_api_key;
-    AffectiveCoreEmbeddedString anthropic_api_key;
-    AffectiveCoreEmbeddedString google_api_key;
     AffectiveCoreEmbeddedString memory_path;
     AffectiveCoreEmbeddedString graph_path;
     AffectiveCoreEmbeddedString schedule_path;
@@ -80,27 +77,13 @@ int affective_core_embedded_dispatch_json(
     AffectiveCoreEmbeddedString *out_error
 );
 
-int affective_core_embedded_dispatch_json_v2(
-    AffectiveCoreEmbedded *handle,
-    const uint8_t *request_json,
-    size_t request_json_len,
-    AffectiveCoreEmbeddedString *out_data,
-    AffectiveCoreEmbeddedString *out_error
-);
-
 int affective_core_embedded_drain_events_json(
     AffectiveCoreEmbedded *handle,
     AffectiveCoreEmbeddedString *out_data,
     AffectiveCoreEmbeddedString *out_error
 );
 
-int affective_core_embedded_drain_events_json_v2(
-    AffectiveCoreEmbedded *handle,
-    AffectiveCoreEmbeddedString *out_data,
-    AffectiveCoreEmbeddedString *out_error
-);
-
-int affective_core_embedded_raw_ref_lookup_json_v2(
+int affective_core_embedded_raw_ref_lookup_json(
     AffectiveCoreEmbedded *handle,
     const uint8_t *raw_ref,
     size_t raw_ref_len,
@@ -132,7 +115,7 @@ int affective_core_embedded_introspect(
     AffectiveCoreEmbeddedString *out_error
 );
 
-int affective_core_embedded_introspect_json_v2(
+int affective_core_embedded_introspect_json(
     AffectiveCoreEmbedded *handle,
     AffectiveCoreEmbeddedString *out_data,
     AffectiveCoreEmbeddedString *out_error

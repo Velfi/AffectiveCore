@@ -1,30 +1,11 @@
 const std = @import("std");
 const files = @import("../platform/common/files.zig");
 const process = @import("../platform/common/process.zig");
+const speech_port = @import("../core/port_speech.zig");
 
-pub const AudioFile = struct {
-    path: []const u8,
-};
-
-pub const SpeechService = struct {
-    ctx: *anyopaque,
-    synthesizeFn: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!AudioFile,
-
-    pub fn synthesize(self: SpeechService, allocator: std.mem.Allocator, text: []const u8) !AudioFile {
-        return self.synthesizeFn(self.ctx, allocator, text);
-    }
-};
-
-pub const TestSpeechService = struct {
-    pub fn service(self: *TestSpeechService) SpeechService {
-        return .{ .ctx = self, .synthesizeFn = synthesize };
-    }
-
-    fn synthesize(_: *anyopaque, allocator: std.mem.Allocator, text: []const u8) !AudioFile {
-        std.debug.print("SPEECH TEST: {s}\n", .{text});
-        return .{ .path = try allocator.dupe(u8, "test://speech") };
-    }
-};
+pub const AudioFile = speech_port.AudioFile;
+pub const SpeechService = speech_port.SpeechService;
+pub const TestSpeechService = speech_port.TestSpeechService;
 
 pub const SpeakNSpellSpeechService = struct {
     io: std.Io,

@@ -6,12 +6,15 @@ const speaker_mod = @import("../platform/common/speaker.zig");
 const speech_mod = @import("../api/speech_client.zig");
 const chat = @import("../api/chat_client.zig");
 
-pub const api_version: u8 = 1;
-pub const api_version_v2: u8 = 2;
-
 pub const HostEvent = struct {
     type: []const u8,
     request_id: ?[]const u8 = null,
+    expression_id: ?[]const u8 = null,
+    modality: ?[]const u8 = null,
+    visibility: ?[]const u8 = null,
+    capability: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
     role: ?[]const u8 = null,
     text: ?[]const u8 = null,
     state: ?[]const u8 = null,
@@ -23,12 +26,15 @@ pub const HostEvent = struct {
     eyes: ?[]const u8 = null,
     mouth: ?[]const u8 = null,
     duration_ms: ?u32 = null,
+    path: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    mime_type: ?[]const u8 = null,
+    caption: ?[]const u8 = null,
     raw_ref: ?[]const u8 = null,
     original_bytes: ?usize = null,
 };
 
 pub const HostManifest = struct {
-    api_version: u8,
     platform: []const u8,
     capabilities: chat.CapabilitySet,
     feature_flags: std.json.ObjectMap,
@@ -41,7 +47,6 @@ pub const HostManifest = struct {
 pub fn defaultMacosManifestJson() []const u8 {
     return
     \\{
-    \\  "api_version": 1,
     \\  "platform": "macos",
     \\  "storage_provider": "file_backed_migration",
     \\  "capabilities": [
@@ -83,8 +88,6 @@ pub fn parseHostManifest(allocator: std.mem.Allocator, json: []const u8) !HostMa
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidHostManifest;
     const object = parsed.value.object;
-    const api = getInteger(object, "api_version") orelse return error.MissingHostManifestApiVersion;
-    if (api != api_version and api != api_version_v2) return error.UnsupportedHostManifestApiVersion;
     const platform = getString(object, "platform") orelse return error.MissingHostManifestPlatform;
     const capabilities_value = object.get("capabilities") orelse return error.MissingHostManifestCapabilities;
     if (capabilities_value != .array) return error.InvalidHostManifestCapabilities;
@@ -100,7 +103,6 @@ pub fn parseHostManifest(allocator: std.mem.Allocator, json: []const u8) !HostMa
     }
 
     return .{
-        .api_version = @intCast(api),
         .platform = try allocator.dupe(u8, platform),
         .capabilities = capabilities,
         .feature_flags = try cloneObjectMap(allocator, flags_value.object),
@@ -112,7 +114,7 @@ pub fn parseHostManifest(allocator: std.mem.Allocator, json: []const u8) !HostMa
 }
 
 fn applyCapability(capabilities: *chat.CapabilitySet, name: []const u8) !void {
-    if (std.mem.eql(u8, name, "live_camera")) capabilities.live_camera = true else if (std.mem.eql(u8, name, "button_activation") or std.mem.eql(u8, name, "short_touch") or std.mem.eql(u8, name, "poke_sequence")) capabilities.button_activation = true else if (std.mem.eql(u8, name, "button_hold_state") or std.mem.eql(u8, name, "long_touch")) capabilities.button_hold_state = true else if (std.mem.eql(u8, name, "visual_description")) capabilities.visual_description = true else if (std.mem.eql(u8, name, "visual_comparison")) capabilities.visual_comparison = true else if (std.mem.eql(u8, name, "identity_recognition")) capabilities.identity_recognition = true else if (std.mem.eql(u8, name, "stored_memory_read")) capabilities.stored_memory_read = true else if (std.mem.eql(u8, name, "stored_memory_write")) capabilities.stored_memory_write = true else if (std.mem.eql(u8, name, "stored_image_read")) capabilities.stored_image_read = true else if (std.mem.eql(u8, name, "introspection")) capabilities.introspection = true else if (std.mem.eql(u8, name, "time_lookup")) capabilities.time_lookup = true else if (std.mem.eql(u8, name, "orientation_query")) capabilities.orientation_query = true else if (std.mem.eql(u8, name, "power_status")) capabilities.power_status = true else if (std.mem.eql(u8, name, "storage_fullness")) capabilities.storage_fullness = true else if (std.mem.eql(u8, name, "database_stats")) capabilities.database_stats = true else if (std.mem.eql(u8, name, "speech_output")) capabilities.speech_output = true else if (std.mem.eql(u8, name, "user_input") or std.mem.eql(u8, name, "speech_transcript") or std.mem.eql(u8, name, "typed_text")) capabilities.user_input = true else if (std.mem.eql(u8, name, "reminder_io")) capabilities.reminder_io = true else if (std.mem.eql(u8, name, "image_generation")) capabilities.image_generation = true else if (std.mem.eql(u8, name, "face_picture_update")) capabilities.face_picture_update = true else if (std.mem.eql(u8, name, "email_delivery")) capabilities.email_delivery = true else if (std.mem.eql(u8, name, "local_process_io")) capabilities.local_process_io = true else if (std.mem.eql(u8, name, "uploaded_media_read") or std.mem.eql(u8, name, "media_uploaded")) capabilities.uploaded_media_read = true else if (std.mem.eql(u8, name, "audio_classification")) capabilities.audio_classification = true else if (std.mem.eql(u8, name, "audio_transcription")) capabilities.audio_transcription = true else if (std.mem.eql(u8, name, "video_inspection")) capabilities.video_inspection = true else if (std.mem.eql(u8, name, "facial_expression_output")) capabilities.facial_expression_output = true else if (std.mem.eql(u8, name, "tool_call") or std.mem.eql(u8, name, "maintenance_tick") or std.mem.eql(u8, name, "autonomy_tick") or std.mem.eql(u8, name, "event_envelope") or std.mem.eql(u8, name, "event_drain") or std.mem.eql(u8, name, "sense_observation")) {} else return error.UnknownHostCapability;
+    if (std.mem.eql(u8, name, "camera_capture")) capabilities.live_camera = true else if (std.mem.eql(u8, name, "button_activation") or std.mem.eql(u8, name, "short_touch") or std.mem.eql(u8, name, "poke_sequence")) capabilities.button_activation = true else if (std.mem.eql(u8, name, "button_hold_state") or std.mem.eql(u8, name, "long_touch")) capabilities.button_hold_state = true else if (std.mem.eql(u8, name, "provider_vision_completion")) { capabilities.visual_description = true; capabilities.visual_comparison = true; } else if (std.mem.eql(u8, name, "face_identification")) capabilities.identity_recognition = true else if (std.mem.eql(u8, name, "memory_read")) capabilities.stored_memory_read = true else if (std.mem.eql(u8, name, "memory_write")) capabilities.stored_memory_write = true else if (std.mem.eql(u8, name, "stored_image_read")) capabilities.stored_image_read = true else if (std.mem.eql(u8, name, "introspection")) capabilities.introspection = true else if (std.mem.eql(u8, name, "time_lookup")) capabilities.time_lookup = true else if (std.mem.eql(u8, name, "orientation_read")) capabilities.orientation_query = true else if (std.mem.eql(u8, name, "power_status")) capabilities.power_status = true else if (std.mem.eql(u8, name, "storage_fullness")) capabilities.storage_fullness = true else if (std.mem.eql(u8, name, "database_stats")) capabilities.database_stats = true else if (std.mem.eql(u8, name, "speech_output")) capabilities.speech_output = true else if (std.mem.eql(u8, name, "text_input") or std.mem.eql(u8, name, "speech_input")) capabilities.user_input = true else if (std.mem.eql(u8, name, "reminder_read") or std.mem.eql(u8, name, "reminder_write") or std.mem.eql(u8, name, "notification_schedule")) capabilities.reminder_io = true else if (std.mem.eql(u8, name, "provider_image_generation")) capabilities.image_generation = true else if (std.mem.eql(u8, name, "face_enrollment")) capabilities.face_picture_update = true else if (std.mem.eql(u8, name, "email_delivery")) capabilities.email_delivery = true else if (std.mem.eql(u8, name, "local_process_io")) capabilities.local_process_io = true else if (std.mem.eql(u8, name, "uploaded_media_read") or std.mem.eql(u8, name, "media_uploaded")) capabilities.uploaded_media_read = true else if (std.mem.eql(u8, name, "audio_classification")) capabilities.audio_classification = true else if (std.mem.eql(u8, name, "audio_transcription")) capabilities.audio_transcription = true else if (std.mem.eql(u8, name, "video_inspection")) capabilities.video_inspection = true else if (std.mem.eql(u8, name, "motion_gesture_read") or std.mem.eql(u8, name, "microphone_capture") or std.mem.eql(u8, name, "provider_text_completion") or std.mem.eql(u8, name, "file_import") or std.mem.eql(u8, name, "file_export")) {} else return error.UnknownHostCapability;
 }
 
 fn cloneObjectMap(allocator: std.mem.Allocator, object: std.json.ObjectMap) std.mem.Allocator.Error!std.json.ObjectMap {
@@ -171,7 +173,6 @@ test "embedded host manifest maps declared capabilities" {
 
     const fixture = try readEmbeddedFixture(allocator, "manifest_macos.json");
     const manifest = try parseHostManifest(allocator, fixture);
-    try std.testing.expectEqual(@as(u8, 1), manifest.api_version);
     try std.testing.expectEqualStrings("macos", manifest.platform);
     try std.testing.expect(manifest.capabilities.button_activation);
     try std.testing.expect(manifest.capabilities.button_hold_state);
@@ -185,29 +186,13 @@ test "embedded host manifest maps declared capabilities" {
     try std.testing.expect(!manifest.capabilities.live_camera);
 }
 
-test "embedded host manifest rejects unsupported versions" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    try std.testing.expectError(error.UnsupportedHostManifestApiVersion, parseHostManifest(allocator,
-        \\{
-        \\  "api_version": 3,
-        \\  "platform": "android",
-        \\  "capabilities": [],
-        \\  "feature_flags": {}
-        \\}
-    ));
-}
-
-test "embedded host manifest accepts android v2 budgets" {
+test "embedded host manifest accepts android budgets" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     const manifest = try parseHostManifest(allocator,
         \\{
-        \\  "api_version": 2,
         \\  "platform": "android",
         \\  "capabilities": ["typed_text", "poke_sequence", "event_envelope", "event_drain", "introspection"],
         \\  "feature_flags": {},
@@ -217,7 +202,6 @@ test "embedded host manifest accepts android v2 budgets" {
         \\  "raw_ref_ttl_seconds": 60
         \\}
     );
-    try std.testing.expectEqual(@as(u8, 2), manifest.api_version);
     try std.testing.expectEqualStrings("android", manifest.platform);
     try std.testing.expectEqual(@as(usize, 8192), manifest.max_envelope_bytes);
     try std.testing.expectEqual(@as(usize, 4), manifest.max_event_count);
@@ -225,49 +209,42 @@ test "embedded host manifest accepts android v2 budgets" {
     try std.testing.expectEqual(@as(i64, 60), manifest.raw_ref_ttl_seconds);
 }
 
-test "embedded api v1 fixtures keep stable envelope shapes" {
-    const request_fixtures = [_][]const u8{
-        "speech_transcript_request.json",
-        "typed_text_request.json",
-        "short_touch_request.json",
-        "long_touch_request.json",
-        "poke_sequence_request.json",
-        "tool_call_request.json",
-    };
-    for (request_fixtures) |name| {
-        const fixture = try readEmbeddedFixture(std.testing.allocator, name);
-        defer std.testing.allocator.free(fixture);
-        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, fixture, .{});
-        defer parsed.deinit();
-        try std.testing.expect(parsed.value == .object);
-        const object = parsed.value.object;
-        try std.testing.expectEqual(@as(i64, 1), getInteger(object, "api_version").?);
-        try std.testing.expect(getString(object, "request_id").?.len > 0);
-        try std.testing.expect(object.get("event").? == .object);
-        try std.testing.expect(getString(object.get("event").?.object, "type").?.len > 0);
-    }
+test "embedded host manifest accepts generic sense capabilities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-    const response_fixtures = [_][]const u8{
-        "success_response.json",
-        "error_response.json",
-        "drain_response.json",
-    };
-    for (response_fixtures) |name| {
-        const fixture = try readEmbeddedFixture(std.testing.allocator, name);
-        defer std.testing.allocator.free(fixture);
-        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, fixture, .{});
-        defer parsed.deinit();
-        try std.testing.expect(parsed.value == .object);
-        const object = parsed.value.object;
-        try std.testing.expectEqual(@as(i64, 1), getInteger(object, "api_version").?);
-        try std.testing.expect(object.get("ok").? == .bool);
-        try std.testing.expect(object.get("events").? == .array);
-        if (object.get("error")) |err_value| {
-            try std.testing.expect(err_value == .object);
-            try std.testing.expect(getString(err_value.object, "code").?.len > 0);
-            try std.testing.expect(getString(err_value.object, "message").?.len > 0);
-        }
-    }
+    const manifest = try parseHostManifest(allocator,
+        \\{
+        \\  "platform": "ios",
+        \\  "capabilities": ["typed_text", "sense_catalog", "sense_status", "sense_observation"],
+        \\  "feature_flags": {}
+        \\}
+    );
+    try std.testing.expect(manifest.capabilities.user_input);
+}
+
+test "host effect collector emits public expressions for text and face output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var collector = HostEffectCollector.init(arena.allocator());
+    try collector.appendCommandLog("brain", "Brain", "Hello there.");
+    try collector.appendFacialExpression(.{ .eyes = "focused", .mouth = "smile_closed" });
+
+    const events = collector.items();
+    try std.testing.expectEqualStrings("state", events[0].type);
+    try std.testing.expectEqualStrings("expression", events[1].type);
+    try std.testing.expectEqualStrings("text", events[1].modality.?);
+    try std.testing.expectEqualStrings("public", events[1].visibility.?);
+    try std.testing.expectEqualStrings("brain", events[1].role.?);
+    try std.testing.expectEqualStrings("Hello there.", events[1].text.?);
+
+    try std.testing.expectEqualStrings("expression", events[2].type);
+    try std.testing.expectEqualStrings("face", events[2].modality.?);
+    try std.testing.expectEqualStrings("focused", events[2].eyes.?);
+    try std.testing.expectEqualStrings("smile_closed", events[2].mouth.?);
+    try std.testing.expectEqualStrings("capability_request", events[3].type);
+    try std.testing.expectEqualStrings("facial_expression_output", events[3].capability.?);
 }
 
 pub const HostEffectCollector = struct {
@@ -289,7 +266,11 @@ pub const HostEffectCollector = struct {
 
     pub fn appendSpeechRequested(self: *HostEffectCollector, text: []const u8) !void {
         try self.events.append(self.allocator, .{
-            .type = "speech_requested",
+            .type = "capability_request",
+            .capability = try self.allocator.dupe(u8, "speech_output"),
+            .modality = try self.allocator.dupe(u8, "audio"),
+            .visibility = try self.allocator.dupe(u8, "public"),
+            .role = try self.allocator.dupe(u8, "brain"),
             .text = try self.allocator.dupe(u8, text),
         });
     }
@@ -300,21 +281,28 @@ pub const HostEffectCollector = struct {
         const owned_title = try self.allocator.dupe(u8, title);
         const owned_body = try self.allocator.dupe(u8, body);
         try self.events.append(self.allocator, .{
-            .type = "command_log",
+            .type = "state",
             .kind = owned_kind,
             .title = owned_title,
             .body = owned_body,
         });
-        if (std.mem.eql(u8, normalized_kind, "brain") or std.mem.eql(u8, normalized_kind, "user")) {
-            try self.events.append(self.allocator, .{
-                .type = "chat_message",
-                .role = owned_kind,
-                .title = owned_title,
-                .text = owned_body,
+        if (std.mem.eql(u8, normalized_kind, "brain")) {
+            try self.appendExpression(.{
+                .modality = "text",
+                .role = "brain",
+                .title = title,
+                .text = body,
+            });
+        } else if (std.mem.eql(u8, normalized_kind, "user")) {
+            try self.appendExpression(.{
+                .modality = "text",
+                .role = "user",
+                .title = title,
+                .text = body,
             });
         } else if (std.mem.eql(u8, normalized_kind, "state")) {
             try self.events.append(self.allocator, .{
-                .type = "state_changed",
+                .type = "state",
                 .state = owned_title,
                 .text = owned_body,
             });
@@ -323,23 +311,69 @@ pub const HostEffectCollector = struct {
 
     pub fn appendSendEnabled(self: *HostEffectCollector, enabled: bool) !void {
         try self.events.append(self.allocator, .{
-            .type = "send_enabled_changed",
+            .type = "control",
+            .state = try self.allocator.dupe(u8, "send_enabled"),
             .enabled = enabled,
         });
     }
 
     pub fn appendFacialExpression(self: *HostEffectCollector, expression: facial_expression.Expression) !void {
+        try self.appendExpression(.{
+            .modality = "face",
+            .role = "brain",
+            .eyes = expression.eyes,
+            .mouth = expression.mouth,
+            .duration_ms = expression.duration_ms,
+        });
         try self.events.append(self.allocator, .{
-            .type = "facial_expression_requested",
+            .type = "capability_request",
+            .capability = try self.allocator.dupe(u8, "facial_expression_output"),
+            .modality = try self.allocator.dupe(u8, "face"),
+            .visibility = try self.allocator.dupe(u8, "public"),
             .eyes = try self.allocator.dupe(u8, expression.eyes),
             .mouth = try self.allocator.dupe(u8, expression.mouth),
             .duration_ms = expression.duration_ms,
         });
     }
 
+    const ExpressionDraft = struct {
+        modality: []const u8,
+        role: []const u8 = "brain",
+        title: ?[]const u8 = null,
+        text: ?[]const u8 = null,
+        eyes: ?[]const u8 = null,
+        mouth: ?[]const u8 = null,
+        duration_ms: ?u32 = null,
+        path: ?[]const u8 = null,
+        url: ?[]const u8 = null,
+        mime_type: ?[]const u8 = null,
+        caption: ?[]const u8 = null,
+    };
+
+    fn appendExpression(self: *HostEffectCollector, draft: ExpressionDraft) !void {
+        const expression_id = try std.fmt.allocPrint(self.allocator, "expression_{d}", .{self.events.items.len});
+        try self.events.append(self.allocator, .{
+            .type = "expression",
+            .expression_id = expression_id,
+            .modality = try self.allocator.dupe(u8, draft.modality),
+            .visibility = try self.allocator.dupe(u8, "public"),
+            .role = try self.allocator.dupe(u8, draft.role),
+            .title = if (draft.title) |value| try self.allocator.dupe(u8, value) else null,
+            .text = if (draft.text) |value| try self.allocator.dupe(u8, value) else null,
+            .eyes = if (draft.eyes) |value| try self.allocator.dupe(u8, value) else null,
+            .mouth = if (draft.mouth) |value| try self.allocator.dupe(u8, value) else null,
+            .duration_ms = draft.duration_ms,
+            .path = if (draft.path) |value| try self.allocator.dupe(u8, value) else null,
+            .url = if (draft.url) |value| try self.allocator.dupe(u8, value) else null,
+            .mime_type = if (draft.mime_type) |value| try self.allocator.dupe(u8, value) else null,
+            .caption = if (draft.caption) |value| try self.allocator.dupe(u8, value) else null,
+        });
+    }
+
     pub fn appendCaptureRequested(self: *HostEffectCollector, title: []const u8, body: []const u8) !void {
         try self.events.append(self.allocator, .{
-            .type = "capture_requested",
+            .type = "sense_request",
+            .sense = try self.allocator.dupe(u8, "camera"),
             .title = try self.allocator.dupe(u8, title),
             .body = try self.allocator.dupe(u8, body),
         });
@@ -347,7 +381,7 @@ pub const HostEffectCollector = struct {
 
     pub fn appendSenseRequested(self: *HostEffectCollector, sense: []const u8, title: []const u8, body: []const u8) !void {
         try self.events.append(self.allocator, .{
-            .type = "sense_requested",
+            .type = "sense_request",
             .sense = try self.allocator.dupe(u8, sense),
             .title = try self.allocator.dupe(u8, title),
             .body = try self.allocator.dupe(u8, body),
@@ -395,14 +429,13 @@ pub const HostEffectCollector = struct {
     }
 };
 
-pub fn successEnvelopeAlloc(
+pub fn legacySuccessEnvelopeAlloc(
     allocator: std.mem.Allocator,
     request_id: []const u8,
     events: []const HostEvent,
     result: anytype,
 ) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, .{
-        .api_version = api_version,
         .request_id = request_id,
         .ok = true,
         .events = events,
@@ -410,7 +443,7 @@ pub fn successEnvelopeAlloc(
     }, .{ .whitespace = .indent_2 });
 }
 
-pub fn successEnvelopeV2Alloc(
+pub fn successEnvelopeAlloc(
     allocator: std.mem.Allocator,
     request_id: []const u8,
     events: []const HostEvent,
@@ -418,7 +451,6 @@ pub fn successEnvelopeV2Alloc(
     budget: anytype,
 ) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, .{
-        .api_version = api_version_v2,
         .request_id = request_id,
         .ok = true,
         .events = events,
@@ -427,7 +459,7 @@ pub fn successEnvelopeV2Alloc(
     }, .{ .whitespace = .indent_2 });
 }
 
-pub fn errorEnvelopeV2Alloc(
+pub fn errorEnvelopeAlloc(
     allocator: std.mem.Allocator,
     request_id: []const u8,
     code: []const u8,
@@ -436,7 +468,6 @@ pub fn errorEnvelopeV2Alloc(
     budget: anytype,
 ) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, .{
-        .api_version = api_version_v2,
         .request_id = request_id,
         .ok = false,
         .events = &[_]HostEvent{},
@@ -449,7 +480,7 @@ pub fn errorEnvelopeV2Alloc(
     }, .{ .whitespace = .indent_2 });
 }
 
-pub fn errorEnvelopeAlloc(
+pub fn legacyErrorEnvelopeAlloc(
     allocator: std.mem.Allocator,
     request_id: []const u8,
     code: []const u8,
@@ -457,7 +488,6 @@ pub fn errorEnvelopeAlloc(
     recoverable: bool,
 ) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, .{
-        .api_version = api_version,
         .request_id = request_id,
         .ok = false,
         .events = &[_]HostEvent{},

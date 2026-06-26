@@ -1,7 +1,8 @@
 const std = @import("std");
 const config_mod = @import("core/config.zig");
-const ai_provider = @import("api/random_provider_client.zig");
+const ai_provider = @import("harness/direct_provider_client.zig");
 const main_http_transport = @import("main_http_transport.zig");
+const files_mod = @import("platform/common/files.zig");
 
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -14,9 +15,10 @@ pub fn main(init: std.process.Init) !void {
     while (args_iter.next()) |arg| try args_list.append(allocator, arg);
 
     const args_cfg = try config_mod.Config.fromArgs(args_list.items);
-    const cfg = try args_cfg.withLlmConfig(allocator, init.io);
+    var local_filesystem = files_mod.LocalFileSystem{};
+    const cfg = try args_cfg.withLlmConfig(allocator, local_filesystem.filesystem(), init.io);
     var http_transport = main_http_transport.StdHttpTransport.init(init.io);
-    var client = ai_provider.RandomProviderClient.init(init.io, http_transport.client(), init.environ_map, cfg.conversation_models);
+    var client = ai_provider.DirectRandomProviderClient.initDirectFromEnv(init.io, http_transport.client(), init.environ_map, cfg.conversation_models);
 
     var total: usize = 0;
     total += try client.checkTextRoutes(allocator, "conversation", cfg.conversation_models);

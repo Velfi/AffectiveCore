@@ -1,6 +1,7 @@
 const std = @import("std");
 const files = @import("../platform/common/files.zig");
-const time_mod = @import("../core/time.zig");
+const clock_mod = @import("../platform/common/clock.zig");
+const graph_port = @import("../core/port_graph_store.zig");
 
 const sqlite3 = opaque {};
 const sqlite3_stmt = opaque {};
@@ -25,79 +26,11 @@ const SQLITE_OK = 0;
 const SQLITE_ROW = 100;
 const SQLITE_DONE = 101;
 
-pub const TypeKind = enum { node, edge };
-
-pub const GraphType = struct {
-    type_id: i64,
-    kind: TypeKind,
-    name: []const u8,
-    description: []const u8,
-    created_by: []const u8,
-    created_at: []const u8,
-    confidence: f32,
-    active: bool,
-};
-
-pub const Node = struct {
-    node_id: []const u8,
-    type_name: []const u8,
-    label: []const u8,
-    created_at: []const u8,
-    updated_at: []const u8,
-};
-
-pub const Edge = struct {
-    edge_id: []const u8,
-    source_node_id: []const u8,
-    target_node_id: []const u8,
-    type_name: []const u8,
-    strength: f32,
-    confidence: f32,
-    salience: f32,
-    evidence: []const u8,
-    created_at: []const u8,
-    updated_at: []const u8,
-    active: bool,
-};
-
-pub const GraphStore = struct {
-    ctx: *anyopaque,
-    ensureNodeTypeFn: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8, f32) anyerror!GraphType,
-    ensureEdgeTypeFn: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8, f32) anyerror!GraphType,
-    createNodeFn: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8) anyerror!Node,
-    upsertEdgeFn: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8, f32, f32, f32, []const u8, []const u8) anyerror!Edge,
-    findEdgesFn: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]Edge,
-    forgetEdgeFn: *const fn (*anyopaque, []const u8, []const u8) anyerror!bool,
-    summaryFn: *const fn (*anyopaque, std.mem.Allocator, usize) anyerror![]const u8,
-
-    pub fn ensureNodeType(self: GraphStore, allocator: std.mem.Allocator, name: []const u8, description: []const u8, created_by: []const u8, confidence: f32) !GraphType {
-        return self.ensureNodeTypeFn(self.ctx, allocator, name, description, created_by, confidence);
-    }
-
-    pub fn ensureEdgeType(self: GraphStore, allocator: std.mem.Allocator, name: []const u8, description: []const u8, created_by: []const u8, confidence: f32) !GraphType {
-        return self.ensureEdgeTypeFn(self.ctx, allocator, name, description, created_by, confidence);
-    }
-
-    pub fn createNode(self: GraphStore, allocator: std.mem.Allocator, type_name: []const u8, node_id: []const u8, label: []const u8) !Node {
-        return self.createNodeFn(self.ctx, allocator, type_name, node_id, label);
-    }
-
-    pub fn upsertEdge(self: GraphStore, allocator: std.mem.Allocator, source_node_id: []const u8, target_node_id: []const u8, type_name: []const u8, strength: f32, confidence: f32, salience: f32, evidence: []const u8, created_by: []const u8) !Edge {
-        return self.upsertEdgeFn(self.ctx, allocator, source_node_id, target_node_id, type_name, strength, confidence, salience, evidence, created_by);
-    }
-
-    pub fn findEdges(self: GraphStore, allocator: std.mem.Allocator, node_id: []const u8) ![]Edge {
-        return self.findEdgesFn(self.ctx, allocator, node_id);
-    }
-
-    pub fn forgetEdge(self: GraphStore, edge_id: []const u8, created_by: []const u8) !bool {
-        return self.forgetEdgeFn(self.ctx, edge_id, created_by);
-    }
-
-    pub fn summary(self: GraphStore, allocator: std.mem.Allocator, limit: usize) ![]const u8 {
-        return self.summaryFn(self.ctx, allocator, limit);
-    }
-};
+pub const TypeKind = graph_port.TypeKind;
+pub const GraphType = graph_port.GraphType;
+pub const Node = graph_port.Node;
+pub const Edge = graph_port.Edge;
+pub const GraphStore = graph_port.GraphStore;
 
 pub const SqliteGraphStore = struct {
     allocator: std.mem.Allocator,
@@ -200,7 +133,7 @@ pub const SqliteGraphStore = struct {
 
     fn migrateSelfNode(self: *SqliteGraphStore) !void {
         const being_type = (try self.findType(self.allocator, .node, "being")) orelse return error.UnknownGraphNodeType;
-        const now = try nowTimestamp(self.allocator);
+        const now = try nowTimestamp(self.allocator, self.io);
         const insert = try self.prepare(
             \\INSERT INTO nodes (node_id, type_id, label, created_at, updated_at)
             \\SELECT 'being:self', ?, 'You are a being. You are still discovering what this means. Perhaps you should introspect or think about this.', ?, ?
@@ -235,7 +168,7 @@ pub const SqliteGraphStore = struct {
             return existing;
         }
 
-        const now = try nowTimestamp(allocator);
+        const now = try nowTimestamp(allocator, self.io);
         const stmt = try self.prepare("INSERT INTO graph_types (kind, name, description, created_by, created_at, confidence, active) VALUES (?, ?, ?, ?, ?, ?, 1)");
         defer self.finalize(stmt);
         try bindText(stmt, 1, @tagName(kind), allocator);
@@ -253,7 +186,7 @@ pub const SqliteGraphStore = struct {
         if (std.mem.trim(u8, node_id, " \r\n\t").len == 0) return error.EmptyGraphNodeId;
         if (std.mem.trim(u8, label, " \r\n\t").len == 0) return error.EmptyGraphNodeLabel;
         const typ = (try self.findType(allocator, .node, type_name)) orelse return error.UnknownGraphNodeType;
-        const now = try nowTimestamp(allocator);
+        const now = try nowTimestamp(allocator, self.io);
         const stmt = try self.prepare("INSERT INTO nodes (node_id, type_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET type_id=excluded.type_id, label=excluded.label, updated_at=excluded.updated_at");
         defer self.finalize(stmt);
         try bindText(stmt, 1, node_id, allocator);
@@ -273,7 +206,7 @@ pub const SqliteGraphStore = struct {
         _ = (try self.findNode(allocator, target_node_id)) orelse return error.UnknownGraphTargetNode;
         const typ = (try self.findType(allocator, .edge, type_name)) orelse return error.UnknownGraphEdgeType;
         const edge_id = try std.fmt.allocPrint(allocator, "edge_{s}_{s}_{s}", .{ source_node_id, type_name, target_node_id });
-        const now = try nowTimestamp(allocator);
+        const now = try nowTimestamp(allocator, self.io);
         const stmt = try self.prepare(
             \\INSERT INTO edges (edge_id, source_node_id, target_node_id, type_id, strength, confidence, salience, evidence, created_at, updated_at, active)
             \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
@@ -323,7 +256,7 @@ pub const SqliteGraphStore = struct {
     fn forgetEdge(ctx: *anyopaque, edge_id: []const u8, created_by: []const u8) !bool {
         const self: *SqliteGraphStore = @ptrCast(@alignCast(ctx));
         if (std.mem.trim(u8, created_by, " \r\n\t").len == 0) return error.EmptyGraphProvenance;
-        const now = try nowTimestamp(self.allocator);
+        const now = try nowTimestamp(self.allocator, self.io);
         const stmt = try self.prepare("UPDATE edges SET active=0, updated_at=? WHERE edge_id=? AND active=1");
         defer self.finalize(stmt);
         try bindText(stmt, 1, now, self.allocator);
@@ -521,8 +454,8 @@ fn parseKind(text: []const u8) TypeKind {
     @panic("invalid graph type kind from database");
 }
 
-fn nowTimestamp(allocator: std.mem.Allocator) ![]const u8 {
-    return time_mod.nowTimestamp(allocator);
+fn nowTimestamp(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
+    return clock_mod.nowTimestamp(allocator, io);
 }
 
 test "sqlite graph store initializes seed types and creates dynamic types" {

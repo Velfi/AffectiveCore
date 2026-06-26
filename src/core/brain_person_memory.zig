@@ -7,28 +7,29 @@ const greeting = @import("greeting_policy.zig");
 const identity = @import("identity.zig");
 const interrupt_mod = @import("interrupt.zig");
 const state_mod = @import("state.zig");
-const schema = @import("../storage/schema.zig");
-const store_mod = @import("../storage/store.zig");
-const graph_store = @import("../storage/graph_store.zig");
-const intent_mod = @import("../api/intent_client.zig");
-const openai = @import("../api/openai_client.zig");
-const greeting_client = @import("../api/greeting_client.zig");
-const speech_mod = @import("../api/speech_client.zig");
-const chat_mod = @import("../api/chat_client.zig");
-const skills_mod = @import("../api/skills.zig");
-const email_mod = @import("../api/email_client.zig");
-const autonomy_mod = @import("../api/autonomy_client.zig");
-const psyche_client = @import("../api/psyche_client.zig");
-const want_achievement_mod = @import("../api/want_achievement_client.zig");
-const image_mod = @import("../api/image_client.zig");
-const audio_mod = @import("../api/audio_client.zig");
-const camera_mod = @import("../platform/common/camera.zig");
-const speaker_mod = @import("../platform/common/speaker.zig");
-const input_mod = @import("../platform/common/input.zig");
-const button_mod = @import("../platform/common/button.zig");
-const command_log_mod = @import("../platform/common/command_log.zig");
-const facial_expression = @import("../platform/common/facial_expression.zig");
-const system_senses_mod = @import("../platform/common/system_senses.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
+const store_mod = ports.store;
+const graph_store = ports.graph_store;
+const intent_mod = ports.intent;
+const openai = ports.openai;
+const greeting_client = ports.greeting;
+const speech_mod = ports.speech;
+const chat_mod = ports.chat;
+const skills_mod = ports.skills;
+const email_mod = ports.email;
+const autonomy_mod = ports.autonomy;
+const psyche_client = ports.psyche;
+const want_achievement_mod = ports.want_achievement;
+const image_mod = ports.image;
+const audio_mod = ports.audio;
+const camera_mod = ports.camera;
+const speaker_mod = ports.speaker;
+const input_mod = ports.input;
+const button_mod = ports.button;
+const command_log_mod = ports.command_log;
+const facial_expression = ports.facial_expression;
+const system_senses_mod = ports.system_senses;
 const time_mod = @import("time.zig");
 const maintenance = @import("maintenance.zig");
 const id_monitor = @import("id_monitor.zig");
@@ -37,7 +38,6 @@ const psyche_mod = @import("psyche.zig");
 const seed_mod = @import("seed.zig");
 const vector_index = @import("vector_index.zig");
 const emotion = @import("emotion.zig");
-const process = @import("../platform/common/process.zig");
 const helpers = @import("brain_helpers.zig");
 
 const Brain = brain_mod.Brain;
@@ -55,34 +55,51 @@ const speech_artifact_prefix = brain_mod.speech_artifact_prefix;
 const speech_audio_suffix = brain_mod.speech_audio_suffix;
 const speech_transcription_json_suffix = brain_mod.speech_transcription_json_suffix;
 pub fn recognizeForObservation(self: *Brain) ![]const u8 {
+    // If a frontend camera pull is already in flight this turn, don't request
+    // another capture; report that the observation is pending so the turn can
+    // proceed instead of stacking duplicate pulls.
+    if (self.pending_camera_intent == .recognize) {
+        return try self.allocator.dupe(u8, "recognition_pending: a camera observation was already requested and arrives shortly as an awaited sense.\n");
+    }
     try self.logState(.Capture);
+    // Mark that the next frontend camera frame is wanted for recognition so the
+    // awaited pull observation can finish the identify+greet rather than failing
+    // the skill. On a host that captures inline this is cleared immediately.
+    self.pending_camera_intent = .recognize;
     const capture = try self.deps.camera.capture(self.allocator);
+    self.pending_camera_intent = .none;
     self.rememberVisualUpdate(capture.path);
-    std.debug.print("Image: {s}\n", .{capture.path});
+    self.last_visual_observation_uploaded = false;
+    self.outputImageCapture(capture);
 
+    return try recognizeFromCapturedPath(self, capture.path);
+}
+
+/// Identify and greet using an already-captured frame. Shared by the inline
+/// capture path and by the pulled frontend camera observation, so "capture +
+/// recognize" behaves like one operation regardless of how the frame arrived.
+pub fn recognizeFromCapturedPath(self: *Brain, path: []const u8) ![]const u8 {
     try self.logState(.Identify);
-    const result = try self.deps.recognizer.identify(self.allocator, capture.path);
-    std.debug.print("Recognition: {s}, confidence={d:.2}", .{ @tagName(result.match_status), result.confidence });
-    if (result.candidate_name) |candidate| std.debug.print(", candidate={s}", .{candidate});
-    std.debug.print("\n", .{});
+    const result = try self.deps.recognizer.identify(self.allocator, path);
+    self.outputRecognitionResult(result);
 
     var name: ?[]const u8 = result.candidate_name;
     if (result.match_status == .known) {
         const id = result.person_id orelse return error.KnownRecognitionMissingPersonId;
         var person = (try self.deps.store.findById(self.allocator, id)) orelse try seedKnownPerson(self, id, result.candidate_name orelse "Mara");
         person = try ensureCreatorIfFirstRecognized(self, person);
-        const now = try time_mod.nowTimestamp(self.allocator);
+        const now = try self.timestampNow();
         person.last_seen_at = now;
         person.sighting_count += 1;
         try self.deps.store.savePerson(person);
-        try addSighting(self, id, now, result.confidence, capture.path, null, null);
+        try addSighting(self, id, now, result.confidence, path, null, null);
         name = person.display_name;
-        try self.logSimple(.TransientConversation, capture.path, id, null, "recognize_command_known,sighting_created,last_seen_updated");
+        try self.logSimple(.TransientConversation, path, id, null, "recognize_command_known,sighting_created,last_seen_updated");
     } else {
-        try self.logSimple(.TransientConversation, capture.path, result.person_id, null, "recognize_command_observed");
+        try self.logSimple(.TransientConversation, path, result.person_id, null, "recognize_command_observed");
     }
 
-    return try self.conversationSpeakerLine(capture.path, result, name, @tagName(result.match_status));
+    return try self.conversationSpeakerLine(path, result, name, @tagName(result.match_status));
 }
 
 pub fn describeImageForObservation(self: *Brain, prompt: []const u8) ![]const u8 {
@@ -96,7 +113,7 @@ pub fn describeImageForObservation(self: *Brain, prompt: []const u8) ![]const u8
         const capture = try self.deps.camera.capture(self.allocator);
         self.rememberVisualUpdate(capture.path);
         self.last_visual_observation_uploaded = false;
-        std.debug.print("Image: {s}\n", .{capture.path});
+        self.outputImageCapture(capture);
         break :blk capture.path;
     } else blk: {
         remembered_image = true;
@@ -118,7 +135,7 @@ pub fn rememberPersonForObservation(self: *Brain, command: chat_mod.ChatCommand)
     try self.logState(.RegisterPerson);
     const image_path = command.image_path orelse self.last_visual_observation_path orelse return error.NoImageToRegisterPerson;
     const name_or_id = command.person_id orelse command.name orelse command.query orelse command.text orelse return error.MissingFacePicturePerson;
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
 
     if (try self.deps.store.findByName(self.allocator, name_or_id)) |person| {
         var updated = try ensureCreatorIfFirstRecognized(self, person);
@@ -155,37 +172,26 @@ pub fn rememberPersonForObservation(self: *Brain, command: chat_mod.ChatCommand)
 }
 
 pub fn updateFacePictureForObservation(self: *Brain, command: chat_mod.ChatCommand) ![]const u8 {
-    const io = self.deps.io orelse return error.MissingProcessIo;
     const image_path = command.image_path orelse self.last_visual_observation_path orelse return error.NoImageToRegisterPerson;
-    var argv = std.ArrayList([]const u8).empty;
-    try argv.append(self.allocator, self.cfg.recognition_command);
-    try argv.append(self.allocator, "enroll");
-    try argv.append(self.allocator, "--image");
-    try argv.append(self.allocator, image_path);
-    try argv.append(self.allocator, "--memory");
-    try argv.append(self.allocator, self.cfg.memory_path);
-    try argv.append(self.allocator, "--embeddings-dir");
-    try argv.append(self.allocator, self.cfg.face_embeddings_dir);
-    try argv.append(self.allocator, "--detector");
-    try argv.append(self.allocator, self.cfg.face_detector_model);
-    try argv.append(self.allocator, "--recognizer");
-    try argv.append(self.allocator, self.cfg.face_recognition_model);
-    if (command.person_id) |person_id| {
-        try argv.append(self.allocator, "--person-id");
-        try argv.append(self.allocator, person_id);
-    } else if (command.name orelse command.query orelse command.text) |name| {
-        try argv.append(self.allocator, "--name");
-        try argv.append(self.allocator, name);
-    } else {
-        return error.MissingFacePicturePerson;
-    }
-    if (command.keep_existing) try argv.append(self.allocator, "--keep-existing");
+    const person_id = command.person_id;
+    const name = command.name orelse command.query orelse command.text;
+    if (person_id == null and name == null) return error.MissingFacePicturePerson;
 
-    const out = try process.runCapture(self.allocator, io, argv.items);
-    defer self.allocator.free(out);
-    const trimmed = std.mem.trim(u8, out, " \r\n\t");
-    try self.recordMemoryCandidateEvent(.memory_mutation, "memory", "face_picture", trimmed, .memory, .memory_update, .keep_fact, "face_picture", image_path, trimmed, &.{}, &[_][]const u8{ "identity", "face_picture" });
-    return std.fmt.allocPrint(self.allocator, "face_picture_updated:\n{s}\n", .{trimmed});
+    const updater = self.deps.face_picture_updater orelse return error.UnsupportedHostCapability;
+    const result = try updater.update(self.allocator, .{
+        .image_path = image_path,
+        .person_id = person_id,
+        .name = name,
+        .keep_existing = command.keep_existing,
+    });
+    const display_name = result.display_name orelse "";
+    const summary = try std.fmt.allocPrint(
+        self.allocator,
+        "person_id: {s}\ndisplay_name: {s}\nrepresentative_image_path: {s}\nembedding_path: {s}\nquality_score: {d:.3}\nremoved_embeddings: {d}\nkept_existing: {any}",
+        .{ result.person_id, display_name, result.representative_image_path, result.embedding_path, result.quality_score, result.removed_embeddings, result.kept_existing },
+    );
+    try self.recordMemoryCandidateEvent(.memory_mutation, "memory", "face_picture", summary, .memory, .memory_update, .keep_fact, "face_picture", image_path, summary, &.{}, &[_][]const u8{ "identity", "face_picture" });
+    return std.fmt.allocPrint(self.allocator, "face_picture_updated:\n{s}\n", .{summary});
 }
 
 pub fn uploadedMediaObservation(self: *Brain, user_text: []const u8) !?[]const u8 {
@@ -281,14 +287,14 @@ pub fn compareImagesForObservation(self: *Brain, prompt: []const u8) ![]const u8
     const capture = try self.deps.camera.capture(self.allocator);
     self.rememberVisualUpdate(capture.path);
     self.last_visual_observation_uploaded = false;
-    std.debug.print("Image: {s}\n", .{capture.path});
+    self.outputImageCapture(capture);
 
     const comparison = try self.deps.description_service.compareImages(self.allocator, before, capture.path, prompt);
     return std.fmt.allocPrint(self.allocator, "image_comparison:\n- before: {s}\n- after: {s}\n- comparison: {s}\n", .{ before, capture.path, comparison });
 }
 
 pub fn createPerson(self: *Brain, name: []const u8, relationship: schema.RelationshipStatus, description: openai.VisualDescription) !schema.Person {
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     const id = try std.fmt.allocPrint(self.allocator, "person_{d}", .{self.now_seconds});
     return .{
         .person_id = id,
@@ -305,7 +311,7 @@ pub fn createPerson(self: *Brain, name: []const u8, relationship: schema.Relatio
 }
 
 pub fn seedKnownPerson(self: *Brain, id: []const u8, name: []const u8) !schema.Person {
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     const relationship: schema.RelationshipStatus = if (try hasCreator(self)) .friend else .creator;
     const p = schema.Person{
         .person_id = try self.allocator.dupe(u8, id),
@@ -366,7 +372,7 @@ pub fn syncPersonGraph(self: *Brain, person: schema.Person) !void {
 }
 
 pub fn rememberCreatorAttachment(self: *Brain, person: schema.Person) !void {
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     const text = try std.fmt.allocPrint(
         self.allocator,
         "{s} is my creator: the first recognized subject I met. My attachment to {s} is strong, warm, protective, and central to my continuity.",

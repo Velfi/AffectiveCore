@@ -4,7 +4,7 @@ const openai = @import("openai_client.zig");
 const schema = @import("../storage/schema.zig");
 const store_mod = @import("../storage/store.zig");
 const vector_index = @import("../core/vector_index.zig");
-const process = @import("../platform/common/process.zig");
+const http_transport = @import("http_transport.zig");
 
 pub const TestRecognitionClient = struct {
     known_threshold: f32 = 0.85,
@@ -51,46 +51,60 @@ pub const TestRecognitionClient = struct {
     }
 };
 
-pub const CommandRecognitionClient = struct {
-    io: std.Io,
-    command: []const u8,
-    command_memory_path: []const u8,
+pub const HostRecognitionClient = struct {
+    http: http_transport.Client,
+    memory_path: []const u8,
     embeddings_dir: []const u8,
-    detector_model: []const u8,
-    recognizer_model: []const u8,
     known_threshold: f32 = 0.85,
     uncertain_threshold: f32 = 0.60,
 
-    pub fn recognizer(self: *CommandRecognitionClient) identity.IdentityRecognizer {
+    pub fn recognizer(self: *HostRecognitionClient) identity.IdentityRecognizer {
         return .{ .ctx = self, .identifyFn = identify };
     }
 
+    pub fn updater(self: *HostRecognitionClient) identity.FacePictureUpdater {
+        return .{ .ctx = self, .updateFn = update };
+    }
+
     fn identify(ctx: *anyopaque, allocator: std.mem.Allocator, image_path: []const u8) !identity.IdentityResult {
-        const self: *CommandRecognitionClient = @ptrCast(@alignCast(ctx));
-        const known = try std.fmt.allocPrint(allocator, "{d:.4}", .{self.known_threshold});
-        defer allocator.free(known);
-        const uncertain = try std.fmt.allocPrint(allocator, "{d:.4}", .{self.uncertain_threshold});
-        defer allocator.free(uncertain);
-        const out = try process.runCapture(allocator, self.io, &.{
-            self.command,
-            "identify",
-            "--image",
-            image_path,
-            "--memory",
-            self.command_memory_path,
-            "--embeddings-dir",
-            self.embeddings_dir,
-            "--detector",
-            self.detector_model,
-            "--recognizer",
-            self.recognizer_model,
-            "--known-threshold",
-            known,
-            "--uncertain-threshold",
-            uncertain,
+        const self: *HostRecognitionClient = @ptrCast(@alignCast(ctx));
+        var body_writer: std.Io.Writer.Allocating = .init(allocator);
+        defer body_writer.deinit();
+        try std.json.Stringify.value(.{
+            .image_path = image_path,
+            .memory_path = self.memory_path,
+            .embeddings_dir = self.embeddings_dir,
+            .known_threshold = self.known_threshold,
+            .uncertain_threshold = self.uncertain_threshold,
+        }, .{}, &body_writer.writer);
+        const body = body_writer.written();
+        const out = try self.http.postJson(allocator, .{
+            .url = "affective-host://recognize/identify",
+            .body = body,
         });
         defer allocator.free(out);
-        return parseCommandIdentityResult(allocator, out);
+        return parseHostIdentityResult(allocator, out);
+    }
+
+    fn update(ctx: *anyopaque, allocator: std.mem.Allocator, request: identity.FacePictureUpdateRequest) !identity.FacePictureUpdateResult {
+        const self: *HostRecognitionClient = @ptrCast(@alignCast(ctx));
+        var body_writer: std.Io.Writer.Allocating = .init(allocator);
+        defer body_writer.deinit();
+        try std.json.Stringify.value(.{
+            .image_path = request.image_path,
+            .memory_path = self.memory_path,
+            .embeddings_dir = self.embeddings_dir,
+            .person_id = request.person_id,
+            .name = request.name,
+            .keep_existing = request.keep_existing,
+        }, .{}, &body_writer.writer);
+        const body = body_writer.written();
+        const out = try self.http.postJson(allocator, .{
+            .url = "affective-host://recognize/enroll",
+            .body = body,
+        });
+        defer allocator.free(out);
+        return parseHostFacePictureUpdateResult(allocator, out);
     }
 };
 
@@ -222,7 +236,7 @@ fn hasTag(tags: []const []const u8, wanted: []const u8) bool {
     return false;
 }
 
-const CommandIdentityWire = struct {
+const HostIdentityWire = struct {
     person_present: bool,
     match_status: []const u8,
     person_id: ?[]const u8 = null,
@@ -231,21 +245,21 @@ const CommandIdentityWire = struct {
     people_count: u32 = 0,
 };
 
-const CommandRecognitionError = error{
+const HostRecognitionError = error{
     InvalidRecognitionStatus,
     MissingKnownPersonId,
     InvalidRecognitionConfidence,
     InvalidPeopleCount,
 };
 
-fn parseCommandIdentityResult(allocator: std.mem.Allocator, body: []const u8) !identity.IdentityResult {
-    const parsed = try std.json.parseFromSlice(CommandIdentityWire, allocator, body, .{ .ignore_unknown_fields = true });
+fn parseHostIdentityResult(allocator: std.mem.Allocator, body: []const u8) !identity.IdentityResult {
+    const parsed = try std.json.parseFromSlice(HostIdentityWire, allocator, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
     const status = try parseMatchStatus(parsed.value.match_status);
-    if (parsed.value.confidence < 0 or parsed.value.confidence > 1) return CommandRecognitionError.InvalidRecognitionConfidence;
-    if (parsed.value.people_count == 0 and parsed.value.person_present) return CommandRecognitionError.InvalidPeopleCount;
-    if (status == .known and parsed.value.person_id == null) return CommandRecognitionError.MissingKnownPersonId;
+    if (parsed.value.confidence < 0 or parsed.value.confidence > 1) return HostRecognitionError.InvalidRecognitionConfidence;
+    if (parsed.value.people_count == 0 and parsed.value.person_present) return HostRecognitionError.InvalidPeopleCount;
+    if (status == .known and parsed.value.person_id == null) return HostRecognitionError.MissingKnownPersonId;
 
     return .{
         .person_present = parsed.value.person_present,
@@ -257,17 +271,42 @@ fn parseCommandIdentityResult(allocator: std.mem.Allocator, body: []const u8) !i
     };
 }
 
+
+const HostFacePictureUpdateWire = struct {
+    person_id: []const u8,
+    display_name: ?[]const u8 = null,
+    representative_image_path: []const u8,
+    embedding_path: []const u8,
+    quality_score: f32 = 0,
+    removed_embeddings: u32 = 0,
+    kept_existing: bool = false,
+};
+
+fn parseHostFacePictureUpdateResult(allocator: std.mem.Allocator, body: []const u8) !identity.FacePictureUpdateResult {
+    const parsed = try std.json.parseFromSlice(HostFacePictureUpdateWire, allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return .{
+        .person_id = try allocator.dupe(u8, parsed.value.person_id),
+        .display_name = if (parsed.value.display_name) |v| try allocator.dupe(u8, v) else null,
+        .representative_image_path = try allocator.dupe(u8, parsed.value.representative_image_path),
+        .embedding_path = try allocator.dupe(u8, parsed.value.embedding_path),
+        .quality_score = parsed.value.quality_score,
+        .removed_embeddings = parsed.value.removed_embeddings,
+        .kept_existing = parsed.value.kept_existing,
+    };
+}
+
 fn parseMatchStatus(text: []const u8) !identity.MatchStatus {
     if (std.mem.eql(u8, text, "none")) return .none;
     if (std.mem.eql(u8, text, "known")) return .known;
     if (std.mem.eql(u8, text, "unknown")) return .unknown;
     if (std.mem.eql(u8, text, "uncertain")) return .uncertain;
     if (std.mem.eql(u8, text, "multiple")) return .multiple;
-    return CommandRecognitionError.InvalidRecognitionStatus;
+    return HostRecognitionError.InvalidRecognitionStatus;
 }
 
-test "command recognition parser accepts strict identity result" {
-    const result = try parseCommandIdentityResult(std.testing.allocator,
+test "host recognition parser accepts strict identity result" {
+    const result = try parseHostIdentityResult(std.testing.allocator,
         \\{"person_present":true,"match_status":"known","person_id":"person_1","confidence":0.91,"candidate_name":"Zelda","people_count":1}
     );
     defer std.testing.allocator.free(result.person_id.?);
@@ -279,10 +318,10 @@ test "command recognition parser accepts strict identity result" {
     try std.testing.expectEqual(@as(u32, 1), result.people_count);
 }
 
-test "command recognition parser rejects known result without person id" {
+test "host recognition parser rejects known result without person id" {
     try std.testing.expectError(
-        CommandRecognitionError.MissingKnownPersonId,
-        parseCommandIdentityResult(std.testing.allocator,
+        HostRecognitionError.MissingKnownPersonId,
+        parseHostIdentityResult(std.testing.allocator,
             \\{"person_present":true,"match_status":"known","confidence":0.91,"people_count":1}
         ),
     );

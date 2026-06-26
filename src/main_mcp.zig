@@ -1,21 +1,26 @@
 const std = @import("std");
-const app_brain = @import("app/brain.zig");
-const brain_config = @import("core/config.zig");
+const brain_container = @import("app/brain_container.zig");
+const app_core = @import("app/app_core.zig");
+const host_profiles = @import("app/host_profiles.zig");
+const brain_mod = @import("core/brain.zig");
 const chat = @import("api/chat_client.zig");
 const schema = @import("storage/schema.zig");
 const json_store = @import("storage/json_store.zig");
 const graph_store = @import("storage/graph_store.zig");
+const brain_storage = @import("storage/brain_storage.zig");
 const store_mod = @import("storage/store.zig");
 const vector_index = @import("core/vector_index.zig");
 const emotion = @import("core/emotion.zig");
-const time_mod = @import("core/time.zig");
+const clock_mod = @import("platform/common/clock.zig");
 const maintenance = @import("core/maintenance.zig");
-const process = @import("platform/common/process.zig");
+const input_mod = @import("platform/common/input.zig");
 const mcp_tools = @import("main_mcp_tools.zig");
 const mcp_utils = @import("main_mcp_utils.zig");
 const main_http_transport = @import("main_http_transport.zig");
+const mcp_config = @import("main_mcp_config.zig");
 
 const Tool = mcp_tools.Tool;
+const Config = mcp_config.Config;
 
 const TextContent = struct {
     type: []const u8 = "text",
@@ -75,33 +80,33 @@ const Server = struct {
     io: std.Io,
     store: store_mod.MemoryStore,
     graph: graph_store.GraphStore,
-    runtime: app_brain.BrainRuntime,
+    brain: brain_mod.Brain,
+    storage_backend: brain_storage.BrainStorage,
     http_transport: *main_http_transport.StdHttpTransport,
     memory_path: []const u8,
     schedule_path: []const u8,
-    recognition_command: []const u8,
-    face_detector_model: []const u8,
-    face_recognition_model: []const u8,
     face_embeddings_dir: []const u8,
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, config: Config) !Server {
+    fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) !Server {
         const http_transport = try allocator.create(main_http_transport.StdHttpTransport);
         http_transport.* = main_http_transport.StdHttpTransport.init(io);
-        const runtime = try app_brain.BrainRuntime.initHeadlessMcp(allocator, io, http_transport.client(), env, try config.toBrainConfig());
+        const brain_host = try host_profiles.initHeadlessMcpBrainHost(allocator, io, http_transport.client(), try config.toBrainConfig());
         return .{
             .allocator = allocator,
             .io = io,
-            .store = runtime.brain.deps.store,
-            .graph = runtime.brain.deps.graph,
-            .runtime = runtime,
+            .store = brain_host.brain.deps.store,
+            .graph = brain_host.brain.deps.graph,
+            .brain = brain_host.brain,
+            .storage_backend = brain_host.storage,
             .http_transport = http_transport,
             .memory_path = config.memory_path,
             .schedule_path = config.schedule_path,
-            .recognition_command = config.recognition_command,
-            .face_detector_model = config.face_detector_model,
-            .face_recognition_model = config.face_recognition_model,
             .face_embeddings_dir = config.face_embeddings_dir,
         };
+    }
+
+    fn deinit(self: *Server) void {
+        self.storage_backend.deinit(self.allocator);
     }
 
     fn callTool(self: *Server, name: []const u8, args: std.json.Value) ![]const u8 {
@@ -134,17 +139,17 @@ const Server = struct {
     }
 
     fn callBrain(self: *Server, command: chat.ChatCommand) ![]const u8 {
-        const result = try self.runtime.executeCommand(command);
+        const result = try app_core.executeBrainCommand(self.allocator, &self.brain, command);
         return result.observation;
     }
 
     fn conversationTurn(self: *Server, text: []const u8) ![]const u8 {
-        const result = try self.runtime.conversationTurn(text);
+        const result = try app_core.conversationBrainTurn(&self.brain, try input_mod.HeardSpeech.typed(self.allocator, text));
         return std.json.Stringify.valueAlloc(self.allocator, result, .{ .whitespace = .indent_2 });
     }
 
     fn chatDryRunPrompt(self: *Server, text: []const u8) ![]const u8 {
-        const prompt = try self.runtime.dryRunConversationPrompt(text);
+        const prompt = try self.brain.dryRunConversationPrompt(text);
         return std.json.Stringify.valueAlloc(self.allocator, struct {
             dry_run: bool,
             system_prompt: []const u8,
@@ -157,7 +162,7 @@ const Server = struct {
     }
 
     fn brainInspect(self: *Server) ![]const u8 {
-        const info = try self.runtime.inspectBrain(self.io);
+        const info = try brain_container.inspectBrain(self.allocator, self.io, self.brain.cfg);
         return std.json.Stringify.valueAlloc(self.allocator, info, .{ .whitespace = .indent_2 });
     }
 
@@ -190,7 +195,7 @@ const Server = struct {
         const memories = try self.store.loadMemoryRecords(self.allocator);
         const results = try vector_index.search(self.allocator, memories, query, tags, 8);
         var matches = std.ArrayList(RecallMatch).empty;
-        const now = try mcp_utils.nowTimestamp(self.allocator);
+        const now = try mcp_utils.nowTimestamp(self.allocator, self.io);
         for (results) |result| {
             var memory = memories[result.memory_index];
             if (memory.vector.len != vector_index.dimensions) memory.vector = try vector_index.embedMemory(self.allocator, memory);
@@ -371,7 +376,7 @@ const Server = struct {
 
     fn consolidateMemory(self: *Server) ![]const u8 {
         const memories = try self.store.loadMemoryRecords(self.allocator);
-        const now = try mcp_utils.nowTimestamp(self.allocator);
+        const now = try mcp_utils.nowTimestamp(self.allocator, self.io);
         var promoted: usize = 0;
         var decayed: usize = 0;
         var revised: usize = 0;
@@ -407,7 +412,7 @@ const Server = struct {
 
     fn dream(self: *Server, text: ?[]const u8, tags: []const []const u8, heat_bias: ?[]const u8) ![]const u8 {
         _ = try self.store.sweepUnreferencedCaptures();
-        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(time_mod.nowSeconds())));
+        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(clock_mod.nowSeconds(self.io))));
         const heat = mcp_utils.rollDreamHeat(prng.random(), heat_bias);
         const confidence = @max(0.20, 0.85 - heat * 0.55);
         const memories = try self.store.loadMemoryRecords(self.allocator);
@@ -426,13 +431,13 @@ const Server = struct {
         }
         const source_ids: []const []const u8 = if (source) |memory| &.{memory.memory_id} else &.{};
         const dream_record: schema.DreamRecord = .{
-            .dream_id = try std.fmt.allocPrint(self.allocator, "dream_{d}", .{time_mod.nowSeconds()}),
+            .dream_id = try std.fmt.allocPrint(self.allocator, "dream_{d}", .{clock_mod.nowSeconds(self.io)}),
             .heat = heat,
             .confidence = confidence,
             .connection = try std.fmt.allocPrint(self.allocator, "{s} <-> {s}", .{ left, right }),
             .source_memory_ids = try mcp_utils.cloneConstStringSlice(self.allocator, source_ids),
             .saved_memory_id = saved_memory_id,
-            .created_at = try mcp_utils.nowTimestamp(self.allocator),
+            .created_at = try mcp_utils.nowTimestamp(self.allocator, self.io),
         };
         try self.store.addDreamRecord(dream_record);
         return std.json.Stringify.valueAlloc(self.allocator, struct { heat: f32, style: []const u8, confidence: f32, connection: []const u8, source_memory_ids: []const []const u8, saved_memory_id: ?[]const u8 }{
@@ -446,8 +451,9 @@ const Server = struct {
     }
 
     fn setReminder(self: *Server, schedule: []const u8, text: []const u8) ![]const u8 {
-        const now_seconds = @divFloor(std.Io.Clock.real.now(self.io).toMilliseconds(), 1000);
-        const normalized_schedule = try maintenance.addReminder(self.allocator, self.io, self.schedule_path, schedule, text, now_seconds);
+        const now_seconds = clock_mod.nowSeconds(self.io);
+        const fs = self.brain.deps.filesystem orelse return error.MissingFileSystem;
+        const normalized_schedule = try maintenance.addReminder(self.allocator, fs, self.io, self.schedule_path, schedule, text, now_seconds);
         const added = try std.fmt.allocPrint(self.allocator, "- {s} run say:{s}", .{ normalized_schedule, text });
         return std.json.Stringify.valueAlloc(self.allocator, struct { added: []const u8, schedule_path: []const u8 }{ .added = added, .schedule_path = self.schedule_path }, .{ .whitespace = .indent_2 });
     }
@@ -457,41 +463,11 @@ const Server = struct {
         return std.json.Stringify.valueAlloc(self.allocator, struct { markdown: []const u8 }{ .markdown = markdown }, .{ .whitespace = .indent_2 });
     }
 
-    fn updateFacePicture(self: *Server, person_id: ?[]const u8, name: ?[]const u8, image_path: []const u8, keep_existing: bool) ![]const u8 {
-        var argv = std.ArrayList([]const u8).empty;
-        try argv.append(self.allocator, self.recognition_command);
-        try argv.append(self.allocator, "enroll");
-        try argv.append(self.allocator, "--image");
-        try argv.append(self.allocator, image_path);
-        try argv.append(self.allocator, "--memory");
-        try argv.append(self.allocator, self.memory_path);
-        try argv.append(self.allocator, "--embeddings-dir");
-        try argv.append(self.allocator, self.face_embeddings_dir);
-        try argv.append(self.allocator, "--detector");
-        try argv.append(self.allocator, self.face_detector_model);
-        try argv.append(self.allocator, "--recognizer");
-        try argv.append(self.allocator, self.face_recognition_model);
-        if (person_id) |id| {
-            try argv.append(self.allocator, "--person-id");
-            try argv.append(self.allocator, id);
-        } else if (name) |display_name| {
-            try argv.append(self.allocator, "--name");
-            try argv.append(self.allocator, display_name);
-        } else {
-            return error.MissingFacePicturePerson;
-        }
-        if (keep_existing) try argv.append(self.allocator, "--keep-existing");
-
-        const out = try process.runCapture(self.allocator, self.io, argv.items);
-        defer self.allocator.free(out);
-        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, self.allocator, out, .{});
-        return std.json.Stringify.valueAlloc(self.allocator, struct { updated: std.json.Value }{ .updated = parsed }, .{ .whitespace = .indent_2 });
-    }
 
     fn makeMemory(self: *Server, text: []const u8, tags: []const []const u8) !schema.MemoryRecord {
-        const now = try mcp_utils.nowTimestamp(self.allocator);
+        const now = try mcp_utils.nowTimestamp(self.allocator, self.io);
         return .{
-            .memory_id = try std.fmt.allocPrint(self.allocator, "memory_{d}_{d}", .{ time_mod.nowSeconds(), text.len }),
+            .memory_id = try std.fmt.allocPrint(self.allocator, "memory_{d}_{d}", .{ clock_mod.nowSeconds(self.io), text.len }),
             .scope = .short_term,
             .text = try self.allocator.dupe(u8, text),
             .original_text = try self.allocator.dupe(u8, text),
@@ -510,9 +486,9 @@ const Server = struct {
     }
 
     fn makeImpression(self: *Server, source: schema.ImpressionSource, text: []const u8, tags: []const []const u8) !schema.Impression {
-        const now = try mcp_utils.nowTimestamp(self.allocator);
+        const now = try mcp_utils.nowTimestamp(self.allocator, self.io);
         return .{
-            .impression_id = try std.fmt.allocPrint(self.allocator, "impression_{d}_{s}", .{ time_mod.nowSeconds(), @tagName(source) }),
+            .impression_id = try std.fmt.allocPrint(self.allocator, "impression_{d}_{s}", .{ clock_mod.nowSeconds(self.io), @tagName(source) }),
             .source = source,
             .text = try self.allocator.dupe(u8, text),
             .tags = try mcp_utils.cloneConstStringSlice(self.allocator, tags),
@@ -522,10 +498,10 @@ const Server = struct {
     }
 
     fn makeAppraisal(self: *Server, query: []const u8, impression_id: ?[]const u8, tags: []const []const u8) !schema.Appraisal {
-        const now = try mcp_utils.nowTimestamp(self.allocator);
+        const now = try mcp_utils.nowTimestamp(self.allocator, self.io);
         const signals = emotion.appraise(query);
         return .{
-            .appraisal_id = try std.fmt.allocPrint(self.allocator, "appraisal_{d}_{d}", .{ time_mod.nowSeconds(), query.len }),
+            .appraisal_id = try std.fmt.allocPrint(self.allocator, "appraisal_{d}_{d}", .{ clock_mod.nowSeconds(self.io), query.len }),
             .impression_id = if (impression_id) |id| try self.allocator.dupe(u8, id) else null,
             .query = try self.allocator.dupe(u8, query),
             .valence = signals.valence,
@@ -567,8 +543,9 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_iter.deinit();
-    const config = try parseArgs(&args_iter);
-    var server = try Server.init(allocator, init.io, init.environ_map, config);
+    const config = try mcp_config.parseArgs(&args_iter);
+    var server = try Server.init(allocator, init.io, config);
+    defer server.deinit();
 
     var stdin_buffer: [8192]u8 = undefined;
     var stdin_file_reader = std.Io.File.stdin().reader(init.io, &stdin_buffer);
@@ -631,63 +608,4 @@ fn sendMessage(io: std.Io, body: []const u8) !void {
     const writer = &stdout_file_writer.interface;
     try writer.print("Content-Length: {d}\r\n\r\n{s}", .{ body.len, body });
     try writer.flush();
-}
-
-const Config = struct {
-    brain_id: []const u8 = "default",
-    brain_root: []const u8 = "data/brains/default",
-    memory_path: []const u8 = "data/brains/default/memory/people.sqlite",
-    graph_path: []const u8 = "data/brains/default/memory/relationships.sqlite",
-    schedule_path: []const u8 = "data/brains/default/maintenance.md",
-    events_path: []const u8 = "data/brains/default/events.jsonl",
-    recognition_command: []const u8 = "tools/affective-face-recognizer",
-    face_detector_model: []const u8 = "models/face_detection_yunet_2023mar_int8.onnx",
-    face_recognition_model: []const u8 = "models/face_recognition_sface_2021dec_int8.onnx",
-    face_embeddings_dir: []const u8 = "data/brains/default/memory/face_embeddings",
-
-    fn toBrainConfig(self: Config) !brain_config.Config {
-        return .{
-            .brain_id = self.brain_id,
-            .brain_root = self.brain_root,
-            .memory_path = self.memory_path,
-            .graph_path = self.graph_path,
-            .events_path = self.events_path,
-            .maintenance_schedule_path = self.schedule_path,
-            .recognition_command = self.recognition_command,
-            .face_detector_model = self.face_detector_model,
-            .face_recognition_model = self.face_recognition_model,
-            .face_embeddings_dir = self.face_embeddings_dir,
-        };
-    }
-};
-
-fn parseArgs(args: *std.process.Args.Iterator) !Config {
-    var config = Config{};
-    _ = args.next();
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--brain")) {
-            config.brain_id = args.next() orelse return error.MissingBrainId;
-        } else if (std.mem.eql(u8, arg, "--brain-root")) {
-            config.brain_root = args.next() orelse return error.MissingBrainRoot;
-        } else if (std.mem.eql(u8, arg, "--memory-path")) {
-            config.memory_path = args.next() orelse return error.MissingMemoryPath;
-        } else if (std.mem.eql(u8, arg, "--graph-path")) {
-            config.graph_path = args.next() orelse return error.MissingGraphPath;
-        } else if (std.mem.eql(u8, arg, "--schedule-path")) {
-            config.schedule_path = args.next() orelse return error.MissingSchedulePath;
-        } else if (std.mem.eql(u8, arg, "--events-path")) {
-            config.events_path = args.next() orelse return error.MissingEventsPath;
-        } else if (std.mem.eql(u8, arg, "--recognition-command")) {
-            config.recognition_command = args.next() orelse return error.MissingRecognitionCommand;
-        } else if (std.mem.eql(u8, arg, "--face-detector-model")) {
-            config.face_detector_model = args.next() orelse return error.MissingFaceDetectorModel;
-        } else if (std.mem.eql(u8, arg, "--face-recognition-model")) {
-            config.face_recognition_model = args.next() orelse return error.MissingFaceRecognitionModel;
-        } else if (std.mem.eql(u8, arg, "--face-embeddings-dir")) {
-            config.face_embeddings_dir = args.next() orelse return error.MissingFaceEmbeddingsDir;
-        } else {
-            return error.UnknownArgument;
-        }
-    }
-    return config;
 }

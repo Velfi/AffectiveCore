@@ -54,16 +54,14 @@ pub fn restoreHostControlledPaths(
     return cfg;
 }
 
-pub fn seedProviderEnvironment(allocator: std.mem.Allocator, env: *std.process.Environ.Map, raw: AffectiveCoreEmbeddedConfig) !void {
-    try trySeedProviderEnvironment(allocator, env, raw);
+pub fn configureHostProviderRouting(allocator: std.mem.Allocator, env: *std.process.Environ.Map, raw: AffectiveCoreEmbeddedConfig) !void {
+    try tryConfigureHostProviderRouting(allocator, env, raw);
 }
 
-pub fn trySeedProviderEnvironment(allocator: std.mem.Allocator, env: *std.process.Environ.Map, raw: AffectiveCoreEmbeddedConfig) !void {
-    try putEnvString(allocator, env, "OPENAI_API_KEY", raw.openai_api_key);
-    try putEnvString(allocator, env, "ANTHROPIC_API_KEY", raw.anthropic_api_key);
-    try putEnvString(allocator, env, "GEMINI_API_KEY", raw.google_api_key);
-    try putEnvString(allocator, env, "GOOGLE_API_KEY", raw.google_api_key);
-    try putEnvString(allocator, env, "GOOGLE_AI_API_KEY", raw.google_api_key);
+pub fn tryConfigureHostProviderRouting(allocator: std.mem.Allocator, env: *std.process.Environ.Map, raw: AffectiveCoreEmbeddedConfig) !void {
+    if (try hostProviderRoutingAvailable(allocator, raw.host_manifest_json)) {
+        try env.put(try allocator.dupe(u8, "AFFECTIVE_HOST_PROVIDER_ROUTING"), try allocator.dupe(u8, "1"));
+    }
 }
 
 pub fn putEnvString(allocator: std.mem.Allocator, env: *std.process.Environ.Map, key: []const u8, value: AffectiveCoreEmbeddedString) !void {
@@ -71,6 +69,29 @@ pub fn putEnvString(allocator: std.mem.Allocator, env: *std.process.Environ.Map,
     const trimmed = std.mem.trim(u8, raw, " \r\n\t");
     if (trimmed.len == 0) return;
     try env.put(try allocator.dupe(u8, key), try allocator.dupe(u8, trimmed));
+}
+
+fn hostProviderRoutingAvailable(allocator: std.mem.Allocator, manifest_json: AffectiveCoreEmbeddedString) !bool {
+    const raw = stringSlice(manifest_json) orelse return false;
+    const trimmed = std.mem.trim(u8, raw, " \r\n\t");
+    if (trimmed.len == 0) return false;
+    const Manifest = struct {
+        capability_status: ?struct {
+            provider_routing: []const u8 = "",
+        } = null,
+        host_provider_routing: ?struct {
+            configured_providers: []const []const u8 = &.{},
+        } = null,
+    };
+    const parsed = std.json.parseFromSlice(Manifest, allocator, trimmed, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    if (parsed.value.capability_status) |status| {
+        if (std.mem.eql(u8, status.provider_routing, "available")) return true;
+    }
+    if (parsed.value.host_provider_routing) |routing| {
+        return routing.configured_providers.len > 0;
+    }
+    return false;
 }
 
 pub fn ensureParentDirs(io: std.Io, cfg: config_mod.Config) !void {
@@ -122,4 +143,23 @@ pub fn stringSlice(string: AffectiveCoreEmbeddedString) ?[]const u8 {
     if (string.len == 0) return "";
     const ptr = string.ptr orelse return null;
     return ptr[0..string.len];
+}
+
+test "embedded provider routing is configured from host manifest without credentials" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var env = std.process.Environ.Map.init(allocator);
+    const manifest =
+        \\{"capability_status":{"provider_routing":"available"},"host_provider_routing":{"configured_providers":["OpenAI"]}}
+    ;
+    var raw = AffectiveCoreEmbeddedConfig{};
+    raw.host_manifest_json = .{ .ptr = manifest.ptr, .len = manifest.len };
+
+    try tryConfigureHostProviderRouting(allocator, &env, raw);
+
+    try std.testing.expectEqualStrings("1", env.get("AFFECTIVE_HOST_PROVIDER_ROUTING") orelse "");
+    try std.testing.expect(env.get("OPENAI_API_KEY") == null);
+    try std.testing.expect(env.get("ANTHROPIC_API_KEY") == null);
+    try std.testing.expect(env.get("GEMINI_API_KEY") == null);
 }

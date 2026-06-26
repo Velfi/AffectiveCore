@@ -1,10 +1,15 @@
 test {
     _ = @import("affective_core_embedded.zig");
+    _ = @import("affective_core_embedded_abi_tests.zig");
+    _ = @import("affective_core_embedded_fuzz_tests.zig");
     _ = @import("affective_core_embedded_tests.zig");
+    _ = @import("app/app_core.zig");
     _ = @import("app/brain.zig");
     _ = @import("app/brain_container.zig");
     _ = @import("app/brain_tests.zig");
     _ = @import("app/context_gate.zig");
+    _ = @import("app/host_adapter.zig");
+    _ = @import("app/host_profiles.zig");
     _ = @import("core/brain.zig");
     _ = @import("core/brain_tests_1.zig");
     _ = @import("core/brain_tests_2.zig");
@@ -36,9 +41,12 @@ test {
     _ = @import("api/openai_client.zig");
     _ = @import("api/openai_identity_client.zig");
     _ = @import("api/random_provider_client.zig");
+    _ = @import("harness/direct_provider_client.zig");
+    _ = @import("harness/direct_provider_client_tests.zig");
     _ = @import("api/service_errors.zig");
     _ = @import("api/skills.zig");
     _ = @import("api/image_client.zig");
+    _ = @import("harness/direct_image_client.zig");
     _ = @import("api/want_achievement_client.zig");
     _ = @import("api/recognition_client.zig");
     _ = @import("platform/common/df_storage.zig");

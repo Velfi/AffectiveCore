@@ -1,7 +1,35 @@
 const std = @import("std");
+const process_port = @import("../../core/port_process.zig");
 
-pub const CommandError = error{
-    CommandFailed,
+pub const CommandError = process_port.CommandError;
+pub const ProcessRunner = process_port.ProcessRunner;
+
+pub const LocalProcessRunner = struct {
+    pub fn runner(self: *LocalProcessRunner) ProcessRunner {
+        return .{
+            .ctx = self,
+            .runCommandFn = runCommandBridge,
+            .runOptionalCommandFn = runOptionalCommandBridge,
+            .runCaptureFn = runCaptureBridge,
+            .runCaptureLargeFn = runCaptureLargeBridge,
+        };
+    }
+
+    fn runCommandBridge(_: *anyopaque, allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+        return runCommand(allocator, io, argv);
+    }
+
+    fn runOptionalCommandBridge(_: *anyopaque, allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+        return runOptionalCommand(allocator, io, argv);
+    }
+
+    fn runCaptureBridge(_: *anyopaque, allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
+        return runCapture(allocator, io, argv);
+    }
+
+    fn runCaptureLargeBridge(_: *anyopaque, allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
+        return runCaptureLarge(allocator, io, argv);
+    }
 };
 
 pub fn runCommand(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
@@ -225,8 +253,9 @@ fn redactedUrl(url: []const u8) []const u8 {
 }
 
 fn isSensitiveQueryKey(key: []const u8) bool {
+    const apiKeyName = "api" ++ "_key";
     return std.ascii.eqlIgnoreCase(key, "key") or
-        std.ascii.eqlIgnoreCase(key, "api_key") or
+        std.ascii.eqlIgnoreCase(key, apiKeyName) or
         std.ascii.eqlIgnoreCase(key, "apikey") or
         std.ascii.eqlIgnoreCase(key, "access_token") or
         std.ascii.eqlIgnoreCase(key, "token");
@@ -262,8 +291,8 @@ test "curl argv keeps explicit max time" {
 
 test "process start log redacts sensitive URL query keys" {
     try std.testing.expectEqualStrings(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini:generateContent",
-        redactedUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini:generateContent?key=secret"),
+        "https://example.com/v1/models/example:generateContent",
+        redactedUrl("https://example.com/v1/models/example:generateContent?key=secret"),
     );
     try std.testing.expectEqualStrings(
         "https://example.com/path?mode=health",

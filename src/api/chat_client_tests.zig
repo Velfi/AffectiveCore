@@ -2,7 +2,6 @@ const std = @import("std");
 const chat = @import("chat_client.zig");
 const ChatCommandType = chat.ChatCommandType;
 const ReasoningEffort = chat.ReasoningEffort;
-const LlmProvider = chat.LlmProvider;
 const max_chat_user_prompt_bytes = chat.max_chat_user_prompt_bytes;
 const commandSpec = chat.commandSpec;
 const parseChatTurn = chat.parseChatTurn;
@@ -10,11 +9,6 @@ const buildChatPrompt = chat.buildChatPrompt;
 const chatUserPrompt = chat.chatUserPrompt;
 const auditChatPrompt = chat.auditChatPrompt;
 const chatSystemPrompt = chat.chatSystemPrompt;
-const buildChatRequestBody = chat.buildChatRequestBody;
-const buildAnthropicRequestBody = chat.buildAnthropicRequestBody;
-const parseProviderModels = chat.parseProviderModels;
-const extractAnthropicContent = chat.extractAnthropicContent;
-const extractGoogleContent = chat.extractGoogleContent;
 
 test "parseChatTurn accepts next reasoning effort" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -144,16 +138,6 @@ test "recognize is described as an identity skill for the current speaker" {
     try std.testing.expect(std.mem.indexOf(u8, spec.description, "who you are talking to") != null);
 }
 
-test "reasoning effort is only sent to reasoning-capable models" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const reasoning_body = try buildChatRequestBody(allocator, "gpt-5-mini", .high, "system", "user");
-    const classic_body = try buildChatRequestBody(allocator, "gpt-4.1-nano", .high, "system", "user");
-    try std.testing.expect(std.mem.indexOf(u8, reasoning_body, "\"reasoning_effort\":\"high\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, classic_body, "\"reasoning_effort\":\"high\"") == null);
-}
-
 test "chat prompt frames the current utterance as heard speech" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -192,63 +176,4 @@ test "chat prompt audit reports rendered byte counts" {
     try std.testing.expectEqual(memory.len, audit.compact_memory_bytes);
     try std.testing.expectEqual(observations.len, audit.observations_bytes);
     try std.testing.expectEqual(prompt.user_prompt.len, audit.user_prompt_bytes);
-}
-
-test "anthropic chat request forces json tool use" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const body = try buildAnthropicRequestBody(allocator, "claude-haiku-4-5-20251001", "system", "user");
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"input_schema\":{\"type\":\"object\",\"additionalProperties\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"required\":[\"commands\",\"user_summary\",\"brain_summary\",\"reasoning_effort\",\"conversation_done\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"required\":[\"command\",\"text\",\"query\",\"memory_id\",\"person_id\",\"name\",\"image_path\",\"schedule\",\"to\",\"subject\",\"heat_bias\",\"eyes\",\"mouth\",\"duration_ms\",\"keep_existing\",\"tags\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":{\"type\":[\"string\",\"null\"]}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":{\"type\":\"tool\",\"name\":\"json_response\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"assistant\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"{\"") == null);
-}
-
-test "provider model roster accepts explicit providers" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const models = try parseProviderModels(allocator, "openai:gpt-4.1-nano, anthropic:claude-haiku-4-5-20251001, gemini:gemini-3.1-flash-lite");
-    try std.testing.expectEqual(@as(usize, 3), models.len);
-    try std.testing.expectEqual(LlmProvider.openai, models[0].provider);
-    try std.testing.expectEqual(LlmProvider.anthropic, models[1].provider);
-    try std.testing.expectEqual(LlmProvider.google, models[2].provider);
-    try std.testing.expectEqualStrings("claude-haiku-4-5-20251001", models[1].model);
-    try std.testing.expectEqualStrings("gemini-3.1-flash-lite", models[2].model);
-}
-
-test "provider model roster rejects invalid providers and empty configured roster" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    try std.testing.expectError(error.InvalidConversationProvider, parseProviderModels(allocator, "bogus:gpt-4.1-nano"));
-    try std.testing.expectError(error.InvalidConversationProviderModel, parseProviderModels(allocator, "openai:"));
-    try std.testing.expectError(error.NoConversationModels, parseProviderModels(allocator, " , "));
-}
-
-test "provider model roster rejects missing configured roster" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    try std.testing.expectError(error.NoConversationModels, parseProviderModels(allocator, ""));
-}
-
-test "provider content extractors read structured payloads" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const anthropic_text = try extractAnthropicContent(allocator,
-        \\{"content":[{"type":"tool_use","id":"toolu_1","name":"json_response","input":{"commands":[]}}]}
-    );
-    const google_text = try extractGoogleContent(allocator,
-        \\{"candidates":[{"content":{"parts":[{"text":"{\"commands\":[]}"}]}}]}
-    );
-    try std.testing.expectEqualStrings("{\"commands\":[]}", anthropic_text);
-    try std.testing.expectEqualStrings("{\"commands\":[]}", google_text);
 }

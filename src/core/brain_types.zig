@@ -1,27 +1,32 @@
 const std = @import("std");
-const chat_mod = @import("../api/chat_client.zig");
-const intent_mod = @import("../api/intent_client.zig");
-const openai = @import("../api/openai_client.zig");
-const greeting_client = @import("../api/greeting_client.zig");
-const speech_mod = @import("../api/speech_client.zig");
-const email_mod = @import("../api/email_client.zig");
-const autonomy_mod = @import("../api/autonomy_client.zig");
-const psyche_client = @import("../api/psyche_client.zig");
-const want_achievement_mod = @import("../api/want_achievement_client.zig");
-const image_mod = @import("../api/image_client.zig");
-const audio_mod = @import("../api/audio_client.zig");
-const camera_mod = @import("../platform/common/camera.zig");
-const speaker_mod = @import("../platform/common/speaker.zig");
-const input_mod = @import("../platform/common/input.zig");
-const command_log_mod = @import("../platform/common/command_log.zig");
-const facial_expression = @import("../platform/common/facial_expression.zig");
-const orientation_mod = @import("../platform/common/orientation.zig");
-const system_senses_mod = @import("../platform/common/system_senses.zig");
-const store_mod = @import("../storage/store.zig");
-const graph_store = @import("../storage/graph_store.zig");
+const chat_mod = ports.chat;
+const intent_mod = ports.intent;
+const openai = ports.openai;
+const greeting_client = ports.greeting;
+const speech_mod = ports.speech;
+const email_mod = ports.email;
+const autonomy_mod = ports.autonomy;
+const psyche_client = ports.psyche;
+const want_achievement_mod = ports.want_achievement;
+const image_mod = ports.image;
+const audio_mod = ports.audio;
+const camera_mod = ports.camera;
+const speaker_mod = ports.speaker;
+const input_mod = ports.input;
+const command_log_mod = ports.command_log;
+const facial_expression = ports.facial_expression;
+const orientation_mod = ports.orientation;
+const output_mod = ports.output;
+const system_senses_mod = ports.system_senses;
+const clock_mod = ports.clock;
+const process_mod = ports.process;
+const files_mod = ports.files;
+const store_mod = ports.store;
+const graph_store = ports.graph_store;
 const interrupt_mod = @import("interrupt.zig");
 const identity = @import("identity.zig");
 const id_monitor = @import("id_monitor.zig");
+const ports = @import("ports.zig");
 const stimulus = @import("stimulus.zig");
 
 pub const BrainDeps = struct {
@@ -29,6 +34,7 @@ pub const BrainDeps = struct {
     capabilities: chat_mod.CapabilitySet,
     camera: camera_mod.Camera,
     recognizer: identity.IdentityRecognizer,
+    face_picture_updater: ?identity.FacePictureUpdater = null,
     description_service: openai.DescriptionService,
     greeting_service: greeting_client.GreetingService,
     intent_service: intent_mod.IntentService,
@@ -47,7 +53,11 @@ pub const BrainDeps = struct {
     command_log: ?command_log_mod.CommandLog = null,
     facial_expression_output: ?facial_expression.Output = null,
     orientation_query: ?orientation_mod.Query = null,
+    output: ?output_mod.Output = null,
     system_senses: system_senses_mod.SystemSenses,
+    clock: ?clock_mod.Clock = null,
+    filesystem: ?files_mod.FileSystem = null,
+    process_runner: ?process_mod.ProcessRunner = null,
     interrupt_source: ?interrupt_mod.Source = null,
     id_monitor_sources: []const id_monitor.Source = &.{},
 };

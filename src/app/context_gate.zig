@@ -171,10 +171,11 @@ fn lessImportantEvent(events: []const embedded_protocol.HostEvent, lhs: usize, r
 }
 
 fn eventScore(event: embedded_protocol.HostEvent) i32 {
-    if (std.mem.eql(u8, event.type, "speech_requested")) return 100;
-    if (std.mem.eql(u8, event.type, "chat_message")) return 90;
+    if (std.mem.eql(u8, event.type, "expression")) return 100;
+    if (std.mem.eql(u8, event.type, "capability_request")) return 90;
+    if (std.mem.eql(u8, event.type, "sense_request")) return 85;
     if (std.mem.eql(u8, event.type, "sense_stimulus")) return 80;
-    if (std.mem.eql(u8, event.type, "state_changed")) return 70;
+    if (std.mem.eql(u8, event.type, "state")) return 70;
     if (event.kind) |kind| {
         if (std.mem.eql(u8, kind, "error")) return 95;
         if (std.mem.eql(u8, kind, "id")) return 75;
@@ -206,7 +207,7 @@ test "context gate compacts large host events" {
     const allocator = arena.allocator();
     const huge = "x" ** 2048;
     const events = [_]embedded_protocol.HostEvent{.{
-        .type = "command_log",
+        .type = "state",
         .kind = "result",
         .title = "huge",
         .body = huge,

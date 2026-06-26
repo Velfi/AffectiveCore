@@ -1,10 +1,33 @@
 const std = @import("std");
 const config = @import("config.zig");
+const FileSystem = @import("port_files.zig").FileSystem;
 const Config = config.Config;
-const effectiveRecognitionMode = config.effectiveRecognitionMode;
 const parseEmailConfig = config.parseEmailConfig;
 const loadEmailConfig = config.loadEmailConfig;
 const parseRuntimeOptionsConfig = config.parseRuntimeOptionsConfig;
+
+const MissingFileSystem = struct {
+    fn filesystem(self: *MissingFileSystem) FileSystem {
+        return .{
+            .ctx = self,
+            .ensureParentDirFn = ensureParentDir,
+            .readFileAllocPathFn = readFileAllocPath,
+            .writeFilePathFn = writeFilePath,
+            .ensureDirFn = ensureDir,
+            .sweepSpeechArtifactsFn = sweepSpeechArtifacts,
+        };
+    }
+
+    fn ensureParentDir(_: *anyopaque, _: std.Io, _: []const u8) !void {}
+    fn readFileAllocPath(_: *anyopaque, _: std.Io, _: []const u8, _: std.mem.Allocator, _: std.Io.Limit) ![]u8 {
+        return error.FileNotFound;
+    }
+    fn writeFilePath(_: *anyopaque, _: std.Io, _: []const u8, _: []const u8) !void {}
+    fn ensureDir(_: *anyopaque, _: std.Io, _: []const u8) !void {}
+    fn sweepSpeechArtifacts(_: *anyopaque, _: std.Io, _: @import("port_files.zig").SpeechArtifactSweepRequest) !@import("port_files.zig").SpeechArtifactSweepResult {
+        return error.FileNotFound;
+    }
+};
 
 test "config parses autonomy flags" {
     const cfg = try Config.fromArgs(&.{
@@ -36,14 +59,6 @@ test "config parses autonomy flags" {
     try std.testing.expectEqualStrings("off", cfg.psyche_mode);
     try std.testing.expectEqualStrings("openai:gpt-4.1-nano", cfg.psyche_models);
     try std.testing.expectEqualStrings("low", cfg.psyche_reasoning_effort);
-}
-
-test "config defaults to auto recognition" {
-    const cfg = try Config.fromArgs(&.{});
-    try std.testing.expectEqualStrings("auto", cfg.recognition_mode);
-    try std.testing.expectEqualStrings("command", effectiveRecognitionMode(cfg, .macos));
-    try std.testing.expectEqualStrings("command", effectiveRecognitionMode(.{ .camera_mode = "webcam" }, .macos));
-    try std.testing.expectEqualStrings("command", effectiveRecognitionMode(cfg, .radxa));
 }
 
 test "brain derives isolated runtime paths" {
@@ -179,32 +194,20 @@ test "brain settings isolate central cognition and storage choices" {
     try std.testing.expectEqualStrings("afplay", updated.speaker_command);
 }
 
-test "config parses recognition command flags" {
+test "config parses host recognition cache flags" {
     const cfg = try Config.fromArgs(&.{
-        "--recognition",
-        "command",
-        "--recognition-command",
-        "/usr/local/bin/affective-face-recognizer",
         "--description",
         "random",
         "--identity-comparison",
         "random",
         "--identity-comparison-model",
         "gpt-4.1-mini",
-        "--face-detector-model",
-        "models/yunet.onnx",
-        "--face-recognition-model",
-        "models/sface.onnx",
         "--face-embeddings-dir",
         "data/faces",
     });
-    try std.testing.expectEqualStrings("command", cfg.recognition_mode);
-    try std.testing.expectEqualStrings("/usr/local/bin/affective-face-recognizer", cfg.recognition_command);
     try std.testing.expectEqualStrings("random", cfg.description_mode);
     try std.testing.expectEqualStrings("random", cfg.identity_comparison_mode);
     try std.testing.expectEqualStrings("gpt-4.1-mini", cfg.identity_comparison_model);
-    try std.testing.expectEqualStrings("models/yunet.onnx", cfg.face_detector_model);
-    try std.testing.expectEqualStrings("models/sface.onnx", cfg.face_recognition_model);
     try std.testing.expectEqualStrings("data/faces", cfg.face_embeddings_dir);
 }
 
@@ -230,7 +233,8 @@ test "missing email config disables email without error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const loaded = try loadEmailConfig(allocator, std.testing.io);
+    var missing_fs = MissingFileSystem{};
+    const loaded = try loadEmailConfig(allocator, missing_fs.filesystem(), std.testing.io);
     try std.testing.expectEqualStrings("", loaded.smtp_url);
     try std.testing.expectEqualStrings("", loaded.from);
     try std.testing.expectEqualStrings("", loaded.username);
@@ -260,7 +264,6 @@ test "runtime options override persisted preferences" {
         \\  "transcription_mode": "voice",
         \\  "speech_mode": "say",
         \\  "seed_path": "data/seeds/otto.md",
-        \\  "recognition_mode": "descriptive",
         \\  "autonomy_mode": "on",
         \\  "speech_voice": "Samantha",
         \\  "button_hold_ms": 750,
@@ -272,7 +275,6 @@ test "runtime options override persisted preferences" {
     try std.testing.expectEqualStrings("voice", cfg.transcription_mode);
     try std.testing.expectEqualStrings("say", cfg.speech_mode);
     try std.testing.expectEqualStrings("data/seeds/otto.md", cfg.seed_path);
-    try std.testing.expectEqualStrings("descriptive", cfg.recognition_mode);
     try std.testing.expectEqualStrings("on", cfg.autonomy_mode);
     try std.testing.expectEqualStrings("Samantha", cfg.speech_voice);
     try std.testing.expectEqual(@as(u64, 750), cfg.button_hold_ms);

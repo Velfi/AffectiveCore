@@ -1,7 +1,8 @@
 const std = @import("std");
-const schema = @import("../storage/schema.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
 const needs_mod = @import("needs.zig");
-const psyche_client = @import("../api/psyche_client.zig");
+const psyche_client = ports.psyche;
 
 pub const SharedInputs = struct {
     now: []const u8,

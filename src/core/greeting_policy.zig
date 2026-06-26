@@ -1,5 +1,6 @@
 const std = @import("std");
-const schema = @import("../storage/schema.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
 const time = @import("time.zig");
 
 pub fn knownGreeting(allocator: std.mem.Allocator, person: schema.Person, change_summary: ?[]const u8, now_seconds: i64) ![]u8 {

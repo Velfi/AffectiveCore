@@ -7,28 +7,29 @@ const greeting = @import("greeting_policy.zig");
 const identity = @import("identity.zig");
 const interrupt_mod = @import("interrupt.zig");
 const state_mod = @import("state.zig");
-const schema = @import("../storage/schema.zig");
-const store_mod = @import("../storage/store.zig");
-const graph_store = @import("../storage/graph_store.zig");
-const intent_mod = @import("../api/intent_client.zig");
-const openai = @import("../api/openai_client.zig");
-const greeting_client = @import("../api/greeting_client.zig");
-const speech_mod = @import("../api/speech_client.zig");
-const chat_mod = @import("../api/chat_client.zig");
-const skills_mod = @import("../api/skills.zig");
-const email_mod = @import("../api/email_client.zig");
-const autonomy_mod = @import("../api/autonomy_client.zig");
-const psyche_client = @import("../api/psyche_client.zig");
-const want_achievement_mod = @import("../api/want_achievement_client.zig");
-const image_mod = @import("../api/image_client.zig");
-const audio_mod = @import("../api/audio_client.zig");
-const camera_mod = @import("../platform/common/camera.zig");
-const speaker_mod = @import("../platform/common/speaker.zig");
-const input_mod = @import("../platform/common/input.zig");
-const button_mod = @import("../platform/common/button.zig");
-const command_log_mod = @import("../platform/common/command_log.zig");
-const facial_expression = @import("../platform/common/facial_expression.zig");
-const system_senses_mod = @import("../platform/common/system_senses.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
+const store_mod = ports.store;
+const graph_store = ports.graph_store;
+const intent_mod = ports.intent;
+const openai = ports.openai;
+const greeting_client = ports.greeting;
+const speech_mod = ports.speech;
+const chat_mod = ports.chat;
+const skills_mod = ports.skills;
+const email_mod = ports.email;
+const autonomy_mod = ports.autonomy;
+const psyche_client = ports.psyche;
+const want_achievement_mod = ports.want_achievement;
+const image_mod = ports.image;
+const audio_mod = ports.audio;
+const camera_mod = ports.camera;
+const speaker_mod = ports.speaker;
+const input_mod = ports.input;
+const button_mod = ports.button;
+const command_log_mod = ports.command_log;
+const facial_expression = ports.facial_expression;
+const system_senses_mod = ports.system_senses;
 const time_mod = @import("time.zig");
 const maintenance = @import("maintenance.zig");
 const id_monitor = @import("id_monitor.zig");
@@ -37,7 +38,7 @@ const psyche_mod = @import("psyche.zig");
 const seed_mod = @import("seed.zig");
 const vector_index = @import("vector_index.zig");
 const emotion = @import("emotion.zig");
-const process = @import("../platform/common/process.zig");
+const process = ports.process;
 
 const Brain = brain_mod.Brain;
 const BrainDeps = brain_mod.BrainDeps;
@@ -549,11 +550,4 @@ pub fn speechArtifactTimestampMs(name: []const u8) ?i64 {
     if (name.len <= speech_artifact_prefix.len + suffix_len) return null;
     const timestamp_text = name[speech_artifact_prefix.len .. name.len - suffix_len];
     return std.fmt.parseInt(i64, timestamp_text, 10) catch null;
-}
-
-pub fn openDirPath(io: std.Io, path: []const u8) !std.Io.Dir {
-    if (!std.fs.path.isAbsolute(path)) {
-        return std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
-    }
-    return std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
 }

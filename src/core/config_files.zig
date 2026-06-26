@@ -1,5 +1,7 @@
 const std = @import("std");
-const files = @import("../platform/common/files.zig");
+const ports = @import("ports.zig");
+const files = ports.files;
+const FileSystem = files.FileSystem;
 const Config = @import("config.zig").Config;
 
 const LlmConfigFile = struct {
@@ -49,7 +51,6 @@ const RuntimeOptionsFile = struct {
     capture_scratch_dir: ?[]const u8 = null,
     audio_input_dir: ?[]const u8 = null,
     audio_output_dir: ?[]const u8 = null,
-    recognition_mode: ?[]const u8 = null,
     autonomy_mode: ?[]const u8 = null,
     psyche_mode: ?[]const u8 = null,
     speech_voice: ?[]const u8 = null,
@@ -68,9 +69,6 @@ const RuntimeOptionsFile = struct {
     id_monitor_external_restart_cooldown_seconds: ?u64 = null,
     id_monitor_severity_threshold: ?[]const u8 = null,
     psyche_reasoning_effort: ?[]const u8 = null,
-    recognition_command: ?[]const u8 = null,
-    face_detector_model: ?[]const u8 = null,
-    face_recognition_model: ?[]const u8 = null,
     face_embeddings_dir: ?[]const u8 = null,
     maintenance_schedule_path: ?[]const u8 = null,
     maintenance_state_path: ?[]const u8 = null,
@@ -83,8 +81,8 @@ pub const LoadedEmailConfig = struct {
     password: []const u8,
 };
 
-pub fn loadLlmConfig(allocator: std.mem.Allocator, io: std.Io) !LoadedLlmConfig {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "data/llm_providers.json", allocator, .limited(64 * 1024));
+pub fn loadLlmConfig(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io) !LoadedLlmConfig {
+    const bytes = try fs.readFileAllocPath(io, "data/llm_providers.json", allocator, .limited(64 * 1024));
     defer allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(LlmConfigFile, allocator, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
@@ -113,8 +111,8 @@ pub fn loadLlmConfig(allocator: std.mem.Allocator, io: std.Io) !LoadedLlmConfig 
     };
 }
 
-pub fn loadEmailConfig(allocator: std.mem.Allocator, io: std.Io) !LoadedEmailConfig {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, "data/email.json", allocator, .limited(16 * 1024)) catch |err| switch (err) {
+pub fn loadEmailConfig(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io) !LoadedEmailConfig {
+    const bytes = fs.readFileAllocPath(io, "data/email.json", allocator, .limited(16 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return .{
             .smtp_url = "",
             .from = "",
@@ -171,7 +169,6 @@ pub fn parseRuntimeOptionsConfig(allocator: std.mem.Allocator, base: Config, byt
     if (value.capture_scratch_dir) |v| cfg.capture_scratch_dir = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.audio_input_dir) |v| cfg.audio_input_dir = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.audio_output_dir) |v| cfg.audio_output_dir = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
-    if (value.recognition_mode) |v| cfg.recognition_mode = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.autonomy_mode) |v| cfg.autonomy_mode = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.psyche_mode) |v| cfg.psyche_mode = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.speech_voice) |v| cfg.speech_voice = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
@@ -190,16 +187,13 @@ pub fn parseRuntimeOptionsConfig(allocator: std.mem.Allocator, base: Config, byt
     if (value.id_monitor_external_restart_cooldown_seconds) |v| cfg.id_monitor_external_restart_cooldown_seconds = v;
     if (value.id_monitor_severity_threshold) |v| cfg.id_monitor_severity_threshold = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.psyche_reasoning_effort) |v| cfg.psyche_reasoning_effort = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
-    if (value.recognition_command) |v| cfg.recognition_command = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
-    if (value.face_detector_model) |v| cfg.face_detector_model = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
-    if (value.face_recognition_model) |v| cfg.face_recognition_model = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.face_embeddings_dir) |v| cfg.face_embeddings_dir = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.maintenance_schedule_path) |v| cfg.maintenance_schedule_path = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.maintenance_state_path) |v| cfg.maintenance_state_path = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     return cfg;
 }
 
-pub fn saveRuntimeOptions(io: std.Io, cfg: Config) !void {
+pub fn saveRuntimeOptions(fs: FileSystem, io: std.Io, cfg: Config) !void {
     var buffer: [4096]u8 = undefined;
     var stream = std.Io.Writer.fixed(&buffer);
     try stream.print("{f}\n", .{std.json.fmt(.{
@@ -218,7 +212,6 @@ pub fn saveRuntimeOptions(io: std.Io, cfg: Config) !void {
         .capture_scratch_dir = cfg.capture_scratch_dir,
         .audio_input_dir = cfg.audio_input_dir,
         .audio_output_dir = cfg.audio_output_dir,
-        .recognition_mode = cfg.recognition_mode,
         .autonomy_mode = cfg.autonomy_mode,
         .psyche_mode = cfg.psyche_mode,
         .speech_voice = cfg.speech_voice,
@@ -237,14 +230,11 @@ pub fn saveRuntimeOptions(io: std.Io, cfg: Config) !void {
         .id_monitor_external_restart_cooldown_seconds = cfg.id_monitor_external_restart_cooldown_seconds,
         .id_monitor_severity_threshold = cfg.id_monitor_severity_threshold,
         .psyche_reasoning_effort = cfg.psyche_reasoning_effort,
-        .recognition_command = cfg.recognition_command,
-        .face_detector_model = cfg.face_detector_model,
-        .face_recognition_model = cfg.face_recognition_model,
         .face_embeddings_dir = cfg.face_embeddings_dir,
         .maintenance_schedule_path = cfg.maintenance_schedule_path,
         .maintenance_state_path = cfg.maintenance_state_path,
     }, .{})});
-    try writeFilePath(io, cfg.runtime_options_path, stream.buffered());
+    try fs.writeFilePath(io, cfg.runtime_options_path, stream.buffered());
 }
 
 fn formatProviderModels(allocator: std.mem.Allocator, models: anytype) ![]const u8 {
@@ -271,12 +261,4 @@ pub fn validateBrainId(brain_id: []const u8) !void {
         const valid = std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
         if (!valid) return error.InvalidBrainId;
     }
-}
-
-fn writeFilePath(io: std.Io, path: []const u8, data: []const u8) !void {
-    return files.writeFilePath(io, path, data);
-}
-
-fn readFileAllocPath(io: std.Io, path: []const u8, allocator: std.mem.Allocator, limit: std.Io.Limit) ![]u8 {
-    return files.readFileAllocPath(io, path, allocator, limit);
 }

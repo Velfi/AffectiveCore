@@ -1,14 +1,9 @@
 const std = @import("std");
-const process = @import("../platform/common/process.zig");
-const service_errors = @import("service_errors.zig");
 const ai = @import("random_provider_client.zig");
-const openai = @import("openai_client.zig");
+const openai = @import("../core/port_openai.zig");
 
-const OpenAIClient = openai.OpenAIClient;
 const IdentityComparison = openai.IdentityComparison;
 const IdentityComparisonService = openai.IdentityComparisonService;
-const jsonString = openai.jsonString;
-const extractChatContent = openai.extractChatContent;
 
 pub const TestIdentityComparisonService = struct {
     pub fn service(self: *TestIdentityComparisonService) IdentityComparisonService {
@@ -26,50 +21,6 @@ pub const TestIdentityComparisonService = struct {
             .confidence = similarity,
             .reason = try std.fmt.allocPrint(allocator, "test description similarity {d:.3}", .{similarity}),
         };
-    }
-};
-
-pub const OpenAIIdentityComparisonService = struct {
-    io: std.Io,
-    client: OpenAIClient,
-    model: []const u8,
-
-    pub fn init(io: std.Io, client: OpenAIClient, model: []const u8) OpenAIIdentityComparisonService {
-        return .{ .io = io, .client = client, .model = model };
-    }
-
-    pub fn service(self: *OpenAIIdentityComparisonService) IdentityComparisonService {
-        return .{ .ctx = self, .compareFn = compare };
-    }
-
-    fn compare(ctx: *anyopaque, allocator: std.mem.Allocator, current_description: []const u8, stored_description: []const u8) !IdentityComparison {
-        const self: *OpenAIIdentityComparisonService = @ptrCast(@alignCast(ctx));
-        const api_key = self.client.api_key orelse return error.MissingOpenAIAPIKey;
-        const system_prompt =
-            \\Compare two non-sensitive visual descriptions of people for household robot identity recognition.
-            \\Use only visible non-sensitive appearance details such as clothing, accessories, carried items, hair/clothing changes, and posture.
-            \\Do not infer or use race, ethnicity, gender identity, age, health, disability, attractiveness, emotion, or socioeconomic status.
-            \\Return only JSON with keys: same_person, confidence, reason.
-            \\confidence must be a number from 0 to 1.
-        ;
-        const user_prompt = try std.fmt.allocPrint(
-            allocator,
-            "Current description:\n{s}\n\nStored description:\n{s}",
-            .{ current_description, stored_description },
-        );
-        const body = try std.fmt.allocPrint(
-            allocator,
-            "{{\"model\":{s},\"temperature\":0,\"response_format\":{{\"type\":\"json_schema\",\"json_schema\":{{\"name\":\"identity_comparison\",\"strict\":true,\"schema\":{s}}}}},\"messages\":[{{\"role\":\"system\",\"content\":{s}}},{{\"role\":\"user\",\"content\":{s}}}]}}",
-            .{
-                try jsonString(allocator, self.model),
-                identityComparisonJsonSchema(),
-                try jsonString(allocator, system_prompt),
-                try jsonString(allocator, user_prompt),
-            },
-        );
-        const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
-        const content = try callOpenAIChatContentWithRetry(allocator, self.io, self.model, auth, body);
-        return parseIdentityComparison(allocator, content);
     }
 };
 
@@ -112,31 +63,6 @@ pub const RandomProviderIdentityComparisonService = struct {
         return parseIdentityComparison(allocator, content);
     }
 };
-
-fn callOpenAIChatContentWithRetry(allocator: std.mem.Allocator, io: std.Io, model: []const u8, auth: []const u8, body: []const u8) ![]const u8 {
-    var attempt: usize = 0;
-    while (true) : (attempt += 1) {
-        const out = try process.runCapture(allocator, io, &.{
-            "curl",
-            "-sS",
-            "https://api.openai.com/v1/chat/completions",
-            "-H",
-            auth,
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            body,
-        });
-        defer allocator.free(out);
-        return extractChatContent(allocator, out) catch |err| {
-            if (service_errors.shouldRetry(err, attempt)) {
-                service_errors.logRemoteRetry("identity_comparison", "openai", model, attempt);
-                continue;
-            }
-            return err;
-        };
-    }
-}
 
 const IdentityComparisonWire = struct {
     same_person: bool,

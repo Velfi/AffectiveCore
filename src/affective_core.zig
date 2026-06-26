@@ -17,7 +17,11 @@ pub const api = struct {
 };
 
 pub const app = struct {
+    pub const app_core = @import("app/app_core.zig");
     pub const brain = @import("app/brain.zig");
+    pub const config_paths = @import("app/config_paths.zig");
+    pub const host_adapter = @import("app/host_adapter.zig");
+    pub const host_profiles = @import("app/host_profiles.zig");
 };
 
 pub const core = struct {
@@ -26,7 +30,7 @@ pub const core = struct {
     pub const events = @import("core/events.zig");
     pub const interrupt = @import("core/interrupt.zig");
     pub const maintenance = @import("core/maintenance.zig");
-    pub const startup_deps = @import("core/startup_deps.zig");
+    pub const ports = @import("core/ports.zig");
 };
 
 pub const platform = struct {
@@ -41,6 +45,7 @@ pub const platform = struct {
         pub const process = @import("platform/common/process.zig");
         pub const shutdown_signals = @import("platform/common/shutdown_signals.zig");
         pub const speaker = @import("platform/common/speaker.zig");
+        pub const startup_deps = @import("platform/common/startup_deps.zig");
         pub const system_senses = @import("platform/common/system_senses.zig");
         pub const voice_input = @import("platform/common/voice_input.zig");
     };

@@ -11,6 +11,34 @@ pub const IdentityResult = struct {
     people_count: u32 = 0,
 };
 
+
+
+pub const FacePictureUpdateRequest = struct {
+    image_path: []const u8,
+    person_id: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    keep_existing: bool = false,
+};
+
+pub const FacePictureUpdateResult = struct {
+    person_id: []const u8,
+    display_name: ?[]const u8 = null,
+    representative_image_path: []const u8,
+    embedding_path: []const u8,
+    quality_score: f32 = 0,
+    removed_embeddings: u32 = 0,
+    kept_existing: bool = false,
+};
+
+pub const FacePictureUpdater = struct {
+    ctx: *anyopaque,
+    updateFn: *const fn (*anyopaque, std.mem.Allocator, FacePictureUpdateRequest) anyerror!FacePictureUpdateResult,
+
+    pub fn update(self: FacePictureUpdater, allocator: std.mem.Allocator, request: FacePictureUpdateRequest) !FacePictureUpdateResult {
+        return self.updateFn(self.ctx, allocator, request);
+    }
+};
+
 pub const IdentityRecognizer = struct {
     ctx: *anyopaque,
     identifyFn: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!IdentityResult,

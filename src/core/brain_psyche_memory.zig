@@ -7,28 +7,29 @@ const greeting = @import("greeting_policy.zig");
 const identity = @import("identity.zig");
 const interrupt_mod = @import("interrupt.zig");
 const state_mod = @import("state.zig");
-const schema = @import("../storage/schema.zig");
-const store_mod = @import("../storage/store.zig");
-const graph_store = @import("../storage/graph_store.zig");
-const intent_mod = @import("../api/intent_client.zig");
-const openai = @import("../api/openai_client.zig");
-const greeting_client = @import("../api/greeting_client.zig");
-const speech_mod = @import("../api/speech_client.zig");
-const chat_mod = @import("../api/chat_client.zig");
-const skills_mod = @import("../api/skills.zig");
-const email_mod = @import("../api/email_client.zig");
-const autonomy_mod = @import("../api/autonomy_client.zig");
-const psyche_client = @import("../api/psyche_client.zig");
-const want_achievement_mod = @import("../api/want_achievement_client.zig");
-const image_mod = @import("../api/image_client.zig");
-const audio_mod = @import("../api/audio_client.zig");
-const camera_mod = @import("../platform/common/camera.zig");
-const speaker_mod = @import("../platform/common/speaker.zig");
-const input_mod = @import("../platform/common/input.zig");
-const button_mod = @import("../platform/common/button.zig");
-const command_log_mod = @import("../platform/common/command_log.zig");
-const facial_expression = @import("../platform/common/facial_expression.zig");
-const system_senses_mod = @import("../platform/common/system_senses.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
+const store_mod = ports.store;
+const graph_store = ports.graph_store;
+const intent_mod = ports.intent;
+const openai = ports.openai;
+const greeting_client = ports.greeting;
+const speech_mod = ports.speech;
+const chat_mod = ports.chat;
+const skills_mod = ports.skills;
+const email_mod = ports.email;
+const autonomy_mod = ports.autonomy;
+const psyche_client = ports.psyche;
+const want_achievement_mod = ports.want_achievement;
+const image_mod = ports.image;
+const audio_mod = ports.audio;
+const camera_mod = ports.camera;
+const speaker_mod = ports.speaker;
+const input_mod = ports.input;
+const button_mod = ports.button;
+const command_log_mod = ports.command_log;
+const facial_expression = ports.facial_expression;
+const system_senses_mod = ports.system_senses;
 const time_mod = @import("time.zig");
 const maintenance = @import("maintenance.zig");
 const id_monitor = @import("id_monitor.zig");
@@ -37,7 +38,7 @@ const psyche_mod = @import("psyche.zig");
 const seed_mod = @import("seed.zig");
 const vector_index = @import("vector_index.zig");
 const emotion = @import("emotion.zig");
-const process = @import("../platform/common/process.zig");
+const process = ports.process;
 const helpers = @import("brain_helpers.zig");
 
 const Brain = brain_mod.Brain;
@@ -67,27 +68,23 @@ pub fn experienceExpiry(self: *Brain, retention: schema.ExperienceRetention) !?[
 pub fn sweepSpeechArtifacts(self: *Brain) !SpeechArtifactSweepResult {
     if (self.cfg.audio_input_dir.len == 0) return error.MissingAudioInputDir;
     const io = self.deps.io orelse return error.MissingBrainIo;
+    const fs = self.deps.filesystem orelse return error.MissingFileSystem;
     const cutoff_ms = (self.now_seconds - speech_artifact_ttl_seconds) * 1000;
-    var result = SpeechArtifactSweepResult{};
-    var dir = try helpers.openDirPath(io, self.cfg.audio_input_dir);
-    defer dir.close(io);
-    var iter = dir.iterate();
-    while (try iter.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        const kind = helpers.speechArtifactKind(entry.name) orelse continue;
-        const timestamp_ms = helpers.speechArtifactTimestampMs(entry.name) orelse return error.InvalidSpeechArtifactName;
-        if (timestamp_ms > cutoff_ms) continue;
-        try dir.deleteFile(io, entry.name);
-        switch (kind) {
-            .audio => result.audio_removed += 1,
-            .transcription_json => result.transcription_json_removed += 1,
-        }
-    }
-    return result;
+    const result = try fs.sweepSpeechArtifacts(io, .{
+        .dir_path = self.cfg.audio_input_dir,
+        .prefix = speech_artifact_prefix,
+        .audio_suffix = speech_audio_suffix,
+        .transcription_json_suffix = speech_transcription_json_suffix,
+        .cutoff_ms = cutoff_ms,
+    });
+    return .{
+        .audio_removed = result.audio_removed,
+        .transcription_json_removed = result.transcription_json_removed,
+    };
 }
 
 pub fn createImpression(self: *Brain, source: schema.ImpressionSource, text: []const u8, tags: []const []const u8) !schema.Impression {
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     return .{
         .impression_id = try std.fmt.allocPrint(self.allocator, "impression_{d}_{d}_{s}", .{ self.now_seconds, text.len, @tagName(source) }),
         .source = source,
@@ -99,7 +96,7 @@ pub fn createImpression(self: *Brain, source: schema.ImpressionSource, text: []c
 }
 
 pub fn createAppraisal(self: *Brain, query: []const u8, impression_id: ?[]const u8, tags: []const []const u8) !schema.Appraisal {
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     const signals = emotion.appraise(query);
     return .{
         .appraisal_id = try std.fmt.allocPrint(self.allocator, "appraisal_{d}_{d}", .{ self.now_seconds, query.len }),
@@ -178,7 +175,7 @@ pub fn detectWantAchievements(self: *Brain, event_text: []const u8) !usize {
 }
 
 pub fn reinforceAchievedWant(self: *Brain, want: schema.MemoryRecord, match: want_achievement_mod.WantAchievementMatch, event_text: []const u8) !void {
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     const strength = helpers.wantReinforcementStrength(want);
     const existing_appraisals = try self.deps.store.loadAppraisals(self.allocator);
     const tags = try helpers.cloneConstStringSlice(self.allocator, &[_][]const u8{ "self_model", "self_want", "want_achievement", "positive_reinforcement", "flexible_identity" });
@@ -341,7 +338,7 @@ pub fn editSelf(self: *Brain, kind: SelfDirectiveKind, memory_id: []const u8, te
     if (!helpers.tagInSlice(existing.tags, required_tag)) return error.SelfDefinitionKindMismatch;
 
     const directive_tags = try helpers.selfDirectiveTags(self.allocator, kind, tags);
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     var updated = existing;
     updated.text = try self.allocator.dupe(u8, trimmed_text);
     updated.interpretation = try std.fmt.allocPrint(self.allocator, "self-defined {s}: {s}", .{ @tagName(kind), trimmed_text });
@@ -385,10 +382,26 @@ pub fn editSelf(self: *Brain, kind: SelfDirectiveKind, memory_id: []const u8, te
     );
 }
 
-pub fn chooseAttention(self: *Brain) ![]const u8 {
+/// The strongest thing worth attending to right now, with the attention weight
+/// the focus layer carries it at. Shared by the `choose_attention` skill (which
+/// formats it) and `refreshFocus` (which holds it), so attention and focus are
+/// one mechanism rather than two.
+const DerivedFocus = struct {
+    priority: []const u8,
+    target: []const u8,
+    detail: []const u8,
+    base_attention: f32,
+};
+
+fn deriveTopPriority(self: *Brain) !DerivedFocus {
     if (currentStimulusAttention(self.current_stimulus_context, self.current_stimulus_seconds, self.now_seconds)) |intensity| {
         if (intensity >= 0.55) {
-            return std.fmt.allocPrint(self.allocator, "attention:\n- priority: current_stimulus\n- target: {s}\n- reason: attention_intensity={d:.3}\n", .{ self.current_stimulus_context.?, intensity });
+            return .{
+                .priority = "current_stimulus",
+                .target = self.current_stimulus_context.?,
+                .detail = try std.fmt.allocPrint(self.allocator, "- reason: attention_intensity={d:.3}\n", .{intensity}),
+                .base_attention = intensity,
+            };
         }
     }
     const summaries = try self.deps.store.loadConversationSummaries(self.allocator);
@@ -407,7 +420,12 @@ pub fn chooseAttention(self: *Brain) ![]const u8 {
     });
     for (active_needs) |need| {
         if (need.urgency == .urgent or need.urgency == .need) {
-            return std.fmt.allocPrint(self.allocator, "attention:\n- priority: self_need\n- target: {s}\n- urgency: {s}\n- reason: {s}\n", .{ need.text, @tagName(need.urgency), need.evidence });
+            return .{
+                .priority = "self_need",
+                .target = need.text,
+                .detail = try std.fmt.allocPrint(self.allocator, "- urgency: {s}\n- reason: {s}\n", .{ @tagName(need.urgency), need.evidence }),
+                .base_attention = if (need.urgency == .urgent) 0.75 else 0.62,
+            };
         }
     }
     const appraisals = try self.deps.store.loadAppraisals(self.allocator);
@@ -418,16 +436,103 @@ pub fn chooseAttention(self: *Brain) ![]const u8 {
     if (appraisals.len > 0) {
         const recent = appraisals[appraisals.len - 1];
         if (recent.stress >= 0.55 or recent.uncertainty > 0.65) {
-            return std.fmt.allocPrint(self.allocator, "attention:\n- priority: unresolved_appraisal\n- target: {s}\n- reason: uncertainty={d:.3} stress={d:.3}\n", .{ recent.query, recent.uncertainty, recent.stress });
+            return .{
+                .priority = "unresolved_appraisal",
+                .target = recent.query,
+                .detail = try std.fmt.allocPrint(self.allocator, "- reason: uncertainty={d:.3} stress={d:.3}\n", .{ recent.uncertainty, recent.stress }),
+                .base_attention = @max(recent.stress, recent.uncertainty),
+            };
         }
     }
     if (best_memory) |memory| {
-        return std.fmt.allocPrint(self.allocator, "attention:\n- priority: salient_memory\n- target: {s}\n- reason: score={d} salience={d:.3}\n", .{ try self.memoryOneLineSummary(memory), memory.score, memory.salience });
+        return .{
+            .priority = "salient_memory",
+            .target = try self.memoryOneLineSummary(memory),
+            .detail = try std.fmt.allocPrint(self.allocator, "- reason: score={d} salience={d:.3}\n", .{ memory.score, memory.salience }),
+            // Background salience is a weak focus: held, but not enough on its own
+            // to flip the bot into focused mode (stays below focus_threshold).
+            .base_attention = 0.40,
+        };
     }
-    return self.allocator.dupe(u8, "attention:\n- priority: curiosity\n- target: wait for the next human-driven interaction\n");
+    return .{
+        .priority = "curiosity",
+        .target = "wait for the next human-driven interaction",
+        .detail = "",
+        .base_attention = 0.20,
+    };
+}
+
+pub fn chooseAttention(self: *Brain) ![]const u8 {
+    const derived = try deriveTopPriority(self);
+    return std.fmt.allocPrint(
+        self.allocator,
+        "attention:\n- priority: {s}\n- target: {s}\n{s}",
+        .{ derived.priority, derived.target, derived.detail },
+    );
+}
+
+/// Promote the strongest current attention into a held, decaying focus.
+pub fn deriveTopPriorityFocus(self: *Brain) !Brain.Focus {
+    const derived = try deriveTopPriority(self);
+    return .{
+        .text = try self.allocator.dupe(u8, derived.target),
+        .source = .derived,
+        .set_at = self.now_seconds,
+        .base_attention = derived.base_attention,
+    };
+}
+
+pub fn setFocus(self: *Brain, text: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \r\n\t");
+    if (trimmed.len == 0) return error.EmptyFocus;
+    self.current_focus = .{
+        .text = try self.allocator.dupe(u8, trimmed),
+        .source = .self_set,
+        .set_at = self.now_seconds,
+        .base_attention = self_set_focus_attention,
+    };
+    try self.appendCommandLog("state", "set_focus", trimmed);
+    return std.fmt.allocPrint(self.allocator, "focus_set:\n- source: self_set\n- text: {s}\n", .{trimmed});
+}
+
+pub fn clearFocus(self: *Brain) ![]const u8 {
+    self.current_focus = null;
+    try self.appendCommandLog("state", "clear_focus", "focus cleared");
+    return self.allocator.dupe(u8, "focus_cleared\n");
+}
+
+/// Keep a still-fresh self-set plan (override wins until it decays); otherwise
+/// derive the focus from the strongest current attention.
+pub fn refreshFocus(self: *Brain) !void {
+    if (self.current_focus) |focus| {
+        if (focus.source == .self_set and currentFocusAttention(self.current_focus, self.now_seconds) != null) {
+            return;
+        }
+    }
+    self.current_focus = try deriveTopPriorityFocus(self);
+}
+
+pub fn focusMode(self: *Brain) Brain.FocusMode {
+    const stimulus = currentStimulusAttention(self.current_stimulus_context, self.current_stimulus_seconds, self.now_seconds) orelse 0;
+    const focus = currentFocusAttention(self.current_focus, self.now_seconds) orelse 0;
+    return if (@max(stimulus, focus) >= focus_threshold) .focused else .unfocused;
 }
 
 const current_stimulus_attention_ttl_seconds: i64 = 120;
+const current_focus_attention_ttl_seconds: i64 = current_stimulus_attention_ttl_seconds;
+const focus_threshold: f32 = 0.55;
+const self_set_focus_attention: f32 = 0.75;
+
+/// Focus attention decays linearly to zero across the TTL, then clears (null),
+/// mirroring currentStimulusAttention so working memory fades with age.
+pub fn currentFocusAttention(focus: ?Brain.Focus, now_seconds: i64) ?f32 {
+    const held = focus orelse return null;
+    const age = now_seconds - held.set_at;
+    if (age < 0 or age > current_focus_attention_ttl_seconds) return null;
+    const ttl: f32 = @floatFromInt(current_focus_attention_ttl_seconds);
+    const remaining = 1.0 - (@as(f32, @floatFromInt(age)) / ttl);
+    return held.base_attention * remaining;
+}
 
 fn currentStimulusAttention(context: ?[]const u8, stimulus_seconds: ?i64, now_seconds: i64) ?f32 {
     const text = context orelse return null;
@@ -448,7 +553,7 @@ fn currentStimulusAttention(context: ?[]const u8, stimulus_seconds: ?i64, now_se
 pub fn askHuman(self: *Brain, text: []const u8) ![]const u8 {
     const impression = try createImpression(self, .self_reflection, text, &[_][]const u8{ "human", "help", "unresolved" });
     try self.deps.store.addImpression(impression);
-    std.debug.print("\nBRAIN:\n{s}\n", .{text});
+    self.outputBrain(text);
     try self.appendCommandLog("brain", "Brain", text);
     return std.fmt.allocPrint(self.allocator, "human_question:\n- text: {s}\n", .{text});
 }
@@ -473,7 +578,7 @@ pub fn consolidateMemory(self: *Brain) ![]const u8 {
         }
         if (updated.access_count > 0 and updated.revisions.len == 0) {
             updated.revisions = try helpers.appendRevision(self.allocator, updated.revisions, .{
-                .time = try time_mod.nowTimestamp(self.allocator),
+                .time = try self.timestampNow(),
                 .text = try std.fmt.allocPrint(self.allocator, "recalled and stabilized: {s}", .{helpers.memoryInterpretation(updated)}),
                 .confidence = updated.confidence,
             });
@@ -502,7 +607,7 @@ pub fn recallMemories(self: *Brain, query: []const u8, tags: []const []const u8)
         }
         updated.access_count += 1;
         updated.score += 2;
-        updated.last_accessed_at = try time_mod.nowTimestamp(self.allocator);
+        updated.last_accessed_at = try self.timestampNow();
         updated.revisions = try helpers.appendRevision(self.allocator, updated.revisions, .{
             .time = updated.last_accessed_at.?,
             .text = try std.fmt.allocPrint(self.allocator, "recalled with query '{s}'", .{query}),

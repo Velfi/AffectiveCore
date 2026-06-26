@@ -95,6 +95,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    tests.root_module.addIncludePath(b.path("include"));
     tests.root_module.linkSystemLibrary("sqlite3", .{});
     const run_tests = b.addRunArtifact(tests);
 

@@ -1,8 +1,8 @@
 const std = @import("std");
-const ai = @import("api/random_provider_client.zig");
+const ai = @import("harness/direct_provider_client.zig");
 const config_mod = @import("core/config.zig");
 const http_transport_mod = @import("api/http_transport.zig");
-const image_api = @import("api/image_client.zig");
+const image_api = @import("harness/direct_image_client.zig");
 const files = @import("platform/common/files.zig");
 
 const EmbeddedE2EProvider = enum {
@@ -42,7 +42,7 @@ pub fn runApiE2E(allocator: std.mem.Allocator, io: std.Io, http: http_transport_
         try runEmbeddedE2EVisionJsonContract(allocator, io, http, env, model, image_path);
     }
 
-    var health_client = ai.RandomProviderClient.init(io, http, env, cfg.conversation_models);
+    var health_client = ai.DirectRandomProviderClient.initDirectFromEnv(io, http, env, cfg.conversation_models);
     const health_total = try health_client.checkTextRoutes(allocator, "embedded_api_e2e", cfg.conversation_models);
     if (health_total == 0) return error.NoApiHealthRoutesChecked;
 
@@ -74,7 +74,7 @@ pub fn runApiE2E(allocator: std.mem.Allocator, io: std.Io, http: http_transport_
 fn runEmbeddedE2ETextJsonContract(allocator: std.mem.Allocator, io: std.Io, http: http_transport_mod.Client, env: *const std.process.Environ.Map, model: EmbeddedE2EProviderModel) !void {
     std.debug.print("EMBEDDED_API_E2E start kind=text-json provider={s} model={s}\n", .{ embeddedE2EProviderName(model.provider), model.model });
     const spec = try embeddedE2EModelSpec(allocator, model);
-    var client = ai.RandomProviderClient.init(io, http, env, spec);
+    var client = ai.DirectRandomProviderClient.initDirectFromEnv(io, http, env, spec);
     const content = try client.completeText(allocator, .{
         .subsystem = "embedded_api_e2e_text",
         .system_prompt = "You are a live API contract test. Return only the requested JSON object.",
@@ -91,7 +91,7 @@ fn runEmbeddedE2ETextJsonContract(allocator: std.mem.Allocator, io: std.Io, http
 fn runEmbeddedE2EVisionJsonContract(allocator: std.mem.Allocator, io: std.Io, http: http_transport_mod.Client, env: *const std.process.Environ.Map, model: EmbeddedE2EProviderModel, image_path: []const u8) !void {
     std.debug.print("EMBEDDED_API_E2E start kind=vision-json provider={s} model={s}\n", .{ embeddedE2EProviderName(model.provider), model.model });
     const spec = try embeddedE2EModelSpec(allocator, model);
-    var client = ai.RandomProviderClient.init(io, http, env, spec);
+    var client = ai.DirectRandomProviderClient.initDirectFromEnv(io, http, env, spec);
     const content = try client.completeVision(allocator, .{
         .subsystem = "embedded_api_e2e_vision",
         .prompt = "This is a live API contract test. Return exactly this JSON object and nothing else: {\"ok\":true}",
@@ -107,7 +107,7 @@ fn runEmbeddedE2EVisionJsonContract(allocator: std.mem.Allocator, io: std.Io, ht
 
 fn runEmbeddedE2EImageGenerationContract(allocator: std.mem.Allocator, io: std.Io, http: http_transport_mod.Client, env: *const std.process.Environ.Map, model: []const u8, output_dir: []const u8) !struct { bytes: usize } {
     std.debug.print("EMBEDDED_API_E2E start kind=image-generation provider=google model={s}\n", .{model});
-    var service_impl = image_api.NanoBananaImageService.init(io, http, env, model, output_dir);
+    var service_impl = image_api.DirectNanoBananaImageService.initDirectFromEnv(io, http, env, model, output_dir);
     const service = service_impl.service();
     const image = try service.generate(allocator, "Live embedded API contract test: generate a single small plain blue square on a white background. No text.");
     if (!isKnownImageMime(image.mime_type)) return error.UnexpectedGeneratedImageMimeType;

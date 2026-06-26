@@ -7,28 +7,29 @@ const greeting = @import("greeting_policy.zig");
 const identity = @import("identity.zig");
 const interrupt_mod = @import("interrupt.zig");
 const state_mod = @import("state.zig");
-const schema = @import("../storage/schema.zig");
-const store_mod = @import("../storage/store.zig");
-const graph_store = @import("../storage/graph_store.zig");
-const intent_mod = @import("../api/intent_client.zig");
-const openai = @import("../api/openai_client.zig");
-const greeting_client = @import("../api/greeting_client.zig");
-const speech_mod = @import("../api/speech_client.zig");
-const chat_mod = @import("../api/chat_client.zig");
-const skills_mod = @import("../api/skills.zig");
-const email_mod = @import("../api/email_client.zig");
-const autonomy_mod = @import("../api/autonomy_client.zig");
-const psyche_client = @import("../api/psyche_client.zig");
-const want_achievement_mod = @import("../api/want_achievement_client.zig");
-const image_mod = @import("../api/image_client.zig");
-const audio_mod = @import("../api/audio_client.zig");
-const camera_mod = @import("../platform/common/camera.zig");
-const speaker_mod = @import("../platform/common/speaker.zig");
-const input_mod = @import("../platform/common/input.zig");
-const button_mod = @import("../platform/common/button.zig");
-const command_log_mod = @import("../platform/common/command_log.zig");
-const facial_expression = @import("../platform/common/facial_expression.zig");
-const system_senses_mod = @import("../platform/common/system_senses.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
+const store_mod = ports.store;
+const graph_store = ports.graph_store;
+const intent_mod = ports.intent;
+const openai = ports.openai;
+const greeting_client = ports.greeting;
+const speech_mod = ports.speech;
+const chat_mod = ports.chat;
+const skills_mod = ports.skills;
+const email_mod = ports.email;
+const autonomy_mod = ports.autonomy;
+const psyche_client = ports.psyche;
+const want_achievement_mod = ports.want_achievement;
+const image_mod = ports.image;
+const audio_mod = ports.audio;
+const camera_mod = ports.camera;
+const speaker_mod = ports.speaker;
+const input_mod = ports.input;
+const button_mod = ports.button;
+const command_log_mod = ports.command_log;
+const facial_expression = ports.facial_expression;
+const system_senses_mod = ports.system_senses;
 const time_mod = @import("time.zig");
 const maintenance = @import("maintenance.zig");
 const id_monitor = @import("id_monitor.zig");
@@ -37,7 +38,7 @@ const psyche_mod = @import("psyche.zig");
 const seed_mod = @import("seed.zig");
 const vector_index = @import("vector_index.zig");
 const emotion = @import("emotion.zig");
-const process = @import("../platform/common/process.zig");
+const process = ports.process;
 const helpers = @import("brain_helpers.zig");
 
 const Brain = brain_mod.Brain;
@@ -130,58 +131,88 @@ pub fn logMaintenanceCommandResult(self: *Brain, command: []const u8, result: []
 }
 
 pub fn logState(self: *Brain, state: state_mod.BrainState) !void {
-    state_mod.printState(state);
+    self.outputFmt("\nBRAIN STATE: {s}\n", .{@tagName(state)});
     const body = try std.fmt.allocPrint(self.allocator, "BRAIN STATE: {s}", .{@tagName(state)});
     try appendCommandLog(self, "state", @tagName(state), body);
 }
 
 pub fn trace(self: *Brain, stage: []const u8) void {
     self.last_trace_stage = stage;
-    std.debug.print("TRACE now={d} stage={s}\n", .{ self.now_seconds, stage });
+    self.outputFmt("TRACE now={d} stage={s}\n", .{ self.now_seconds, stage });
 }
 
 pub fn traceError(self: *Brain, stage: []const u8, err: anyerror) void {
-    std.debug.print("TRACE now={d} stage={s} error={s}\n", .{ self.now_seconds, stage, @errorName(err) });
+    self.outputFmt("TRACE now={d} stage={s} error={s}\n", .{ self.now_seconds, stage, @errorName(err) });
 }
 
 pub fn traceText(self: *Brain, stage: []const u8, text: []const u8) void {
-    std.debug.print("TRACE now={d} stage={s} bytes={d}", .{ self.now_seconds, stage, text.len });
-    if (text.len > 0) std.debug.print(" preview=\"{s}\"", .{helpers.previewText(text)});
-    std.debug.print("\n", .{});
+    if (text.len > 0) {
+        self.outputFmt("TRACE now={d} stage={s} bytes={d} preview=\"{s}\"\n", .{ self.now_seconds, stage, text.len, helpers.previewText(text) });
+    } else {
+        self.outputFmt("TRACE now={d} stage={s} bytes={d}\n", .{ self.now_seconds, stage, text.len });
+    }
 }
 
 pub fn traceCount(self: *Brain, stage: []const u8, count: usize) void {
-    std.debug.print("TRACE now={d} stage={s} count={d}\n", .{ self.now_seconds, stage, count });
+    self.outputFmt("TRACE now={d} stage={s} count={d}\n", .{ self.now_seconds, stage, count });
 }
 
 pub fn traceIntent(self: *Brain, stage: []const u8, action: intent_mod.IntentAction) void {
-    std.debug.print("TRACE now={d} stage={s} action={s}\n", .{ self.now_seconds, stage, @tagName(action) });
+    self.outputFmt("TRACE now={d} stage={s} action={s}\n", .{ self.now_seconds, stage, @tagName(action) });
 }
 
 pub fn traceTurn(self: *Brain, stage: []const u8, turn_index: usize, observation_bytes: usize) void {
-    std.debug.print("TRACE now={d} stage={s} turn={d} observation_bytes={d}\n", .{ self.now_seconds, stage, turn_index, observation_bytes });
+    self.outputFmt("TRACE now={d} stage={s} turn={d} observation_bytes={d}\n", .{ self.now_seconds, stage, turn_index, observation_bytes });
 }
 
 pub fn traceTurnCommands(self: *Brain, stage: []const u8, turn_index: usize, command_count: usize, conversation_done: bool) void {
-    std.debug.print("TRACE now={d} stage={s} turn={d} commands={d} conversation_done={any}\n", .{ self.now_seconds, stage, turn_index, command_count, conversation_done });
+    self.outputFmt("TRACE now={d} stage={s} turn={d} commands={d} conversation_done={any}\n", .{ self.now_seconds, stage, turn_index, command_count, conversation_done });
 }
 
 pub fn traceCommandBatch(self: *Brain, stage: []const u8, turn_index: usize, batch: CommandBatchResult, observation_bytes: usize) void {
-    std.debug.print(
+    self.outputFmt(
         "TRACE now={d} stage={s} turn={d} spoken={any} ended_with_speech={any} interrupted={any} observation_bytes={d}\n",
         .{ self.now_seconds, stage, turn_index, batch.spoken_text != null, batch.ended_with_speech, batch.interrupted_by != null, observation_bytes },
     );
 }
 
 pub fn traceCommand(self: *Brain, stage: []const u8, command_index: usize, command: chat_mod.ChatCommandType) void {
-    std.debug.print("TRACE now={d} stage={s} command_index={d} command={s}\n", .{ self.now_seconds, stage, command_index, @tagName(command) });
+    self.outputFmt("TRACE now={d} stage={s} command_index={d} command={s}\n", .{ self.now_seconds, stage, command_index, @tagName(command) });
 }
 
 pub fn traceCommandError(self: *Brain, stage: []const u8, command_index: usize, command: chat_mod.ChatCommandType, err: anyerror) void {
-    std.debug.print(
+    self.outputFmt(
         "TRACE now={d} stage={s} command_index={d} command={s} error={s}\n",
         .{ self.now_seconds, stage, command_index, @tagName(command), @errorName(err) },
     );
+}
+
+pub fn output(self: *Brain, text: []const u8) void {
+    const sink = self.deps.output orelse return;
+    sink.write(text) catch {};
+}
+
+pub fn outputFmt(self: *Brain, comptime fmt: []const u8, args: anytype) void {
+    const sink = self.deps.output orelse return;
+    const text = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
+    defer self.allocator.free(text);
+    sink.write(text) catch {};
+}
+
+pub fn outputBrain(self: *Brain, text: []const u8) void {
+    self.outputFmt("\nBRAIN:\n{s}\n", .{text});
+}
+
+pub fn outputImageCapture(self: *Brain, capture: events.ImageCapture) void {
+    self.outputFmt("Image: {s}\n", .{capture.path});
+}
+
+pub fn outputRecognitionResult(self: *Brain, result: identity.IdentityResult) void {
+    if (result.candidate_name) |candidate| {
+        self.outputFmt("Recognition: {s}, confidence={d:.2}, candidate={s}\n", .{ @tagName(result.match_status), result.confidence, candidate });
+    } else {
+        self.outputFmt("Recognition: {s}, confidence={d:.2}\n", .{ @tagName(result.match_status), result.confidence });
+    }
 }
 
 pub fn appendCommandLog(self: *Brain, kind: []const u8, title: []const u8, body: []const u8) !void {
@@ -196,7 +227,7 @@ pub fn appendCommandLog(self: *Brain, kind: []const u8, title: []const u8, body:
 }
 
 pub fn recordRuntimeEvent(self: *Brain, event: schema.RuntimeEvent) anyerror!void {
-    const now = try time_mod.nowTimestamp(self.allocator);
+    const now = try self.timestampNow();
     const event_id = try std.fmt.allocPrint(self.allocator, "event_{d}_{s}_{d}_{d}", .{ self.now_seconds, @tagName(event.kind), event.title.len, event.body.len });
     const full_event: schema.RuntimeEvent = .{
         .event_id = event_id,

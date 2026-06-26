@@ -1,5 +1,6 @@
 const std = @import("std");
-const schema = @import("../storage/schema.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
 
 pub const test_first_turned_on_at_unix_seconds: i64 = 1_781_222_400;
 

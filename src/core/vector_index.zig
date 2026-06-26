@@ -1,5 +1,6 @@
 const std = @import("std");
-const schema = @import("../storage/schema.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
 
 pub const dimensions: usize = 64;
 

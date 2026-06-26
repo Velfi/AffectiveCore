@@ -1,5 +1,3 @@
-const std = @import("std");
-
 pub const BrainState = enum {
     Idle,
     Capture,
@@ -33,7 +31,3 @@ pub const BrainState = enum {
         };
     }
 };
-
-pub fn printState(state: BrainState) void {
-    std.debug.print("\nBRAIN STATE: {s}\n", .{@tagName(state)});
-}

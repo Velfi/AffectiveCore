@@ -1,4 +1,5 @@
 const std = @import("std");
+const FileSystem = @import("port_files.zig").FileSystem;
 
 pub const SeedEntryKind = enum {
     core_value,
@@ -44,8 +45,8 @@ const Section = enum {
     superego_principles,
 };
 
-pub fn readSeedFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !SeedDocument {
-    const bytes = try readFileAllocPath(io, path, allocator, .limited(128 * 1024));
+pub fn readSeedFile(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, path: []const u8) !SeedDocument {
+    const bytes = try fs.readFileAllocPath(io, path, allocator, .limited(128 * 1024));
     defer allocator.free(bytes);
     return parseSeedMarkdown(allocator, bytes);
 }
@@ -138,17 +139,6 @@ pub fn parseSeedMarkdown(allocator: std.mem.Allocator, markdown: []const u8) !Se
         .name = name.?,
         .entries = try entries.toOwnedSlice(allocator),
     };
-}
-
-fn readFileAllocPath(io: std.Io, path: []const u8, allocator: std.mem.Allocator, limit: std.Io.Limit) ![]u8 {
-    if (!std.fs.path.isAbsolute(path)) {
-        return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, limit);
-    }
-    const dirname = std.fs.path.dirname(path) orelse return error.MissingParentDirectory;
-    const basename = std.fs.path.basename(path);
-    var dir = try std.Io.Dir.openDirAbsolute(io, dirname, .{});
-    defer dir.close(io);
-    return dir.readFileAlloc(io, basename, allocator, limit);
 }
 
 test "parse seed markdown extracts durable entries" {

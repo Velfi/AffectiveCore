@@ -2,41 +2,21 @@ const std = @import("std");
 const ai = @import("random_provider_client.zig");
 const http_transport = @import("http_transport.zig");
 const chat = @import("chat_client.zig");
+const want_port = @import("../core/port_want_achievement.zig");
 
-pub const WantCandidate = struct {
-    memory_id: []const u8,
-    text: []const u8,
-    interpretation: []const u8,
-    salience: f32,
-    score: i32,
-};
-
-pub const WantAchievementMatch = struct {
-    memory_id: []const u8,
-    confidence: f32,
-    evidence: []const u8,
-};
-
-pub const WantAchievementResult = struct {
-    matches: []const WantAchievementMatch,
-};
-
-pub const WantAchievementDetector = struct {
-    ctx: *anyopaque,
-    detectFn: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const WantCandidate) anyerror!WantAchievementResult,
-
-    pub fn detect(self: WantAchievementDetector, allocator: std.mem.Allocator, event_text: []const u8, wants: []const WantCandidate) !WantAchievementResult {
-        return self.detectFn(self.ctx, allocator, event_text, wants);
-    }
-};
+pub const WantCandidate = want_port.WantCandidate;
+pub const WantAchievementMatch = want_port.WantAchievementMatch;
+pub const WantAchievementResult = want_port.WantAchievementResult;
+pub const WantAchievementDetector = want_port.WantAchievementDetector;
+pub const ScriptedWantAchievementDetector = want_port.ScriptedWantAchievementDetector;
 
 pub const RandomProviderWantAchievementDetector = struct {
     provider_client: ai.RandomProviderClient,
     reasoning_effort: ?chat.ReasoningEffort,
 
-    pub fn init(io: std.Io, http: http_transport.Client, env: *const std.process.Environ.Map, models_spec: []const u8, reasoning_effort: ?chat.ReasoningEffort) RandomProviderWantAchievementDetector {
+    pub fn init(io: std.Io, http: http_transport.Client, models_spec: []const u8, reasoning_effort: ?chat.ReasoningEffort) RandomProviderWantAchievementDetector {
         return .{
-            .provider_client = ai.RandomProviderClient.init(io, http, env, models_spec),
+            .provider_client = ai.RandomProviderClient.init(io, http, models_spec),
             .reasoning_effort = reasoning_effort,
         };
     }
@@ -61,28 +41,6 @@ pub const RandomProviderWantAchievementDetector = struct {
             .bad_response_logger = reportWantAchievementParseError,
         });
         return parseWantAchievementResult(allocator, content);
-    }
-};
-
-pub const ScriptedWantAchievementDetector = struct {
-    matches: []const WantAchievementMatch = &.{},
-    fail: ?anyerror = null,
-    calls: usize = 0,
-    last_event_text: []const u8 = "",
-    last_want_count: usize = 0,
-
-    pub fn detector(self: *ScriptedWantAchievementDetector) WantAchievementDetector {
-        return .{ .ctx = self, .detectFn = detect };
-    }
-
-    fn detect(ctx: *anyopaque, allocator: std.mem.Allocator, event_text: []const u8, wants: []const WantCandidate) !WantAchievementResult {
-        _ = allocator;
-        const self: *ScriptedWantAchievementDetector = @ptrCast(@alignCast(ctx));
-        self.calls += 1;
-        self.last_event_text = event_text;
-        self.last_want_count = wants.len;
-        if (self.fail) |err| return err;
-        return .{ .matches = self.matches };
     }
 };
 

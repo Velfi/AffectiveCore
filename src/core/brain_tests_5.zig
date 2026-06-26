@@ -2,17 +2,18 @@ const std = @import("std");
 const brain_mod = @import("brain.zig");
 const support = @import("brain_test_support.zig");
 const store_support = @import("brain_test_store.zig");
-const schema = @import("../storage/schema.zig");
-const chat_mod = @import("../api/chat_client.zig");
-const openai = @import("../api/openai_client.zig");
-const audio_mod = @import("../api/audio_client.zig");
-const autonomy_mod = @import("../api/autonomy_client.zig");
-const image_mod = @import("../api/image_client.zig");
-const email_mod = @import("../api/email_client.zig");
-const want_achievement_mod = @import("../api/want_achievement_client.zig");
-const psyche_client = @import("../api/psyche_client.zig");
-const input_mod = @import("../platform/common/input.zig");
-const facial_expression = @import("../platform/common/facial_expression.zig");
+const ports = @import("ports.zig");
+const schema = ports.schema;
+const chat_mod = ports.chat;
+const openai = ports.openai;
+const audio_mod = ports.audio;
+const autonomy_mod = ports.autonomy;
+const image_mod = ports.image;
+const email_mod = ports.email;
+const want_achievement_mod = ports.want_achievement;
+const psyche_client = ports.psyche;
+const input_mod = ports.input;
+const facial_expression = ports.facial_expression;
 const maintenance = @import("maintenance.zig");
 const id_monitor = @import("id_monitor.zig");
 const interrupt_mod = @import("interrupt.zig");
@@ -54,8 +55,6 @@ test "autonomy sleeps when energy is exhausted" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const state_path = "data/test/autonomy_exhausted_state.json";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "data/test");
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, state_path) catch {};
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
@@ -68,7 +67,7 @@ test "autonomy sleeps when energy is exhausted" {
 
     try brain.runAutonomyTick(std.testing.io);
     const day_key = try brain.localDayKey(std.testing.io);
-    const state = try maintenance.loadAutonomyState(allocator, std.testing.io, state_path, false, 0, day_key);
+    const state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, 0, day_key);
     try std.testing.expectEqual(@as(usize, 0), scripted.calls);
     try std.testing.expect(state.sleeping);
     try std.testing.expect(state.energy_exhausted);
@@ -333,7 +332,7 @@ test "choose_attention prioritizes unresolved appraisal" {
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
     try store.conversation_summaries.append(allocator, .{
         .summary_id = "recent_summary",
-        .time = try time_mod.nowTimestamp(allocator),
+        .time = try std.fmt.allocPrint(allocator, "{d}", .{brain.now_seconds}),
         .user_summary = "recent interaction",
         .brain_summary = "daily interaction need was met",
     });
@@ -386,6 +385,98 @@ test "choose_attention ignores stale current stimulus" {
 
     const text = try brain.chooseAttention();
     try std.testing.expect(std.mem.indexOf(u8, text, "current_stimulus") == null);
+}
+
+test "focus derives from a high-attention stimulus and leads the context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    _ = try brain.observeSenseStimulus(.{
+        .kind = .power,
+        .source = "test",
+        .signature = "battery_critical_unplugged",
+        .raw_magnitude = 0.90,
+        .threat = 0.90,
+        .safety_relevant = true,
+        .metadata = "test critical power stimulus",
+    });
+    try brain.refreshFocus();
+
+    try std.testing.expectEqual(Brain.FocusMode.focused, brain.focusMode());
+    try std.testing.expect(brain.current_focus != null);
+    try std.testing.expectEqual(Brain.FocusSource.derived, brain.current_focus.?.source);
+    const memory = try brain.buildConversationMemory();
+    try std.testing.expect(std.mem.indexOf(u8, memory, "CURRENT FOCUS:") != null);
+}
+
+test "a self-set focus overrides weaker derived attention until it decays" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    _ = try brain.setFocus("finish the plant note");
+    try std.testing.expectEqual(Brain.FocusSource.self_set, brain.current_focus.?.source);
+
+    // A weak stimulus arrives; the deliberate plan should still win.
+    _ = try brain.observeSenseStimulus(.{
+        .kind = .speech,
+        .source = "test",
+        .signature = "weak_background",
+        .raw_magnitude = 0.20,
+        .threat = 0.0,
+        .metadata = "weak background stimulus",
+    });
+    try brain.refreshFocus();
+
+    try std.testing.expectEqual(Brain.FocusSource.self_set, brain.current_focus.?.source);
+    try std.testing.expectEqualStrings("finish the plant note", brain.current_focus.?.text);
+    const memory = try brain.buildConversationMemory();
+    try std.testing.expect(std.mem.indexOf(u8, memory, "source: self_set") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "finish the plant note") != null);
+}
+
+test "a self-set focus decays past its TTL and re-derives" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    _ = try brain.setFocus("finish the plant note");
+    try std.testing.expect(brain.currentFocusAttention() != null);
+
+    brain.now_seconds += 121; // past the 120s focus TTL
+    try std.testing.expect(brain.currentFocusAttention() == null);
+
+    try brain.refreshFocus();
+    try std.testing.expectEqual(Brain.FocusSource.derived, brain.current_focus.?.source);
+}
+
+test "unfocused mode shows the low-key line, not a focus block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    // No fresh stimulus and only a weak derived focus: the gate stays unfocused.
+    brain.current_stimulus_context = null;
+    brain.current_stimulus_seconds = null;
+    brain.current_focus = .{ .text = "wait for the next interaction", .source = .derived, .set_at = brain.now_seconds, .base_attention = 0.20 };
+
+    try std.testing.expectEqual(Brain.FocusMode.unfocused, brain.focusMode());
+    const memory = try brain.buildConversationMemory();
+    try std.testing.expect(std.mem.indexOf(u8, memory, "unfocused") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "CURRENT FOCUS:") == null);
 }
 
 test "consolidation promotes salient memories and decays weak short term memories" {
