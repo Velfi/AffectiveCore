@@ -474,13 +474,20 @@ fn runtimeTurnContext(self: *Brain) ?*RuntimeTurnContext {
     return @ptrCast(@alignCast(raw));
 }
 
+fn coerceConversationOrigins(turn_ctx: *RuntimeTurnContext, proposals: []chat_mod.ActionProposal) void {
+    if (turn_ctx.source != .conversation) return;
+    for (proposals) |*proposal| proposal.origin = .interaction;
+}
+
 fn registerTurnProposals(turn_ctx: *RuntimeTurnContext, allocator: std.mem.Allocator, proposals: []const chat_mod.ActionProposal) !void {
     for (proposals, 0..) |proposal, index| {
+        var registered = proposal;
+        if (turn_ctx.source == .conversation) registered.origin = .interaction;
         const proposal_id = try std.fmt.allocPrint(allocator, "proposal_{d}_{d}", .{ turn_ctx.now_ms, index });
         try turn_ctx.proposals.append(allocator, .{
             .proposal_id = proposal_id,
-            .proposal = proposal,
-            .payload = proposalPayload(proposal_id, proposal),
+            .proposal = registered,
+            .payload = proposalPayload(proposal_id, registered),
         });
     }
 }
@@ -713,6 +720,7 @@ fn runtimeLanguageMindActorHandle(ctx: *anyopaque, event: brain_event.BrainEvent
         defer handle_ctx.allocator.free(composition_context);
         var expanded_turn = turn;
         try process_goal_resolver.expandChatTurn(self, &expanded_turn, composition_context);
+        coerceConversationOrigins(turn_ctx, expanded_turn.action_pressures);
         try actor.emitProposals(turn_ctx.now_ms, expanded_turn.action_pressures);
         turn_ctx.chat_turn = expanded_turn;
         try registerTurnProposals(turn_ctx, handle_ctx.allocator, expanded_turn.action_pressures);
@@ -807,7 +815,7 @@ fn runtimeAutonomyActorHandle(ctx: *anyopaque, event: brain_event.BrainEvent, ha
     const turn_ctx = runtimeTurnContext(self) orelse return no_events[0..];
     var parsed = try parseProposalPayload(handle_ctx.allocator, event.payload);
     defer parsed.deinit();
-    if (std.mem.eql(u8, parsed.value.origin, "interaction")) {
+    if (std.mem.eql(u8, parsed.value.origin, "interaction") or turn_ctx.source == .conversation) {
         var interaction_collector = EmitCollector{
             .allocator = handle_ctx.allocator,
             .override_event_kind = "governance.autonomy",

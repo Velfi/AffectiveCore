@@ -962,6 +962,9 @@ test "embedded user_text pauses for camera sense then resumes on observation" {
     try std.testing.expect(std.mem.indexOf(u8, first_json, "Chose to look at who is here.") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_json, "spoken_text") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_json, "\"awaiting_host_sense\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_json, "\"awaited_host_sense\": \"camera\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_json, "\"awaited_host_purpose\": \"recognize\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_json, "\"awaited_host_timeout_ms\": 15000") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_json, "\"activity_id\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_json, "\"activity_state\": \"active\"") != null);
     try std.testing.expect(handle.?.brain.conversationAwaitingHost());

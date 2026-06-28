@@ -86,6 +86,7 @@ pub fn activeActivityId(self: *Brain) ?[]const u8 {
 
 pub fn attachActivityFields(self: *Brain, result: brain_mod.ConversationTurnResult) !brain_mod.ConversationTurnResult {
     const dispatch_id = try duplicateDispatchId(self, result.dispatch_id);
+    const awaited = try awaitedHostRequestOutcomeFields(self);
     const active = self.active_activity orelse return .{
         .user_text = result.user_text,
         .spoken_text = result.spoken_text,
@@ -94,6 +95,9 @@ pub fn attachActivityFields(self: *Brain, result: brain_mod.ConversationTurnResu
         .dispatch_id = dispatch_id,
         .interrupted_by = result.interrupted_by,
         .awaiting_host_sense = self.awaitedHostRequestActive(),
+        .awaited_host_sense = awaited.sense,
+        .awaited_host_purpose = awaited.purpose,
+        .awaited_host_timeout_ms = awaited.timeout_ms,
         .activity_id = result.activity_id,
         .activity_kind = result.activity_kind,
         .activity_kind_label = result.activity_kind_label,
@@ -110,12 +114,24 @@ pub fn attachActivityFields(self: *Brain, result: brain_mod.ConversationTurnResu
         .dispatch_id = dispatch_id,
         .interrupted_by = result.interrupted_by,
         .awaiting_host_sense = self.awaitedHostRequestActive(),
+        .awaited_host_sense = awaited.sense,
+        .awaited_host_purpose = awaited.purpose,
+        .awaited_host_timeout_ms = awaited.timeout_ms,
         .activity_id = try self.allocator.dupe(u8, active.id),
         .activity_kind = try self.allocator.dupe(u8, @tagName(active.kind)),
         .activity_kind_label = try self.allocator.dupe(u8, active.kind_label),
         .activity_state = try self.allocator.dupe(u8, activity_mod.activityStateTag(active.status, awaiting_host)),
         .activity_goal = try self.allocator.dupe(u8, active.goal),
         .activity_awaiting = if (active.awaiting) |awaiting| try self.allocator.dupe(u8, awaiting) else null,
+    };
+}
+
+fn awaitedHostRequestOutcomeFields(self: *Brain) !struct { sense: ?[]const u8, purpose: ?[]const u8, timeout_ms: ?u32 } {
+    const req = self.awaited_host_request orelse return .{ .sense = null, .purpose = null, .timeout_ms = null };
+    return .{
+        .sense = try self.allocator.dupe(u8, req.sense),
+        .purpose = try self.allocator.dupe(u8, req.purpose),
+        .timeout_ms = req.timeout_ms,
     };
 }
 

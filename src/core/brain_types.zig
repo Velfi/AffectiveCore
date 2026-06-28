@@ -89,6 +89,12 @@ pub const ConversationTurnResult = struct {
     /// observation. The host should keep the turn open and expect a follow-up
     /// user_text or sense_observation once the awaited sense arrives.
     awaiting_host_sense: bool = false,
+  /// Host pull sense name when awaiting_host_sense is true (e.g. "camera").
+    awaited_host_sense: ?[]const u8 = null,
+    /// Host pull purpose when awaiting_host_sense is true (e.g. "recognize").
+    awaited_host_purpose: ?[]const u8 = null,
+    /// Host pull timeout in milliseconds when awaiting_host_sense is true.
+    awaited_host_timeout_ms: ?u32 = null,
     /// Stable ID for a multi-step activity the brain opened. Absent on single-step turns.
     activity_id: ?[]const u8 = null,
     activity_kind: ?[]const u8 = null,

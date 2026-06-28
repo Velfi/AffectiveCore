@@ -602,35 +602,57 @@ fn runSingleChatPass(
             .awaiting_host_sense = false,
         };
     }
-    self.traceTurn("conversation.runtime.turn.start", 0, observations.items.len);
-    const runtime_turn = runtime_bridge.runConversationPass(self, memory, memory_sections, user_text, observations, 0) catch |err| {
-        var failure: ConversationPassResult = .{
-            .spoken_text = "",
-            .final_turn = null,
-            .pending_interrupt = null,
-            .awaiting_host_sense = false,
-        };
-        try recordConversationPassFailure(self, user_text, err, &failure);
-        return failure;
-    };
-    const turn = runtime_turn.turn;
-    self.traceTurnActionPressures("conversation.runtime.turn.done", 0, turn.action_pressures.len, turn.turn_complete);
-    if (runtime_turn.execution_error) |exec_err| {
-        return .{
-            .spoken_text = try self.handleHardActionError(exec_err),
-            .final_turn = turn,
-            .pending_interrupt = null,
-            .awaiting_host_sense = false,
-        };
-    }
-    const batch = runtime_turn.batch;
-    self.traceActionPressureBatch("conversation.action_pressures.done", 0, batch, observations.items.len);
-    return .{
-        .spoken_text = batch.spoken_text orelse "",
-        .final_turn = turn,
-        .pending_interrupt = batch.interrupted_by,
+
+    var turn_index: usize = 0;
+    const max_passes = self.cfg.capacity.open_loops_soft_max;
+    var latest: ConversationPassResult = .{
+        .spoken_text = "",
+        .final_turn = null,
+        .pending_interrupt = null,
         .awaiting_host_sense = false,
     };
+
+    while (turn_index < max_passes) : (turn_index += 1) {
+        const observations_before = observations.items.len;
+        self.traceTurn("conversation.runtime.turn.start", turn_index, observations.items.len);
+        const runtime_turn = runtime_bridge.runConversationPass(self, memory, memory_sections, user_text, observations, turn_index) catch |err| {
+            var failure: ConversationPassResult = .{
+                .spoken_text = "",
+                .final_turn = null,
+                .pending_interrupt = null,
+                .awaiting_host_sense = false,
+            };
+            try recordConversationPassFailure(self, user_text, err, &failure);
+            return failure;
+        };
+        const turn = runtime_turn.turn;
+        self.traceTurnActionPressures("conversation.runtime.turn.done", turn_index, turn.action_pressures.len, turn.turn_complete);
+        if (runtime_turn.execution_error) |exec_err| {
+            return .{
+                .spoken_text = try self.handleHardActionError(exec_err),
+                .final_turn = turn,
+                .pending_interrupt = null,
+                .awaiting_host_sense = false,
+            };
+        }
+        const batch = runtime_turn.batch;
+        latest = .{
+            .spoken_text = batch.spoken_text orelse "",
+            .final_turn = turn,
+            .pending_interrupt = batch.interrupted_by,
+            .awaiting_host_sense = self.awaitedHostRequestActive(),
+        };
+        self.traceActionPressureBatch("conversation.action_pressures.done", turn_index, batch, observations.items.len);
+
+        if (batch.interrupted_by != null) return latest;
+        if (latest.awaiting_host_sense) return latest;
+        if (latest.spoken_text.len > 0) return latest;
+        if (turn.action_pressures.len == 0) return latest;
+        if (observations.items.len <= observations_before) return latest;
+        if (turn_index + 1 >= max_passes) return latest;
+    }
+
+    return latest;
 }
 
 fn finalizeConversationTurn(
@@ -720,6 +742,9 @@ fn stampDispatchIdOnResult(self: *Brain, result: ConversationTurnResult) !Conver
         .dispatch_id = if (id.len > 0) try self.allocator.dupe(u8, id) else "",
         .interrupted_by = result.interrupted_by,
         .awaiting_host_sense = result.awaiting_host_sense,
+        .awaited_host_sense = result.awaited_host_sense,
+        .awaited_host_purpose = result.awaited_host_purpose,
+        .awaited_host_timeout_ms = result.awaited_host_timeout_ms,
         .activity_id = result.activity_id,
         .activity_kind = result.activity_kind,
         .activity_kind_label = result.activity_kind_label,

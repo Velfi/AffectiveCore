@@ -558,6 +558,7 @@ pub fn encodeStructuredDispatchResult(
     event_type: []const u8,
     value: anytype,
 ) ![]u8 {
+    stampAwaitedHostSenseTimeouts(ctx);
     const activity_id = ctx.brain.activeActivityId() orelse "";
     const compacted_events = try context_gate.compactEvents(ctx.allocator(), ctx.brain.now_seconds, request_id, activity_id, embedded.hostEvents(ctx), ctx.context_budget);
     try persistRawRefs(ctx, compacted_events.raw_refs);
@@ -575,6 +576,17 @@ pub fn encodeStructuredDispatchResult(
         return try minimalEnvelope(ctx, request_id, event_type, "compacted envelope exceeded max_bytes");
     }
     return output;
+}
+
+fn stampAwaitedHostSenseTimeouts(ctx: *AffectiveCoreEmbedded) void {
+    const req = ctx.brain.awaited_host_request orelse return;
+    const effects = ctx.host_effects orelse return;
+    for (effects.events.items) |*event| {
+        if (!std.mem.eql(u8, event.type, "sense_request")) continue;
+        const sense = event.sense orelse continue;
+        if (!std.mem.eql(u8, sense, req.sense)) continue;
+        event.timeout_ms = req.timeout_ms;
+    }
 }
 
 pub fn filterSuppressedEvents(ctx: *AffectiveCoreEmbedded, events: []const embedded_protocol.HostEvent) ![]const embedded_protocol.HostEvent {

@@ -14,6 +14,7 @@ const helpers = @import("brain_helpers.zig");
 const activity_mod = @import("activity.zig");
 const brain_process = @import("brain_process.zig");
 const read_models = @import("read_models.zig");
+const awaited_host_request = @import("awaited_host_request.zig");
 
 const Brain = brain_mod.Brain;
 const TestStore = store_support.TestStore;
@@ -419,6 +420,9 @@ test "conversation turn awaiting host sense exposes activity id" {
 
     try std.testing.expect(brain.conversationAwaitingHost());
     try std.testing.expect(result.awaiting_host_sense);
+    try std.testing.expectEqualStrings("camera", result.awaited_host_sense.?);
+    try std.testing.expectEqualStrings("recognize", result.awaited_host_purpose.?);
+    try std.testing.expectEqual(@as(u32, awaited_host_request.camera_recognize_timeout_ms), result.awaited_host_timeout_ms.?);
     try std.testing.expect(result.activity_id != null);
     try std.testing.expectEqualStrings("active", result.activity_state.?);
     try std.testing.expectEqualStrings("hello", result.activity_goal.?);

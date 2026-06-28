@@ -170,3 +170,119 @@ test "facial expression fails loudly for invalid sprites and long duration" {
     try std.testing.expectError(error.FacialExpressionDurationTooLong, brain.executeActionProposals(long_duration[0..], &observations));
 }
 
+const runtime_bridge = @import("brain_runtime_bridge.zig");
+
+const ScriptedSenseBatchChatService = struct {
+    pub fn service(_: *ScriptedSenseBatchChatService) chat_mod.ChatService {
+        return .{ .ctx = @as(*anyopaque, @ptrFromInt(1)), .respondFn = respond };
+    }
+
+    fn respond(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !chat_mod.ChatTurn {
+        var pressures = try allocator.alloc(chat_mod.ActionProposal, 5);
+        pressures[0] = .{ .action = .get_time };
+        pressures[1] = .{ .action = .get_power };
+        pressures[2] = .{ .action = .get_storage };
+        pressures[3] = .{ .action = .get_database_stats };
+        pressures[4] = .{ .action = .request_orientation };
+        return .{
+            .action_pressures = pressures,
+            .user_summary = try allocator.dupe(u8, "test senses"),
+            .brain_summary = try allocator.dupe(u8, "polling senses"),
+        };
+    }
+};
+
+test "runtime conversation pass executes five sense proposals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    var chat = ScriptedSenseBatchChatService{};
+    brain.deps.chat_service = chat.service();
+    var observations = std.ArrayList(u8).empty;
+    const result = try runtime_bridge.runConversationPass(&brain, "memory", &.{}, "test your senses", &observations, 0);
+    try std.testing.expectEqual(@as(usize, 5), result.turn.action_pressures.len);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "time:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "power:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "storage:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "database:") != null);
+}
+
+test "conversation runtime forces interaction origin when autonomy mode is off" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.cfg.autonomy_mode = "off";
+    var chat = ScriptedAutonomyOriginSenseChatService{};
+    brain.deps.chat_service = chat.service();
+    var observations = std.ArrayList(u8).empty;
+    const result = try runtime_bridge.runConversationPass(&brain, "memory", &.{}, "poll senses", &observations, 0);
+    _ = result;
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "time:") != null);
+}
+
+const ScriptedAutonomyOriginSenseChatService = struct {
+    pub fn service(_: *ScriptedAutonomyOriginSenseChatService) chat_mod.ChatService {
+        return .{ .ctx = @as(*anyopaque, @ptrFromInt(2)), .respondFn = respond };
+    }
+
+    fn respond(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !chat_mod.ChatTurn {
+        var pressures = try allocator.alloc(chat_mod.ActionProposal, 1);
+        pressures[0] = .{ .action = .get_time, .origin = .autonomy };
+        return .{
+            .action_pressures = pressures,
+            .user_summary = try allocator.dupe(u8, "poll senses"),
+            .brain_summary = try allocator.dupe(u8, "autonomy-origin sense poll"),
+        };
+    }
+};
+
+const ScriptedSenseThenReportChatService = struct {
+    calls: usize = 0,
+
+    pub fn service(self: *ScriptedSenseThenReportChatService) chat_mod.ChatService {
+        return .{ .ctx = self, .respondFn = respond };
+    }
+
+    fn respond(ctx: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8, observations: []const u8) !chat_mod.ChatTurn {
+        const self: *ScriptedSenseThenReportChatService = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (self.calls == 1) {
+            var pressures = try allocator.alloc(chat_mod.ActionProposal, 1);
+            pressures[0] = .{ .action = .get_time };
+            return .{
+                .action_pressures = pressures,
+                .user_summary = try allocator.dupe(u8, "test senses"),
+                .brain_summary = try allocator.dupe(u8, "polling time"),
+            };
+        }
+        try std.testing.expect(std.mem.indexOf(u8, observations, "time:") != null);
+        var pressures = try allocator.alloc(chat_mod.ActionProposal, 1);
+        pressures[0] = .{ .action = .say, .text = try allocator.dupe(u8, "The clock reads 2026-06-23.") };
+        return .{
+            .action_pressures = pressures,
+            .user_summary = try allocator.dupe(u8, "test senses"),
+            .brain_summary = try allocator.dupe(u8, "reporting sense results"),
+        };
+    }
+};
+
+test "conversation capability loop speaks after sense-only first pass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    var chat = ScriptedSenseThenReportChatService{};
+    brain.deps.chat_service = chat.service();
+    const result = try brain.handleConversationText(try input_mod.HeardSpeech.typed(allocator, "test your senses and report back"), .{});
+    try std.testing.expectEqual(@as(usize, 2), chat.calls);
+    try std.testing.expectEqualStrings("The clock reads 2026-06-23.", result.spoken_text);
+}
+

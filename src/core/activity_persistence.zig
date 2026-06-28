@@ -169,6 +169,7 @@ pub fn applyRecordContext(self: *Brain, record: schema.ActivityRecord) !void {
             .sense = try self.allocator.dupe(u8, sense),
             .purpose = try self.allocator.dupe(u8, purpose),
             .since_seconds = if (record.waiting_since_ms) |ms| @divFloor(ms, 1000) else self.now_seconds,
+            .timeout_ms = try @import("awaited_host_request.zig").hostSensePullTimeoutMs(sense, purpose),
         };
     } else if (record.awaiting) |awaiting| {
         if (std.mem.indexOf(u8, awaiting, "recognize") != null and std.mem.indexOf(u8, awaiting, "camera") != null) {

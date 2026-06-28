@@ -29,6 +29,7 @@ pub const HostEvent = struct {
     eyes: ?[]const u8 = null,
     mouth: ?[]const u8 = null,
     duration_ms: ?u32 = null,
+    timeout_ms: ?u32 = null,
     path: ?[]const u8 = null,
     url: ?[]const u8 = null,
     mime_type: ?[]const u8 = null,
@@ -131,6 +132,10 @@ pub const HostEvent = struct {
         try jw.write("pull");
         try jw.objectField("response_presentation");
         try jw.write("status");
+        if (self.timeout_ms) |timeout_ms| {
+            try jw.objectField("timeout_ms");
+            try jw.write(timeout_ms);
+        }
         try jw.endObject();
     }
 
