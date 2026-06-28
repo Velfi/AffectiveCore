@@ -1,10 +1,22 @@
 const std = @import("std");
 
+pub const WantGoalKind = enum {
+    achievement,
+    maintenance,
+
+    pub fn wireName(self: WantGoalKind) []const u8 {
+        return @tagName(self);
+    }
+};
+
 pub const WantCandidate = struct {
     memory_id: []const u8,
     text: []const u8,
     interpretation: []const u8,
+    goal_kind: WantGoalKind,
+    fulfillment_criterion: []const u8,
     salience: f32,
+    confidence: f32,
     score: i32,
 };
 

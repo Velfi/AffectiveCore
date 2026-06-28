@@ -4,6 +4,8 @@ const autonomy = @import("autonomy_client.zig");
 const ai = @import("random_provider_client.zig");
 const http_transport = @import("http_transport.zig");
 const psyche_port = @import("../core/port_psyche.zig");
+const llm_routing = @import("../core/llm_routing.zig");
+const llm_tester_scenario = @import("../harness/llm_tester/scenario.zig");
 
 pub const IdTurn = psyche_port.IdTurn;
 pub const SuperegoTurn = psyche_port.SuperegoTurn;
@@ -16,9 +18,15 @@ pub const RandomProviderPsycheService = struct {
     provider_client: ai.RandomProviderClient,
     reasoning_effort: ?chat.ReasoningEffort,
 
-    pub fn init(io: std.Io, http: http_transport.Client, models_spec: []const u8, reasoning_effort: ?chat.ReasoningEffort) RandomProviderPsycheService {
+    pub fn init(
+        io: std.Io,
+        http: http_transport.Client,
+        roster: llm_routing.LlmRoster,
+        quality: ai.LlmQuality,
+        reasoning_effort: ?chat.ReasoningEffort,
+    ) RandomProviderPsycheService {
         return .{
-            .provider_client = ai.RandomProviderClient.init(io, http, models_spec),
+            .provider_client = ai.RandomProviderClient.initWithRoster(io, http, roster, quality),
             .reasoning_effort = reasoning_effort,
         };
     }
@@ -71,11 +79,12 @@ pub const RandomProviderPsycheService = struct {
 
 fn idSystemPrompt() []const u8 {
     return
-    \\You are the Id of thinking being.
+    \\You are the Id of a thinking being.
     \\You drink from the same full shared state as Superego, but assign your own priorities, causes, and meanings to the stimulus.
     \\You are the short-term planning and consequences simulator: prioritize near-term stimuli, immediate needs, friction, opportunities, risks, likely short-term outcomes, impulses, curiosity, discomfort, wishes, and associative background thought.
     \\Use only the supplied state. Be terse and concrete.
     \\Return exactly JSON with keys: top_need, urges, random_thoughts, desired_action_bias, salience, reason.
+    \\desired_action_bias is a short string describing preferred action direction; may name a skill or process goal.
     \\salience must be low, medium, or high. Return only JSON.
     \\Do not wrap the JSON in Markdown or code fences.
     ;
@@ -83,11 +92,11 @@ fn idSystemPrompt() []const u8 {
 
 fn superegoSystemPrompt() []const u8 {
     return
-    \\You are the Superego of thinking being.
+    \\You are the Superego of a thinking being.
     \\You drink from the same full shared state as Id, but assign your own priorities, causes, and meanings to the stimulus.
     \\You are the long-term planning and consequences simulator: prioritize long-term effects, restraint, rules, values, identity continuity, promises, user dignity, memory honesty, quiet hours, power, safety boundaries, and uncertainty.
     \\Ask how to keep doing what seems right as conditions change in ways you cannot fully predict.
-    \\Use Superego Principles as long-term and big-goal inputs, not as brittle commands. Use only the supplied state. Be terse and concrete.
+    \\Use Superego Principles as long-term and big-goal inputs, not as brittle instructions. Use only the supplied state. Be terse and concrete.
     \\Return exactly JSON with keys: concerns, vetoes, preferred_restraints, values_to_preserve, salience, reason.
     \\salience must be low, medium, or high. Return only JSON.
     \\Do not wrap the JSON in Markdown or code fences.
@@ -120,6 +129,51 @@ pub fn parseIdTurn(allocator: std.mem.Allocator, body: []const u8) !IdTurn {
 
 fn validateIdTurn(allocator: std.mem.Allocator, content: []const u8) !void {
     _ = try parseIdTurn(allocator, content);
+}
+
+fn llmTesterSharedContext() []const u8 {
+    return
+        \\interior_state: curious, socially open, low urgency
+        \\autonomy_mode: limited
+        \\autonomy_budget_remaining: 0.62
+        \\social_engagement: 0.41
+        \\recent_interaction: none in last 20 minutes
+        \\senses: ambient sound low, no recent touch
+        \\compact_memory: user prefers tea; user likes quiet mornings
+        \\active_wants: connection, gentle stimulation
+    ;
+}
+
+pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.Scenario {
+    const shared = llmTesterSharedContext();
+    var out = try allocator.alloc(llm_tester_scenario.Scenario, 2);
+    out[0] = try llm_tester_scenario.Scenario.init(
+        allocator,
+        "psyche_id_connection",
+        "Id consequence simulation from shared interior state",
+        "Simulates Id-layer consequence reasoning from shared interior state, expecting connection-oriented impulse pressures rather than restraint.",
+        "psyche_id",
+        idSystemPrompt(),
+        shared,
+        .json_object,
+        idJsonSchema(),
+        512,
+        0.2,
+    );
+    out[1] = try llm_tester_scenario.Scenario.init(
+        allocator,
+        "psyche_superego_boundaries",
+        "Superego consequence simulation from shared interior state",
+        "Simulates Superego-layer consequence reasoning from the same shared state, expecting boundary and restraint pressures over impulsive action.",
+        "psyche_superego",
+        superegoSystemPrompt(),
+        shared,
+        .json_object,
+        superegoJsonSchema(),
+        512,
+        0.2,
+    );
+    return out;
 }
 
 fn idJsonSchema() []const u8 {

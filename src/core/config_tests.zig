@@ -33,16 +33,20 @@ test "config parses autonomy flags" {
     const cfg = try Config.fromArgs(&.{
         "--autonomy",
         "on",
-        "--autonomy-interval-seconds",
-        "60",
+        "--autonomy-limited-replenish-actions-per-minute",
+        "2",
+        "--autonomy-full-replenish-actions-per-minute",
+        "6",
         "--autonomy-sleep",
         "on",
         "--autonomy-quiet-hours",
         "21:30-07:15",
-        "--autonomy-speech-cooldown-minutes",
-        "45",
-        "--autonomy-daily-energy",
-        "12",
+        "--autonomy-limited-max-capacity",
+        "0.40",
+        "--autonomy-full-max-capacity",
+        "0.90",
+        "--autonomy-limited-threshold-bias",
+        "0.25",
         "--psyche",
         "off",
         "--psyche-models",
@@ -50,12 +54,14 @@ test "config parses autonomy flags" {
         "--psyche-reasoning-effort",
         "low",
     });
-    try std.testing.expectEqualStrings("on", cfg.autonomy_mode);
-    try std.testing.expectEqual(@as(u64, 60), cfg.autonomy_interval_seconds);
+    try std.testing.expectEqualStrings("full", cfg.autonomy_mode);
+    try std.testing.expectEqual(@as(f32, 2), cfg.autonomy_limited_replenish_actions_per_minute);
+    try std.testing.expectEqual(@as(f32, 6), cfg.autonomy_full_replenish_actions_per_minute);
     try std.testing.expectEqualStrings("on", cfg.autonomy_sleep);
     try std.testing.expectEqualStrings("21:30-07:15", cfg.autonomy_quiet_hours);
-    try std.testing.expectEqual(@as(u64, 45), cfg.autonomy_speech_cooldown_minutes);
-    try std.testing.expectEqual(@as(u32, 12), cfg.autonomy_daily_energy);
+    try std.testing.expectEqual(@as(f32, 0.40), cfg.autonomy_limited_max_capacity);
+    try std.testing.expectEqual(@as(f32, 0.90), cfg.autonomy_full_max_capacity);
+    try std.testing.expectEqual(@as(f32, 0.25), cfg.autonomy_limited_threshold_bias);
     try std.testing.expectEqualStrings("off", cfg.psyche_mode);
     try std.testing.expectEqualStrings("openai:gpt-4.1-nano", cfg.psyche_models);
     try std.testing.expectEqualStrings("low", cfg.psyche_reasoning_effort);
@@ -72,8 +78,8 @@ test "brain derives isolated runtime paths" {
     try std.testing.expectEqualStrings("/Users/test/Library/Application Support/AffectiveCore/brains/ada", cfg.brain_root);
     try std.testing.expectEqualStrings("/Users/test/Library/Application Support/AffectiveCore/brains/ada/memory/people.sqlite", cfg.memory_path);
     try std.testing.expectEqualStrings("/Users/test/Library/Application Support/AffectiveCore/brains/ada/memory/relationships.sqlite", cfg.graph_path);
-    try std.testing.expectEqualStrings("/Users/test/Library/Application Support/AffectiveCore/brains/ada/events.jsonl", cfg.events_path);
     try std.testing.expectEqualStrings("/Users/test/Library/Application Support/AffectiveCore/brains/ada/runtime_options.json", cfg.runtime_options_path);
+    try std.testing.expectEqualStrings("/Users/test/Library/Application Support/AffectiveCore/brains/ada/llm_providers.json", cfg.llm_providers_path);
     try std.testing.expectEqualStrings("/Users/test/Library/Application Support/AffectiveCore/brains/ada/memory/face_embeddings", cfg.face_embeddings_dir);
     try std.testing.expectEqualStrings("/Users/test/Library/Application Support/AffectiveCore/brains/ada/captures", cfg.captures_dir);
     try std.testing.expectEqualStrings("/tmp/affective-core/brains/ada/captures", cfg.capture_scratch_dir);
@@ -82,9 +88,8 @@ test "brain derives isolated runtime paths" {
     try std.testing.expectEqualStrings("/Users/test/Library/Application Support/AffectiveCore/brains/ada/generated/images", cfg.image_generation_output_dir);
 }
 
-test "legacy profile flag maps to brain id" {
-    const cfg = try Config.fromArgs(&.{ "--profile", "ada" });
-    try std.testing.expectEqualStrings("ada", cfg.brain_id);
+test "profile flag is rejected" {
+    try std.testing.expectError(error.UnknownConfigFlag, Config.fromArgs(&.{ "--profile", "ada" }));
 }
 
 test "brain rejects path-like names" {
@@ -116,7 +121,7 @@ test "client settings isolate frontend and speech IO choices" {
         .audio_input_dir = "/tmp/audio/in",
         .audio_output_dir = "/tmp/audio/out",
         .capture_scratch_dir = "/tmp/captures",
-        .autonomy_mode = "on",
+        .autonomy_mode = "full",
         .conversation_model = "gpt-4.1-mini",
     };
 
@@ -143,7 +148,7 @@ test "client settings isolate frontend and speech IO choices" {
     try std.testing.expectEqualStrings("terminal", updated.transcription_mode);
     try std.testing.expectEqualStrings("aplay", updated.speaker_command);
     try std.testing.expectEqual(@as(u64, 900), updated.button_hold_ms);
-    try std.testing.expectEqualStrings("on", updated.autonomy_mode);
+    try std.testing.expectEqualStrings("full", updated.autonomy_mode);
     try std.testing.expectEqualStrings("gpt-4.1-mini", updated.conversation_model);
 }
 
@@ -157,7 +162,8 @@ test "brain settings isolate central cognition and storage choices" {
         .ai_mode = "openai",
         .conversation_model = "gpt-4.1",
         .autonomy_mode = "off",
-        .autonomy_interval_seconds = 300,
+        .autonomy_limited_replenish_actions_per_minute = 2,
+        .autonomy_full_replenish_actions_per_minute = 6,
         .memory_path = "data/otto/memory.sqlite",
         .graph_path = "data/otto/graph.sqlite",
         .email_smtp_url = "smtps://smtp.example.com:465",
@@ -170,21 +176,24 @@ test "brain settings isolate central cognition and storage choices" {
     try std.testing.expectEqualStrings("openai", brain.ai_mode);
     try std.testing.expectEqualStrings("gpt-4.1", brain.conversation_model);
     try std.testing.expectEqualStrings("off", brain.autonomy_mode);
-    try std.testing.expectEqual(@as(?u64, 300), brain.autonomy_interval_seconds);
+    try std.testing.expectEqual(@as(?f32, 2), brain.autonomy_limited_replenish_actions_per_minute);
+    try std.testing.expectEqual(@as(?f32, 6), brain.autonomy_full_replenish_actions_per_minute);
     try std.testing.expectEqualStrings("data/otto/memory.sqlite", brain.memory_path);
 
-    const updated = cfg.withBrainSettings(.{
+    const updated = try cfg.withBrainSettings(.{
         .brain_id = "otto",
         .ai_mode = "random",
         .conversation_model = "gpt-4.1-mini",
-        .autonomy_mode = "on",
-        .autonomy_interval_seconds = 45,
+        .autonomy_mode = "full",
+        .autonomy_limited_replenish_actions_per_minute = 3,
+        .autonomy_full_replenish_actions_per_minute = 9,
         .memory_path = "data/otto/new-memory.sqlite",
     });
     try std.testing.expectEqualStrings("random", updated.ai_mode);
     try std.testing.expectEqualStrings("gpt-4.1-mini", updated.conversation_model);
-    try std.testing.expectEqualStrings("on", updated.autonomy_mode);
-    try std.testing.expectEqual(@as(u64, 45), updated.autonomy_interval_seconds);
+    try std.testing.expectEqualStrings("full", updated.autonomy_mode);
+    try std.testing.expectEqual(@as(f32, 3), updated.autonomy_limited_replenish_actions_per_minute);
+    try std.testing.expectEqual(@as(f32, 9), updated.autonomy_full_replenish_actions_per_minute);
     try std.testing.expectEqualStrings("smtps://smtp.example.com:465", updated.email_smtp_url);
     try std.testing.expectEqualStrings("secret", updated.email_password);
     try std.testing.expectEqualStrings("data/otto/new-memory.sqlite", updated.memory_path);
@@ -275,7 +284,7 @@ test "runtime options override persisted preferences" {
     try std.testing.expectEqualStrings("voice", cfg.transcription_mode);
     try std.testing.expectEqualStrings("say", cfg.speech_mode);
     try std.testing.expectEqualStrings("data/seeds/otto.md", cfg.seed_path);
-    try std.testing.expectEqualStrings("on", cfg.autonomy_mode);
+    try std.testing.expectEqualStrings("full", cfg.autonomy_mode);
     try std.testing.expectEqualStrings("Samantha", cfg.speech_voice);
     try std.testing.expectEqual(@as(u64, 750), cfg.button_hold_ms);
     try std.testing.expectEqual(@as(f32, 0.9), cfg.known_threshold);

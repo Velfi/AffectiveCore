@@ -1,0 +1,20 @@
+{
+  "setup": true,
+  "steps": [
+    { "request_id": "invalid-resume-first", "event": { "type": "user_text", "text": "hello" } },
+    { "op": "drain" },
+    {
+      "request_id": "invalid-resume-camera",
+      "event": {
+        "type": "sense_observation",
+        "sense": "camera",
+        "observation": {
+          "path": "fixtures/visitors/unknown_01.jpg",
+          "mime_type": "image/jpeg",
+          "source": "affective_requested_capture"
+        }
+      }
+    },
+    { "op": "drain" }
+  ]
+}

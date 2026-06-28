@@ -6,12 +6,13 @@ const psyche_client = ports.psyche;
 
 pub const SharedInputs = struct {
     now: []const u8,
-    energy_remaining: u32,
-    daily_energy: u32,
-    day_key: []const u8,
+    control_capacity: f32,
+    max_capacity: f32,
+    social_engagement: f32,
+    consecutive_voluntary_speech: u32,
+    mode: []const u8,
     sleeping: bool,
     quiet_hours_active: bool,
-    speech_cooldown_active: bool,
     blocked: []const u8,
     affordances: []const u8,
     needs: []const needs_mod.Need,
@@ -27,8 +28,8 @@ pub fn formatSharedContext(allocator: std.mem.Allocator, inputs: SharedInputs) !
     var out = std.ArrayList(u8).empty;
     try out.print(
         allocator,
-        "Shared psyche state:\n- time: {s}\n- autonomy_budget_remaining: {d}/{d}\n- autonomy_budget_note: internal daily action budget, not battery charge or external power\n- day_key: {s}\n- sleeping: {any}\n- quiet_hours_active: {any}\n- speech_cooldown_active: {any}\n- autonomy_blocked: {s}\n- proactive_camera: forbidden\n- current_stimulus: {s}\n\nNeeds:\n",
-        .{ inputs.now, inputs.energy_remaining, inputs.daily_energy, inputs.day_key, inputs.sleeping, inputs.quiet_hours_active, inputs.speech_cooldown_active, inputs.blocked, if (inputs.current_stimulus.len > 0) inputs.current_stimulus else "none" },
+        "Shared psyche state:\n- time: {s}\n- autonomy_mode: {s}\n- control_capacity: {d:.2}/{d:.2}\n- social_engagement: {d:.2}\n- consecutive_voluntary_speech: {d}\n- sleeping: {any}\n- quiet_hours_active: {any}\n- autonomy_blocked: {s}\n- proactive_camera: forbidden\n- current_stimulus: {s}\n\nNeeds:\n",
+        .{ inputs.now, inputs.mode, inputs.control_capacity, inputs.max_capacity, inputs.social_engagement, inputs.consecutive_voluntary_speech, inputs.sleeping, inputs.quiet_hours_active, inputs.blocked, if (inputs.current_stimulus.len > 0) inputs.current_stimulus else "none" },
     );
     try appendTopNeeds(allocator, &out, inputs.needs, 5);
     try out.print(allocator, "\nRelationship graph:\n{s}", .{inputs.relationship_graph});
@@ -46,7 +47,7 @@ pub fn formatSharedContext(allocator: std.mem.Allocator, inputs: SharedInputs) !
 pub fn formatEgoContext(allocator: std.mem.Allocator, shared_context: []const u8, id: psyche_client.IdTurn, superego: psyche_client.SuperegoTurn) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
-        "Ego deliberation context:\nYou are the Ego of a stationary household robot. Reconcile the Id short-term consequence simulation, the Superego long-term consequence simulation, external reality, autonomy budget, and command availability. Both voices used the same shared state, but may assign different salience, causes, and meanings to the same stimulus. Choose exactly one allowed command. Superego advice is influential, but runtime gates still hard-block forbidden actions.\n\n{s}\n\n{s}\n{s}\nEgo task:\n- Compare the two simulations and notice priority conflicts, causal disagreements, and meaning disagreements.\n- Satisfy urgent needs only through available commands and current autonomy budget.\n- Treat autonomy budget as separate from battery charge and external power.\n- Prefer quiet self-work unless speech is genuinely high salience and allowed.\n- Return exactly one autonomy JSON command envelope.\n",
+        "Ego deliberation context:\n\n{s}\n\n{s}\n{s}\nEgo task:\n- Compare the Id and Superego simulations; note priority conflicts, causal disagreements, and meaning disagreements.\n- Apply system rules for capabilities, autonomy budget, and runtime gates.\n- Return autonomy JSON with an ordered action_pressures array (multi-step when needed).\n",
         .{ shared_context, try psyche_client.formatIdTurn(allocator, id), try psyche_client.formatSuperegoTurn(allocator, superego) },
     );
 }
@@ -54,7 +55,7 @@ pub fn formatEgoContext(allocator: std.mem.Allocator, shared_context: []const u8
 pub fn formatEgoContextWithoutPsyche(allocator: std.mem.Allocator, shared_context: []const u8) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
-        "Ego deliberation context:\nPsyche voices are disabled. Choose exactly one allowed command using the shared state, command availability, autonomy budget, and runtime gates.\n\n{s}\n",
+        "Ego deliberation context:\nPsyche voices are disabled.\n\n{s}\nEgo task:\n- Apply system rules using shared state, capabilities, and runtime gates.\n- Return autonomy JSON with an ordered action_pressures array.\n",
         .{shared_context},
     );
 }
@@ -187,12 +188,13 @@ test "shared context includes pertinent ranked data" {
     }};
     const text = try formatSharedContext(allocator, .{
         .now = "now",
-        .energy_remaining = 8,
-        .daily_energy = 10,
-        .day_key = "2026-06-23",
+        .control_capacity = 0.64,
+        .max_capacity = 0.85,
+        .social_engagement = 0.2,
+        .consecutive_voluntary_speech = 1,
+        .mode = "full",
         .sleeping = false,
         .quiet_hours_active = false,
-        .speech_cooldown_active = false,
         .blocked = "none",
         .affordances = "- think_about\n",
         .needs = &needs,
@@ -226,8 +228,7 @@ test "ego context reconciles different salience causes and meanings" {
         .reason = "long-term trust matters",
     };
     const text = try formatEgoContext(allocator, "Shared psyche state:\n- current_stimulus: new sound\n", id, superego);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Id short-term consequence simulation") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Superego long-term consequence simulation") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "different salience, causes, and meanings") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Compare the Id and Superego simulations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ordered action_pressures array") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "priority conflicts, causal disagreements, and meaning disagreements") != null);
 }

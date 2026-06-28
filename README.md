@@ -13,7 +13,7 @@ Host applications live in sibling projects that depend on this core module:
 
 ## Required deps
 
-- [Zig](https://ziglang.org/download/) 0.16.0 or compatible to build and test the project.
+- [Zig](https://ziglang.org/download/) 0.16.0 to build and test the project.
 - A POSIX shell for the fixture test scripts in `scripts/`.
 - Real local face recognition uses the repo-local `tools/affective-face-recognizer` command. The recognizer is an OpenCV DNN pipeline with OpenCV Zoo YuNet and SFace int8 ONNX models at `models/face_detection_yunet_2023mar_int8.onnx` and `models/face_recognition_sface_2021dec_int8.onnx`.
 - Descriptive identity recognition uses the random provider client for person descriptions and final identity comparison, plus the brain's local vector index for candidate filtering.
@@ -33,7 +33,7 @@ The Radxa Zero 3 host also needs:
 - [whisper.cpp](https://github.com/ggerganov/whisper.cpp) `whisper-cli` plus a model at `models/ggml-base.en.bin` when using `--transcription voice`.
 - An audio player such as `aplay` from [ALSA](https://www.alsa-project.org/wiki/Main_Page), or [mpg123](https://mpg123.de/) passed with `--speaker-command mpg123`.
 
-Random-provider AI modes require [curl](https://curl.se/download.html) and at least one configured provider key: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`/`GOOGLE_API_KEY`. Nano Banana image generation uses the Gemini API and requires `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `GOOGLE_AI_API_KEY`.
+Random-provider AI modes require [curl](https://curl.se/download.html) and at least one configured provider key: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, or `GEMINI_API_KEY`/`GOOGLE_API_KEY`. Nano Banana image generation uses the Gemini API and requires `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `GOOGLE_AI_API_KEY`.
 
 Email delivery uses `curl` with SMTP. Enable the chat `send_email` skill by copying `data/email.example.json` to `data/email.json` and filling in `smtp_url`, `from`, and, when the SMTP server requires auth, `username` and `password`. The real `data/email.json` file is local-only because it may contain credentials. Missing SMTP settings in that file, invalid addresses, empty bodies, and nonzero `curl` exits are hard errors.
 
@@ -62,18 +62,18 @@ cd ../AffectiveRadxa && zig build radxa
 
 ## Adding a skill
 
-Skills are declared in `src/api/skills.zig`. That registry is the canonical source of truth for a skill's public name, description, dependencies, autonomy policy, energy cost, and failure guidance. `src/api/chat_client.zig` re-exports the registry types so older call sites can keep using `ChatCommandType`, `Capability`, and `CapabilitySet`.
+Skills are declared in `src/api/skills.zig`. That registry is the canonical source of truth for a skill's public name, description, dependencies, autonomy policy, energy cost, and failure guidance. Language output is converted into action pressures before selected capabilities execute, so skills should describe capabilities and policy boundaries rather than UI tool calls.
 
 Checklist for a new skill:
 
 - Add one `SkillId` enum value and one matching `SkillSpec` registry entry. The `name` must exactly match the enum tag.
 - Use `requires_senses` for host/runtime resources the skill directly needs, such as camera, memory read/write, stored image, system senses, speech, reminder I/O, image generation, face picture updates, email delivery, or local process I/O.
 - Use `requires_skills` when a skill is conceptually built on another skill. Dependency resolution is recursive, so a missing dependency hides the dependent skill too.
-- Add the execution handler in `Brain.executeCommands` and tests for success, unavailable dependencies, and implementation failure.
+- Add the capability execution handler and tests for action pressure creation, selection or suppression, unavailable dependencies, and implementation failure.
 - Choose an `autonomy_policy`: `allowed` requires an `energy_cost`, `forbidden` is reserved for skills autonomy must never choose, and `invalid` keeps a skill out of autonomous planning.
 - Add an MCP mapping only when the skill should also be callable as an external MCP tool. MCP-only tools may stay separate, but shared descriptions should come from the skill registry when they map directly to brain skills.
 
-The brain only advertises skills that are callable in the current host/runtime state. If a stale or unavailable skill is requested anyway, the observation is `skill_failed: <skill>: unavailable: <reason>` with the registry failure hint when available. If a callable skill's implementation fails, the failure is logged as `skill_failed` and the Zig error still propagates; there are no fallback implementations.
+The brain only advertises skills that are callable in the current host/runtime state. If a stale or unavailable skill is requested anyway, the observation is `skill_failed: <skill>: unavailable: <reason>` with the registry failure hint when available. If a callable skill's implementation fails, the failure is logged as `skill_failed` and the Zig error still propagates; there are no alternate implementations.
 
 Press Enter to simulate a local activation. Type `quit` at the activation prompt to exit, or `forget me` when asked a name to exercise the terminal forget path.
 
@@ -81,7 +81,7 @@ On macOS, runtime brain state is brain-scoped outside the repo. A brain is a tra
 
 Webcam frames and dropped images start in scratch storage. The brain promotes a photo into the active brain only when it becomes important enough to keep, such as a retained sighting or the representative photo for a person.
 
-Use `--brain <name>` to run separate beings on the same machine. Brain names may contain letters, numbers, `_`, and `-`. `--profile <name>` is still accepted as a legacy alias for `--brain <name>`.
+Use `--brain <name>` to run separate beings on the same machine. Brain names may contain letters, numbers, `_`, and `-`.
 
 Brains can be exported and imported only as local frontend-managed brain files. A brain file is one zlib-compressed container holding the brain root's databases, logs, maintenance files, captures, generated assets, and brain-specific config. Host capabilities and credentials, such as email delivery settings, stay with the host adapter and are not part of a transferable brain. Safe inspection reports only manifest metadata: brain id, format version, compression, component paths, byte sizes, and totals. It does not dump memory contents or embedded settings.
 
@@ -157,21 +157,26 @@ The hardware brain is activated by a single GPIO button. A tap pokes the brain t
 
 The Radxa host exposes its GPIO, transcription, speech, and speaker flags from `../AffectiveRadxa`.
 
-Conversation-provider rotation lives in `data/llm_providers.json`. Set `"mode": "random"` and list equivalent-strength provider/model pairs there; each speech-turn LLM call samples one available provider from that list. Providers without a matching API key are skipped, so a partial local setup still runs.
+Conversation-provider rotation lives in `data/llm_providers.json`. Set `"mode": "random"` and list equivalent-strength provider/model pairs there; each LLM call samples one available provider from the roster after quality and effort-tier routing. Providers without a matching API key are skipped, so a partial local setup still runs.
+
+User-facing quality is controlled by `llm_quality`: `frugal` (basic models only, reasoning capped at `low`), `auto` (decide for me — the brain picks per-turn effort within the allowed envelope), or `best` (full tier access; the brain may still downshift on trivial turns). Override at launch with `--llm-quality frugal|auto|best`, or persist per brain in `runtime_options.json` / the macOS dashboard picker.
+
+Tag each roster entry with a model tier: `basic`, `standard`, or `complex`. Legacy flat rosters without `tier` treat every model as `basic`. Once any non-basic tier appears, all three tiers must be present or config load fails loudly.
 
 ```json
 {
   "mode": "random",
+  "llm_quality": "auto",
   "reasoning_effort": "auto",
   "models": [
-    { "provider": "openai", "model": "gpt-4.1-nano" },
-    { "provider": "anthropic", "model": "claude-haiku-4-5-20251001" },
-    { "provider": "google", "model": "gemini-3.1-flash-lite" }
+    { "provider": "openai", "model": "gpt-4.1-nano", "tier": "basic" },
+    { "provider": "anthropic", "model": "claude-haiku-4-5-20251001", "tier": "basic" },
+    { "provider": "google", "model": "gemini-3.1-flash-lite", "tier": "basic" }
   ]
 }
 ```
 
-The random mode reads `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
+The random mode reads `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, and `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
 
 Run the provider route health check when changing provider models, API keys, or endpoint code:
 
@@ -189,39 +194,40 @@ zig build api-e2e
 
 This exercises every configured random-provider conversation model with both text JSON and vision JSON requests, runs the route health check above, and performs a Gemini image generation call. It requires `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GEMINI_API_KEY` or `GOOGLE_API_KEY` for the configured providers, and it fails loudly on missing keys, rejected envelopes, malformed JSON, wrong forced-tool output, empty route responses, or missing generated image files.
 
-Talk-only LLM turns use a small command envelope so behavior can emerge from the brain's available skills instead of from a long list of behavioral instructions. The brain is treated as a situated being with senses, memory, uncertainty, and continuity; the standing prompt only includes the bootstrap commands needed to speak or request introspection. When the brain chooses `introspect`, the runtime generates the current skill catalog from the command enum and returns it as an observation.
+Talk-only LLM turns use a compact language-action envelope that the runtime converts into `ActionPressure` records before any capability executes. The brain is treated as a situated being with senses, memory, uncertainty, and continuity; the prompt receives compact read-model context and the currently callable capability descriptions. LanguageMind proposes action pressures and language content, while action selection and capability execution remain runtime responsibilities.
 
-Hosts can send dropped uploads as uploaded media observations. PNG, JPEG, and WebP files use the configured visual description service and become the latest stored visual observation. Audio uploads are classified before they are treated as speech when the host provides an audio inspection service; there is no fallback music, ambient audio, animation, or video analyzer.
+Hosts can send dropped uploads as uploaded media observations. PNG, JPEG, and WebP files use the configured visual description service and become the latest stored visual observation. Audio uploads are classified before they are treated as speech when the host provides an audio inspection service; music, ambient audio, animation, and video analyzer routes are unavailable unless the host explicitly provides them.
 
 The brain can also choose `imagine_image` when it wants to create a new imagined image. That command sends the command `text` as a Nano Banana prompt through Gemini's `generateContent` API, using `--image-generation-model` (default `gemini-3.1-flash-image`) and writing the result under `--image-generation-output-dir` (default `generated/images` inside the active brain root). Missing API keys, empty prompts, curl failures, and unexpected image responses are returned as hard errors.
 
-With reasoning-capable OpenAI conversation models, the brain can also choose how much reasoning effort to spend on the next model call. Set an initial value with `reasoning_effort` in `data/llm_providers.json`, or with `--conversation-reasoning-effort low|medium|high`; leave it as `auto` to omit the API knob until the model requests one. The chat envelope's top-level `reasoning_effort` is carried forward for later calls in the same conversation loop and subsequent turns. The runtime only sends `reasoning_effort` for models that look reasoning-capable, such as `o*` and `gpt-5*`, so existing `gpt-4.1-nano` setups keep their current API shape.
+With reasoning-capable OpenAI conversation models, the brain chooses how much reasoning effort to spend on the next model call via `reasoning_effort` in the chat envelope, and which model tier to use via `effort_tier` (`basic`, `standard`, or `complex`). Set an initial reasoning default with `reasoning_effort` in `data/llm_providers.json`, or with `--conversation-reasoning-effort low|medium|high`; leave it as `auto` to omit the API knob until the model requests one. Both fields are carried forward across turns in the same conversation loop. Under `llm_quality=frugal`, the runtime clamps `effort_tier` to `basic` and caps `reasoning_effort` at `low`. The runtime only sends `reasoning_effort` for models that look reasoning-capable, such as `o*` and `gpt-5*`, so existing `gpt-4.1-nano` setups keep their current API shape.
 
 The envelope shape is:
 
 ```json
 {
   "commands": [
-    { "command": "say", "text": "I can do that." },
-    { "command": "introspect" }
+    { "command": "think_about", "query": "what matters in this request?" },
+    { "command": "say", "text": "I can do that." }
   ],
   "user_summary": "Tiny summary of what the user said.",
   "brain_summary": "Tiny summary of what the brain did or said.",
-  "reasoning_effort": "medium"
+  "reasoning_effort": "medium",
+  "effort_tier": "standard"
 }
 ```
 
-If the model chooses an observation command such as `introspect`, `recognize`, `take_picture`, `describe_image`, `compare_images`, `get_time`, `get_power`, `get_storage`, `get_database_stats`, or `think_about`, the brain executes it, sends the observation back to the model, and waits for the next natural command. `recognize` is the brain's identity-recognition skill for seeing who it is talking to; it captures a fresh image and returns current speaker recognition status as an observation. `describe_image` captures a fresh image and returns a written description. `compare_images` compares the latest stored visual observation with a fresh capture; if there is no previous image, it returns a hard error. `get_time` returns the current date/time only. `get_power` reads platform power status, including battery percentage and whether external power is plugged in. `get_storage` reports mounted filesystem fullness. `get_database_stats` reports SQLite page, freelist, size, and table counts for the memory databases. `think_about` accepts `query` or `text` plus optional tags; it recalls relevant memory, appraises the topic, may use model judgment for hard-to-quantify questions, and saves a short-term reflection before the next model pass. `ask_human` is reserved for asking the nearby human for help, clarification, or permission.
+If the model proposes an observation capability such as `recognize`, `take_picture`, `describe_image`, `compare_images`, `get_time`, `get_power`, `get_storage`, `get_database_stats`, or `think_about`, action selection first records whether the pressure was selected or suppressed. Selected capabilities execute, emit capability lifecycle events, send observations back to the model, and wait for the next natural action. `recognize` is the brain's identity-recognition skill for seeing who it is talking to; it captures a fresh image and returns current speaker recognition status as an observation. `describe_image` captures a fresh image and returns a written description. `compare_images` compares the latest stored visual observation with a fresh capture; if there is no previous image, it returns a hard error. `get_time` returns the current date/time only. `get_power` reads platform power status, including battery percentage and whether external power is plugged in. `get_storage` reports mounted filesystem fullness. `get_database_stats` reports SQLite page, freelist, size, and table counts for the memory databases. `think_about` accepts `query` or `text` plus optional tags; it recalls relevant memory, appraises the topic, may use model judgment for hard-to-quantify questions, and saves a short-term reflection before the next model pass. Use `say` when the brain needs human help, clarification, or permission.
 
 `update_face_picture` updates an existing face profile's command-recognizer reference image. It accepts `person_id` or unique `name`, optional `image_path`, and optional `keep_existing`. If `image_path` is omitted, the brain uses the latest uploaded or observed image. The command delegates to `tools/affective-face-recognizer enroll`, so missing files, duplicate names, no face, multiple faces, and invalid embeddings fail loudly.
 
-General memories are separate from face profiles. They are taggable and start as short-term reconstructive records with score `1`, confidence, valence, salience, original text, current interpretation, and revision history. Recalling a memory increments its access count, raises score by `2`, records a small reconstruction revision, and may promote a short-term memory to long-term after three accesses or score `5`. A `sweep_memory` command decays each short-term memory score by `1` and removes short-term memories whose score reaches `0`. The brain can define durable self-needs and self-wants with `define_need` and `define_want`; seed markdown can also define startup self-wants under `## Wants` and Superego constraints under `## Superego Principles`. Introspection lists their memory ids under `self_needs_and_wants`, and `edit_need` / `edit_want` revise a matching stored self-definition by `memory_id`.
+General memories are separate from face profiles. They are taggable and start as short-term reconstructive records with score `1`, confidence, valence, salience, original text, current interpretation, and revision history. Recalling a memory increments its access count, raises score by `2`, records a small reconstruction revision, and may promote a short-term memory to long-term after three accesses or score `5`. A `sweep_memory` command decays each short-term memory score by `1` and removes short-term memories whose score reaches `0`. The brain can define durable self-needs and self-wants with `define_need` and `define_want`; seed markdown can also define startup self-wants under `## Wants` and Superego constraints under `## Superego Principles`. `edit_need` and `edit_want` revise a matching stored self-definition by `memory_id`.
 
-Long-term memory is retrieved on demand rather than inserted wholesale into every prompt. The first-pass conversation context is a working-state index, not a full memory dump: self facts, relationship graph summary, active needs, memory counts, up to 32 available tags, and up to 8 recent conversation summaries. The model should call `recall_memory` with a task-specific `query`, `tags`, or both, and only the matching memory records are returned as observations. This keeps stale or off-topic memories from crowding the context window; oversized rendered chat prompts fail loudly with `ContextBudgetExceeded` instead of being silently truncated or compacted. Use the MCP `chat_dry_run_prompt` tool to inspect the exact system and user prompt that would be sent without mutating memory. Memory records include a persisted local vector, so recall ranks by cosine similarity plus small lexical, tag, salience, and durability boosts. Older memories without vectors are indexed lazily the next time they are saved or recalled.
+Long-term memory is retrieved on demand rather than inserted wholesale into every prompt. The first-pass conversation context is a working-state index, not a full memory dump: self facts, relationship graph summary, active needs, memory counts, up to 32 available tags, and up to 8 recent conversation summaries. The model should call `think_about` with a task-specific `query`, `tags`, or both when it needs memory-grounded reflection; only matching memory records are returned as observations inside that typed capability loop. This keeps stale or off-topic memories from crowding the context window; oversized rendered chat prompts fail loudly with `ContextBudgetExceeded` instead of being silently truncated. Use the MCP `chat_dry_run_prompt` tool to inspect the exact system and user prompt that would be sent without mutating memory. Memory records include a persisted local vector, so recall ranks by cosine similarity plus small lexical, tag, salience, and durability boosts. Older memories without vectors are indexed lazily the next time they are saved or recalled.
 
 The inner-life system also persists raw impressions, structured appraisals, and dream records. Appraisals track valence, arousal, confidence, uncertainty, social warmth, curiosity, stress, feeling label, action tendency, expression style, dynamics, and a freeform "how this lands" note, including ambivalence. The emotion model follows a component view: appraisal, bodily arousal, action tendency, expression, subjective feeling, and update dynamics are represented separately. Dreams always roll a random heat value from `0.0` to `1.0`; optional `heat_bias` only nudges the range toward grounded or surreal. Low heat dreams are grounded replay, medium heat dreams are associative synthesis, and high heat dreams are more surreal, lower-confidence, and provisional.
 
-Autonomy uses an Id/Ego/Superego deliberation layer when `--psyche on` is active, which is the default for autonomy. The Id and Superego run as two separate cheap-model calls over the same compact state: ranked needs, recent impressions/appraisals, salient memories, energy, quiet-hour status, autonomy skills, and seeded Superego principles. They drink from the same firehose, but may assign different salience, causes, and meanings to the same stimulus. Id acts as the short-term planning and consequence simulator, prioritizing near-term needs, urges, friction, opportunities, risks, curiosity, discomfort, and associative thoughts. Superego acts as the long-term planning and consequence simulator, prioritizing values, restraint, identity continuity, promises, user dignity, memory honesty, quiet hours, power, safety boundaries, and uncertainty about how conditions may change. Seeded `Superego Principles` remain compatible as long-term and big-goal inputs rather than brittle commands. The existing autonomy planner is the Ego: it receives both voices, compares their interpretations and priorities, and chooses exactly one command. Runtime gates still hard-block forbidden actions such as proactive camera capture.
+Autonomy uses an Id/Ego/Superego deliberation layer when `--psyche on` is active, which is the default for autonomy. The Id and Superego run as two separate cheap-model calls over the same compact state: ranked needs, recent impressions/appraisals, salient memories, energy, quiet-hour status, autonomy skills, and seeded Superego principles. They drink from the same firehose, but may assign different salience, causes, and meanings to the same stimulus. Id acts as the short-term planning and consequence simulator, prioritizing near-term needs, urges, friction, opportunities, risks, curiosity, discomfort, and associative thoughts. Superego acts as the long-term planning and consequence simulator, prioritizing values, restraint, identity continuity, promises, user dignity, memory honesty, quiet hours, power, safety boundaries, and uncertainty about how conditions may change. Seeded `Superego Principles` remain usable as long-term and big-goal inputs rather than brittle commands. The existing autonomy planner is the Ego: it receives both voices, compares their interpretations and priorities, and chooses exactly one command. Runtime gates still hard-block forbidden actions such as proactive camera capture.
 
 Configure the psyche models independently with `--psyche-models openai:gpt-4.1-nano,anthropic:claude-haiku-4-5-20251001,google:gemini-3.1-flash-lite --psyche-reasoning-effort low` on the host runtime.
 
@@ -232,14 +238,14 @@ Maintenance and reminders live in a simple Markdown file under the active brain 
 ```md
 - every 6 hours run sweep_memory
 - every day at 03:00 run consolidate_memory
-- every day at 03:15 run dream
+- every day at 03:15 run request_dream_time
 - every day at 09:00 run say:Check the plants.
 - at unix 1782255000 run say:Check the tea.
 ```
 
-The brain can add reminders itself with `set_reminder`; this appends a `say:` task to the maintenance schedule. For wait timers, use relative schedules such as `in 10 seconds`, `in 5 minutes`, `after 2 hours`, or `in 1 day`; these are stored as one-shot `at unix ...` tasks. Due tasks are tracked in `data/maintenance_state.json` so recurring tasks run once per scheduled window and one-shot timers run once.
+The brain can add reminders itself with `schedule_reminder`; this appends a `say:` task to the maintenance schedule. For wait timers, use relative schedules such as `in 10 seconds`, `in 5 minutes`, `after 2 hours`, or `in 1 day`; these are stored as one-shot `at unix ...` tasks. Due tasks are tracked in `data/maintenance_state.json` so recurring tasks run once per scheduled window and one-shot timers run once.
 
-`introspect` returns a compact observation about the brain's available senses, skills, memory counts, scores, access totals, recent appraisals, impressions, and dream/consolidation activity. `dream` loosely connects stored memories with recent conversation summaries; if the model includes `text`, the brain stores that text as a short-term provisional dream/reflection memory.
+`read_models_snapshot` returns compact derived state about brain mode, focus, needs, beliefs, self-trust, dispositions, visual state, autonomy budget, and host capability status. `request_dream_time` enters Dream Time, runs maintenance and reconciliation, writes the canonical dream record, and delivers Brain-owned mailbox content.
 
 ## MCP server
 
@@ -286,32 +292,21 @@ Example MCP client configuration:
 }
 ```
 
-Exposed MCP tools:
+Exposed MCP operations:
 
-- `brain_inspect`
-- `chat_dry_run_prompt`
-- `memory_index`
-- `recall_memory`
-- `remember_memory`
-- `forget_memory`
-- `sweep_memory`
-- `introspect`
-- `inner_state`
-- `appraise_event`
-- `feel_about`
-- `choose_attention`
-- `ask_human`
-- `consolidate_memory`
-- `dream`
-- `set_reminder`
-- `list_reminders`
-- `update_face_picture`
-- `graph_type_create`
-- `graph_node_create`
-- `graph_edge_upsert`
-- `graph_entity_context`
-- `graph_summary`
-- `graph_edge_forget`
+- `connect`
+- `host_attach`
+- `host_capability_manifest`
+- `send_experience_event`
+- `user_text`
+- `request_dream_time`
+- `brain_mode`
+- `read_models_snapshot`
+- `mailbox_list`
+- `mailbox_mark_read`
+- `capability_status`
+- `export_brain`
+- `import_brain`
 
 ## Recognition
 

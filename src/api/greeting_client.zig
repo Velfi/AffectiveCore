@@ -1,11 +1,12 @@
 const std = @import("std");
 const ai = @import("random_provider_client.zig");
 const greeting_port = @import("../core/port_greeting.zig");
+const context_composition = @import("../core/context_composition.zig");
+const llm_tester_scenario = @import("../harness/llm_tester/scenario.zig");
 
 pub const GreetingIntent = greeting_port.GreetingIntent;
 pub const GreetingContext = greeting_port.GreetingContext;
 pub const GreetingService = greeting_port.GreetingService;
-pub const TestGreetingService = greeting_port.TestGreetingService;
 
 pub const RandomProviderGreetingService = struct {
     client: *ai.RandomProviderClient,
@@ -20,20 +21,23 @@ pub const RandomProviderGreetingService = struct {
 
     fn generate(ctx: *anyopaque, allocator: std.mem.Allocator, context: GreetingContext) ![]const u8 {
         const self: *RandomProviderGreetingService = @ptrCast(@alignCast(ctx));
+        context_composition.traceReportToDebug(0, context_composition.auditGreetingContext(context));
         const system_prompt =
             \\Choose one spoken greeting or confirmation from the provided context.
             \\Follow greeting_intent exactly.
             \\Use the person's name only when an actual person_name is provided.
             \\Ground the sentence in the supplied memories, needs, appraisals, senses, and recognition context.
-            \\Keep it to one sentence, under 160 characters.
+            \\Keep it to one sentence, under 240 characters.
             \\Return only JSON with key: text.
+            \\Return only JSON. Do not wrap in Markdown or code fences.
+            \\Return only valid JSON. No markdown, code fences, or prose outside the object.
         ;
         const user_prompt = try formatGreetingPrompt(allocator, context);
         const content = try self.client.completeText(allocator, .{
             .subsystem = "greeting",
             .system_prompt = system_prompt,
             .user_prompt = user_prompt,
-            .temperature = 0.6,
+            .temperature = 0.3,
             .response_format = .json_object,
             .response_size = .small,
             .json_schema = greetingJsonSchema(),
@@ -80,6 +84,47 @@ fn parseGreeting(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
 fn validateGreeting(allocator: std.mem.Allocator, content: []const u8) !void {
     const text = try parseGreeting(allocator, content);
     allocator.free(text);
+}
+
+pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.Scenario {
+    const context = GreetingContext{
+        .intent = .known_person,
+        .person_name = "Zelda",
+        .elapsed_days = 3,
+        .visual_description = "dark hoodie, glasses, carrying a notebook",
+        .change_summary = "new haircut since last visit",
+        .senses = "- host_sense: door_open=true\n- host_sense: ambient_light=moderate",
+        .interior_state = "curious, socially open, low urgency",
+        .stable_notes = &.{"enjoys tea", "works from home"},
+        .recent_notes = &.{"mentioned a busy week"},
+    };
+    const system_prompt =
+        \\Choose one spoken greeting or confirmation from the provided context.
+        \\Follow greeting_intent exactly.
+        \\Use the person's name only when an actual person_name is provided.
+        \\Ground the sentence in the supplied memories, needs, appraisals, senses, and recognition context.
+        \\Keep it to one sentence, under 240 characters.
+        \\Return only JSON with key: text.
+        \\Return only JSON. Do not wrap in Markdown or code fences.
+        \\Return only valid JSON. No markdown, code fences, or prose outside the object.
+    ;
+    const user_prompt = try formatGreetingPrompt(allocator, context);
+    const scenario = try llm_tester_scenario.Scenario.init(
+        allocator,
+        "greeting_known_person",
+        "Welcome-back greeting for a recognized person",
+        "Verifies the model chooses an appropriate welcome-back greeting JSON for a recognized person, using their name, elapsed time, and noted appearance changes.",
+        "greeting",
+        system_prompt,
+        user_prompt,
+        .json_object,
+        greetingJsonSchema(),
+        256,
+        0.3,
+    );
+    const out = try allocator.alloc(llm_tester_scenario.Scenario, 1);
+    out[0] = scenario;
+    return out;
 }
 
 fn greetingJsonSchema() []const u8 {

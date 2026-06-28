@@ -27,7 +27,7 @@ const camera_mod = ports.camera;
 const speaker_mod = ports.speaker;
 const input_mod = ports.input;
 const button_mod = ports.button;
-const command_log_mod = ports.command_log;
+const event_log_mod = ports.event_log;
 const facial_expression = ports.facial_expression;
 const system_senses_mod = ports.system_senses;
 const time_mod = @import("time.zig");
@@ -40,10 +40,15 @@ const vector_index = @import("vector_index.zig");
 const emotion = @import("emotion.zig");
 const process = ports.process;
 const helpers = @import("brain_helpers.zig");
+const experience_pipeline = @import("experience_pipeline.zig");
+const experience_kinds = @import("experience_kinds.zig");
+const experiential_observations = @import("experiential_observations.zig");
+const context_composition = @import("context_composition.zig");
+const memory_selection_mod = @import("memory_selection.zig");
 
 const Brain = brain_mod.Brain;
 const BrainDeps = brain_mod.BrainDeps;
-const CommandBatchResult = brain_mod.CommandBatchResult;
+const ActionPressureBatchResult = brain_mod.ActionPressureBatchResult;
 const ConversationTurnResult = brain_mod.ConversationTurnResult;
 const ConversationSpeakerContext = brain_mod.Brain.ConversationSpeakerContext;
 const QuietHours = brain_mod.Brain.QuietHours;
@@ -55,108 +60,6 @@ const speech_artifact_ttl_seconds = brain_mod.speech_artifact_ttl_seconds;
 const speech_artifact_prefix = brain_mod.speech_artifact_prefix;
 const speech_audio_suffix = brain_mod.speech_audio_suffix;
 const speech_transcription_json_suffix = brain_mod.speech_transcription_json_suffix;
-pub fn dream(self: *Brain, optional_text: ?[]const u8, tags: []const []const u8, heat_bias: ?[]const u8) ![]const u8 {
-    _ = try self.deps.store.sweepUnreferencedCaptures();
-    _ = try self.consolidateMemory();
-    const memories = try self.deps.store.loadMemoryRecords(self.allocator);
-    const summaries = try self.deps.store.loadConversationSummaries(self.allocator);
-    const pending_flexible_identity = try helpers.pendingFlexibleIdentityMemories(self.allocator, memories);
-    const now = try self.timestampNow();
-    var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(@max(self.now_seconds, 0))) ^ @as(u64, memories.len * 97 + summaries.len * 13));
-    const heat = helpers.rollDreamHeat(prng.random(), heat_bias);
-    const confidence = helpers.dreamConfidence(heat);
-    const first_index: usize = if (memories.len > 0) prng.random().intRangeLessThan(usize, 0, memories.len) else 0;
-    const first = if (memories.len > 0) helpers.memoryInterpretation(memories[first_index]) else "no stored memory yet";
-    const second = if (summaries.len > 0) summaries[@intCast(@mod(self.now_seconds + 1, @as(i64, @intCast(summaries.len))))].user_summary else "no recent conversation summary yet";
-    const style = helpers.dreamStyle(heat);
-    const flexible_text = try helpers.flexibleIdentityDreamText(self.allocator, pending_flexible_identity);
-    const connection_text = if (flexible_text.len > 0)
-        try std.fmt.allocPrint(self.allocator, "{s} <-> {s} <-> flexible_identity: {s}", .{ first, second, flexible_text })
-    else
-        try std.fmt.allocPrint(self.allocator, "{s} <-> {s}", .{ first, second });
-    const dream_seed: ?[]const u8 = if (flexible_text.len > 0)
-        try std.fmt.allocPrint(self.allocator, "{s}\nFlexible self-model material to reconcile through dreams: {s}", .{ optional_text orelse "", flexible_text })
-    else
-        optional_text;
-    const dream_prompt = try Brain.dreamImagePrompt(self.allocator, style, connection_text, dream_seed);
-    const dream_image = try self.deps.image_generation_service.generate(self.allocator, dream_prompt);
-    const source_ids = try helpers.dreamSourceIds(self.allocator, if (memories.len > 0) memories[first_index].memory_id else null, pending_flexible_identity);
-    var saved_memory_id: ?[]const u8 = null;
-
-    if (optional_text) |text| {
-        if (text.len > 0) {
-            const dream_tags = if (tags.len > 0) tags else &[_][]const u8{ "dream", "reflection" };
-            var memory = try createMemoryRecord(self, text, dream_tags);
-            memory.score = 2;
-            memory.confidence = confidence;
-            memory.salience = 0.25 + heat * 0.25;
-            memory.interpretation = try std.fmt.allocPrint(self.allocator, "provisional dream: {s}", .{text});
-            try self.deps.store.saveMemoryRecord(memory);
-            saved_memory_id = memory.memory_id;
-            try self.recordRuntimeEvent(.{
-                .kind = .memory_mutation,
-                .source = "brain",
-                .title = "dream_memory",
-                .body = memory.interpretation,
-                .subject = "dream_memory",
-                .raw = text,
-                .interpretation = memory.interpretation,
-                .experience_source = .brain,
-                .experience_kind = .dream,
-                .experience_retention = .keep_episode,
-                .derived_memory_ids = @constCast(&[_][]const u8{memory.memory_id}),
-                .created_memory_id = memory.memory_id,
-                .tags = memory.tags,
-            });
-        }
-    }
-    const dream_id = try std.fmt.allocPrint(self.allocator, "dream_{d}_{d}", .{ self.now_seconds, memories.len + summaries.len });
-    const artifact_id = try std.fmt.allocPrint(self.allocator, "artifact_{s}", .{dream_id});
-    try self.deps.store.addArtifact(.{
-        .artifact_id = artifact_id,
-        .kind = .image,
-        .path = dream_image.path,
-        .mime_type = dream_image.mime_type,
-        .provenance = "dream",
-        .retention = .episode,
-        .linked_trace_ids = source_ids,
-        .lifecycle = .{
-            .status = .active,
-            .created_at = now,
-            .updated_at = now,
-        },
-    });
-    try self.deps.store.addDream(.{
-        .dream_id = dream_id,
-        .selected_trace_ids = source_ids,
-        .belief_change_ids = &.{},
-        .generated_artifact_id = artifact_id,
-        .reflection = connection_text,
-        .heat = heat,
-        .created_at = now,
-    });
-    if (pending_flexible_identity.len > 0) {
-        const reconciliation = try saveFlexibleIdentityReconciliation(self, connection_text, source_ids, confidence);
-        saved_memory_id = reconciliation;
-        for (pending_flexible_identity) |memory| {
-            _ = try self.deps.store.forgetMemoryRecord(memory.memory_id);
-        }
-    }
-    const saved = if (saved_memory_id) |id| id else "none";
-    try self.recordMemoryCandidateEvent(.autonomy, "brain", "dream_image", dream_image.path, .brain, .dream, .keep_episode, "dream_image", dream_prompt, dream_image.path, &.{}, &[_][]const u8{ "dream", "image" });
-    return std.fmt.allocPrint(self.allocator, "dream:\n- heat: {d:.3}\n- style: {s}\n- confidence: {d:.3}\n- connection: {s}\n- source_ids: {s}\n- memory_saved: {s}\n- image_prompt: {s}\n- image_path: {s}\n- image_mime_type: {s}\n", .{
-        heat,
-        style,
-        confidence,
-        connection_text,
-        try helpers.joinTags(self.allocator, source_ids),
-        saved,
-        dream_prompt,
-        dream_image.path,
-        dream_image.mime_type,
-    });
-}
-
 pub fn dreamImagePrompt(allocator: std.mem.Allocator, style: []const u8, connection: []const u8, optional_text: ?[]const u8) ![]const u8 {
     const seed = if (optional_text) |text| std.mem.trim(u8, text, " \r\n\t") else "";
     if (seed.len > 0) {
@@ -189,7 +92,7 @@ pub fn saveFlexibleIdentityReconciliation(self: *Brain, connection_text: []const
     memory.valence = 0.45;
     memory.interpretation = try std.fmt.allocPrint(self.allocator, "reconciled flexible self-model material: {s}", .{connection_text});
     try self.deps.store.saveMemoryRecord(memory);
-    try self.recordRuntimeEvent(.{
+    try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "brain",
         .title = "flexible_identity_reconciliation",
@@ -214,51 +117,90 @@ pub fn imagineImage(self: *Brain, prompt: []const u8) ![]const u8 {
     return std.fmt.allocPrint(self.allocator, "imagined_image:\n- prompt: {s}\n- path: {s}\n- mime_type: {s}\n", .{ trimmed, image.path, image.mime_type });
 }
 
-pub fn runMaintenanceCommand(self: *Brain, command: []const u8) !bool {
-    try self.logMaintenanceCommandSent(command);
-    if (std.mem.eql(u8, command, "sweep_memory")) {
-        _ = try self.sweepShortTermMemories();
-        const removed = try self.deps.store.sweepExpiredExperiences(self.now_seconds);
-        const runtime_events_removed = try self.deps.store.sweepRuntimeEvents();
-        const speech_removed = try self.sweepSpeechArtifacts();
-        const result = try std.fmt.allocPrint(
-            self.allocator,
-            "swept short-term memories; expired_experiences_removed={d}; runtime_events_removed={d}; speech_artifacts_removed={d} audio={d} transcription_json={d}",
-            .{ removed, runtime_events_removed, speech_removed.total(), speech_removed.audio_removed, speech_removed.transcription_json_removed },
-        );
-        try self.logMaintenanceCommandResult(command, result);
-        return true;
+const MaintenanceCapabilityKind = enum {
+    sweep_memory,
+    consolidate_memory,
+    request_dream_time,
+    end_conversation,
+    speech,
+};
+
+const MaintenanceCapability = struct {
+    kind: MaintenanceCapabilityKind,
+    spec: []const u8,
+    text: ?[]const u8 = null,
+};
+
+fn parseMaintenanceCapability(spec: []const u8) !MaintenanceCapability {
+    const trimmed = std.mem.trim(u8, spec, " \r\n\t");
+    if (std.mem.eql(u8, trimmed, "sweep_memory")) return .{ .kind = .sweep_memory, .spec = trimmed };
+    if (std.mem.eql(u8, trimmed, "consolidate_memory")) return .{ .kind = .consolidate_memory, .spec = trimmed };
+    if (std.mem.eql(u8, trimmed, "request_dream_time")) return .{ .kind = .request_dream_time, .spec = trimmed };
+    if (std.mem.startsWith(u8, trimmed, "request_dream_time:")) {
+        return .{
+            .kind = .request_dream_time,
+            .spec = trimmed,
+            .text = std.mem.trim(u8, trimmed["request_dream_time:".len..], " \t"),
+        };
     }
-    if (std.mem.eql(u8, command, "consolidate_memory")) {
-        _ = try self.consolidateMemory();
-        try self.logMaintenanceCommandResult(command, "consolidated memory");
-        return true;
+    if (std.mem.eql(u8, trimmed, "end_conversation")) return .{ .kind = .end_conversation, .spec = trimmed };
+    if (std.mem.startsWith(u8, trimmed, "say:")) {
+        return .{
+            .kind = .speech,
+            .spec = trimmed,
+            .text = std.mem.trim(u8, trimmed["say:".len..], " \t"),
+        };
     }
-    if (std.mem.eql(u8, command, "dream")) {
-        _ = try dream(self, null, &[_][]const u8{}, null);
-        try self.logMaintenanceCommandResult(command, "dream recorded");
-        return true;
-    }
-    if (std.mem.eql(u8, command, "end_conversation")) {
-        self.conversation_speaker_context = null;
-        self.last_conversation_turn_seconds = null;
-        try self.logMaintenanceCommandResult(command, "conversation context cleared");
-        return true;
-    }
-    if (std.mem.startsWith(u8, command, "say:")) {
-        const text = std.mem.trim(u8, command["say:".len..], " \t");
-        self.outputFmt("\nBRAIN REMINDER:\n{s}\n", .{text});
-        try self.say(text);
-        try self.logMaintenanceCommandResult(command, text);
-        return true;
-    }
-    self.outputFmt("Unknown maintenance command: {s}\n", .{command});
-    try self.logMaintenanceCommandResult(command, "unknown maintenance command");
-    return false;
+    return error.UnknownMaintenanceCapability;
 }
 
-pub fn buildConversationMemory(self: *Brain) ![]const u8 {
-    return buildConversationMemoryWithSpeaker(self, null);
+pub fn maintenanceSpeechText(spec: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, spec, " \r\n\t");
+    if (!std.mem.startsWith(u8, trimmed, "say:")) return null;
+    const text = std.mem.trim(u8, trimmed["say:".len..], " \t");
+    if (text.len == 0) return null;
+    return text;
+}
+
+pub fn runMaintenanceCapability(self: *Brain, capability_spec: []const u8) !void {
+    const capability = try parseMaintenanceCapability(capability_spec);
+    try self.logMaintenanceCapabilityRequested(capability.spec);
+    switch (capability.kind) {
+        .sweep_memory => {
+            _ = try self.sweepShortTermMemories();
+            const removed = try self.deps.store.sweepExpiredExperiences(self.now_seconds);
+            const speech_removed = try self.sweepSpeechArtifacts();
+            const now = try self.timestampNow();
+            const cognitive_prune = try self.deps.store.pruneTombstonedCognitiveRecords(now);
+            const captures_purged = try self.deps.store.sweepUnreferencedCaptures();
+            const result = try std.fmt.allocPrint(
+                self.allocator,
+                "swept short-term memories; expired_experiences_removed={d}; speech_artifacts_removed={d} audio={d} transcription_json={d}; cognitive_tombstoned={d}; cognitive_purged={d}; captures_purged={d}",
+                .{ removed, speech_removed.total(), speech_removed.audio_removed, speech_removed.transcription_json_removed, cognitive_prune.tombstoned, cognitive_prune.purged, captures_purged },
+            );
+            try self.logMaintenanceCapabilityResult(capability.spec, result);
+        },
+        .consolidate_memory => {
+            _ = try self.consolidateMemory();
+            try self.logMaintenanceCapabilityResult(capability.spec, "consolidated memory");
+        },
+        .request_dream_time => {
+            const item = try self.requestDreamTime(capability.text);
+            const result = try std.fmt.allocPrint(self.allocator, "dream_time_delivered:{s}", .{item.mailbox_id});
+            try self.logMaintenanceCapabilityResult(capability.spec, result);
+        },
+        .end_conversation => {
+            self.conversation_speaker_context = null;
+            self.last_conversation_turn_seconds = null;
+            try self.logMaintenanceCapabilityResult(capability.spec, "conversation context cleared");
+        },
+        .speech => {
+            const text = capability.text orelse return error.EmptyMaintenanceSpeech;
+            self.outputFmt("\nBRAIN REMINDER:\n{s}\n", .{text});
+            try self.say(text);
+            try self.logMaintenanceCapabilityResult(capability.spec, text);
+        },
+    }
 }
 
 /// Lead the context with the bot's working memory. When focused (high attention
@@ -279,19 +221,56 @@ fn appendFocusBlock(self: *Brain, out: *std.ArrayList(u8)) !void {
     try out.appendSlice(self.allocator, "focus: unfocused — open to whatever comes; no strong focus right now.\n");
 }
 
-pub fn buildConversationMemoryWithSpeaker(self: *Brain, speaker_context: ?[]const u8) ![]const u8 {
+pub fn buildConversationMemory(self: *Brain) ![]const u8 {
+    return buildConversationMemoryWithSpeaker(self, null, null, null);
+}
+
+pub fn buildConversationMemoryWithSpeaker(
+    self: *Brain,
+    speaker_context: ?[]const u8,
+    sections_out: ?*std.ArrayList(context_composition.SectionStat),
+    selection: ?memory_selection_mod.ResolvedMemorySelection,
+) ![]const u8 {
     const summaries = try self.deps.store.loadConversationSummaries(self.allocator);
     var out = std.ArrayList(u8).empty;
+    var before: usize = 0;
+
+    before = out.items.len;
     try appendFocusBlock(self, &out);
+    try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "focus", null);
+
     if (speaker_context) |context| {
+        before = out.items.len;
         try out.appendSlice(self.allocator, context);
+        try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "speaker", null);
     }
-    try out.appendSlice(self.allocator, try self.selfFactsSummary());
+
+    before = out.items.len;
+    try out.appendSlice(self.allocator, try self.selfFactsConversationSummary());
+    try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "self_facts", null);
+
+    before = out.items.len;
     try out.appendSlice(self.allocator, try self.deps.graph.summary(self.allocator, 8));
+    try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "relationship_graph", null);
+
+    before = out.items.len;
     try out.appendSlice(self.allocator, try self.activeNeedsSummary());
-    var prng = std.Random.DefaultPrng.init(helpers.contextShuffleSeed(self.now_seconds, summaries.len));
+    try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "needs", null);
+
+    before = out.items.len;
+    try experiential_observations.appendDayArcToMemory(self, &out);
+    try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "day_arc", null);
+
+    if (selection) |resolved| {
+        before = out.items.len;
+        try memory_selection_mod.appendMemorySelectionToMemory(self.allocator, &out, resolved);
+        try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "relevant_memories", resolved.entries.len);
+    }
+
     const memories = try self.deps.store.loadMemoryRecords(self.allocator);
+    var prng = std.Random.DefaultPrng.init(helpers.contextShuffleSeed(self.now_seconds, summaries.len));
     if (memories.len > 0) {
+        before = out.items.len;
         var long_count: usize = 0;
         var short_count: usize = 0;
         for (memories) |memory| {
@@ -300,7 +279,7 @@ pub fn buildConversationMemoryWithSpeaker(self: *Brain, speaker_context: ?[]cons
                 .short_term => short_count += 1,
             }
         }
-        try out.print(self.allocator, "Memory index: {d} long-term, {d} short-term. Use recall_memory with a query and/or tags when details are needed.\n", .{ long_count, short_count });
+        try out.print(self.allocator, "Memory index: {d} long-term, {d} short-term. Use typed memory read models and explicit recall events when details are needed.\n", .{ long_count, short_count });
         var memory_tags = std.ArrayList([]const u8).empty;
         for (memories) |memory| {
             for (memory.tags) |tag| {
@@ -314,23 +293,25 @@ pub fn buildConversationMemoryWithSpeaker(self: *Brain, speaker_context: ?[]cons
             try out.print(self.allocator, " {s}", .{tag});
         }
         try out.appendSlice(self.allocator, "\n");
+        try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "memory_index", memories.len);
     }
 
     if (summaries.len == 0) return out.toOwnedSlice(self.allocator);
-    try out.appendSlice(self.allocator, "Recent conversation summaries:\n");
-    const start = if (summaries.len > 8) summaries.len - 8 else 0;
-    const recent = summaries[start..];
-    const indices = try self.allocator.alloc(usize, recent.len);
-    for (indices, 0..) |*index, i| index.* = i;
-    prng.random().shuffle(usize, indices);
-    for (indices) |index| {
-        const summary = recent[index];
+
+    before = out.items.len;
+    try out.appendSlice(self.allocator, "Recent conversation summaries (chronological):\n");
+    const summary_window = self.cfg.capacity.conversation_summaries_in_context_max;
+    const start = if (summaries.len > summary_window) summaries.len - summary_window else 0;
+    for (summaries[start..]) |summary| {
+        const age_seconds = std.fmt.parseInt(i64, summary.time, 10) catch self.now_seconds;
+        const seconds_ago = @max(@as(i64, 0), self.now_seconds - age_seconds);
         try out.print(
             self.allocator,
-            "- You just heard USER say \"{s}\"\n  I just said \"{s}\"\n",
-            .{ summary.user_summary, summary.brain_summary },
+            "- ({d}s ago) USER: \"{s}\"\n  BRAIN: \"{s}\"\n",
+            .{ seconds_ago, summary.user_summary, summary.brain_summary },
         );
     }
+    try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "conversation_summaries", summaries.len - start);
     return out.toOwnedSlice(self.allocator);
 }
 
@@ -375,12 +356,26 @@ pub fn setFact(self: *Brain, key_text: []const u8, value_text: []const u8, tags:
     }
     fact.value = try self.allocator.dupe(u8, value);
     fact.active = true;
-    fact.invalidated_at = null;
     fact.updated_at = now;
     fact.tags = try helpers.cloneConstStringSlice(self.allocator, tags);
+    // TODO(memory-runtime-merge): replace direct fact mutation with candidate-only reconciliation once runtime registration lands.
+    try self.recordMemoryCandidateEvent(
+        .memory_mutation,
+        "brain",
+        "memory.candidate",
+        value,
+        .brain,
+        .memory_update,
+        .keep_fact,
+        key,
+        value,
+        value,
+        &[_][]const u8{},
+        fact.tags,
+    );
     try self.deps.store.saveFactRecord(fact);
     const interpretation = try std.fmt.allocPrint(self.allocator, "fact {s}: {s}", .{ fact.key, fact.value });
-    try self.recordRuntimeEvent(.{
+    try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "brain",
         .title = "set_fact",
@@ -407,8 +402,13 @@ pub fn recallFacts(self: *Brain, query_text: []const u8, tags: []const []const u
     for (records) |record| {
         if (!helpers.factMatches(record, query, tags)) continue;
         matched += 1;
+        const recall_payload = try std.fmt.allocPrint(
+            self.allocator,
+            "fact_id={s}\nquery={s}\nactive={any}\nconfidence={d:.3}",
+            .{ record.fact_id, query, record.active, record.confidence },
+        );
+        _ = try self.recordSimpleExperienceEvent(experience_kinds.memory_recalled, .memory, recall_payload);
         try out.print(self.allocator, "- {s}: {s} key={s} active={any} confidence={d:.3} updated_at={s}", .{ record.fact_id, record.value, record.key, record.active, record.confidence, record.updated_at });
-        if (record.invalidated_at) |invalidated_at| try out.print(self.allocator, " invalidated_at={s}", .{invalidated_at});
         try out.appendSlice(self.allocator, " tags=");
         try out.appendSlice(self.allocator, try helpers.joinTags(self.allocator, record.tags));
         try out.append(self.allocator, '\n');
@@ -437,7 +437,7 @@ pub fn invalidateFact(self: *Brain, fact_id_text: []const u8, key_text: []const 
     const invalidated = try self.deps.store.invalidateFactRecord(id, now);
     if (!invalidated) return error.FactNotFound;
     const interpretation = try std.fmt.allocPrint(self.allocator, "invalidated fact {s}", .{id});
-    try self.recordRuntimeEvent(.{
+    try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "brain",
         .title = "invalidate_fact",
@@ -485,12 +485,14 @@ pub fn seedEntryMemory(self: *Brain, doc: seed_mod.SeedDocument, entry: seed_mod
         .core_value => 0.90,
         .operating_tendency => 0.70,
         .want => 0.75,
+        .goal => 0.75,
         .superego_principle => 0.85,
     };
     const score: i32 = switch (entry.kind) {
         .core_value => 8,
         .operating_tendency => 5,
         .want => 5,
+        .goal => 5,
         .superego_principle => 7,
     };
     return .{
@@ -512,39 +514,18 @@ pub fn seedEntryMemory(self: *Brain, doc: seed_mod.SeedDocument, entry: seed_mod
     };
 }
 
-pub fn addExperience(
+pub fn recordExperienceFromLog(
     self: *Brain,
-    source: schema.ExperienceSource,
-    kind: schema.ExperienceKind,
+    source: schema.MemoryExperienceSource,
+    kind: schema.MemoryExperienceKind,
     subject: []const u8,
     raw: []const u8,
     interpretation: []const u8,
-    retention: schema.ExperienceRetention,
+    retention: schema.MemoryExperienceRetention,
     derived_memory_ids: []const []const u8,
     tags: []const []const u8,
 ) ![]const u8 {
-    const now = try self.timestampNow();
-    const existing = try self.deps.store.loadExperiences(self.allocator);
-    const experience_id = try std.fmt.allocPrint(self.allocator, "experience_{d}_{d}_{d}", .{ self.now_seconds, existing.len, raw.len });
-    const expires_at = try self.experienceExpiry(retention);
-    try self.deps.store.addExperience(.{
-        .experience_id = experience_id,
-        .time = now,
-        .source = source,
-        .kind = kind,
-        .subject = try self.allocator.dupe(u8, subject),
-        .raw = try self.allocator.dupe(u8, raw),
-        .interpretation = try self.allocator.dupe(u8, interpretation),
-        .confidence = 0.70,
-        .salience = emotion.estimateSalience(interpretation, tags),
-        .valence = emotion.estimateValence(interpretation),
-        .retention = retention,
-        .expires_at = expires_at,
-        .derived_memory_ids = try helpers.cloneConstStringSlice(self.allocator, derived_memory_ids),
-        .related_experience_ids = &.{},
-        .tags = try helpers.cloneConstStringSlice(self.allocator, tags),
-    });
-    return experience_id;
+    return experience_pipeline.recordMemoryExperience(self, source, kind, subject, raw, interpretation, retention, derived_memory_ids, tags, &.{});
 }
 
 pub fn heardSpeechRaw(self: *Brain, heard_speech: input_mod.HeardSpeech) ![]const u8 {
@@ -566,18 +547,24 @@ pub fn heardSpeechRaw(self: *Brain, heard_speech: input_mod.HeardSpeech) ![]cons
 }
 
 pub fn appendHeardSpeechObservation(self: *Brain, observations: *std.ArrayList(u8), heard_speech: input_mod.HeardSpeech) !void {
-    if (heard_speech.source != .speech_transcription) return;
-    try observations.print(
-        self.allocator,
-        "heard_speech sense:\n- source: speech_transcription\n- provider: {s}\n- model_path: {s}\n- audio_path: {s}\n- raw_provider_json_path: {s}\n- speaker_continuity: {s}\n- transcript: {s}\n- summary_json:\n{s}\n",
-        .{
-            heard_speech.provider orelse return error.MissingHeardSpeechProvider,
-            heard_speech.model_path orelse return error.MissingHeardSpeechModelPath,
-            heard_speech.audio_path orelse return error.MissingHeardSpeechAudioPath,
-            heard_speech.raw_provider_json_path orelse return error.MissingHeardSpeechProviderJsonPath,
-            self.current_stimulus_context orelse "none",
-            heard_speech.text,
-            heard_speech.summary_json orelse return error.MissingHeardSpeechSummaryJson,
-        },
-    );
+    switch (heard_speech.source) {
+        .typed_text => try observations.print(
+            self.allocator,
+            "user_text:\n- source: typed_text\n- text: {s}\n",
+            .{heard_speech.text},
+        ),
+        .speech_transcription => try observations.print(
+            self.allocator,
+            "heard_speech sense:\n- source: speech_transcription\n- provider: {s}\n- model_path: {s}\n- audio_path: {s}\n- raw_provider_json_path: {s}\n- speaker_continuity: {s}\n- transcript: {s}\n- summary_json:\n{s}\n",
+            .{
+                heard_speech.provider orelse return error.MissingHeardSpeechProvider,
+                heard_speech.model_path orelse return error.MissingHeardSpeechModelPath,
+                heard_speech.audio_path orelse return error.MissingHeardSpeechAudioPath,
+                heard_speech.raw_provider_json_path orelse return error.MissingHeardSpeechProviderJsonPath,
+                self.current_stimulus_context orelse "none",
+                heard_speech.text,
+                heard_speech.summary_json orelse return error.MissingHeardSpeechSummaryJson,
+            },
+        ),
+    }
 }

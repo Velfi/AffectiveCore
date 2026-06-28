@@ -8,13 +8,17 @@ const email_mod = ports.email;
 const autonomy_mod = ports.autonomy;
 const psyche_client = ports.psyche;
 const want_achievement_mod = ports.want_achievement;
+const process_goal_mod = ports.process_goal;
 const image_mod = ports.image;
 const audio_mod = ports.audio;
 const camera_mod = ports.camera;
 const speaker_mod = ports.speaker;
 const input_mod = ports.input;
-const command_log_mod = ports.command_log;
+const event_log_mod = ports.event_log;
 const facial_expression = ports.facial_expression;
+const mise_en_scene_mod = ports.mise_en_scene;
+const memory_extraction_mod = ports.memory_extraction;
+const memory_selection_mod = ports.memory_selection;
 const orientation_mod = ports.orientation;
 const output_mod = ports.output;
 const system_senses_mod = ports.system_senses;
@@ -39,19 +43,23 @@ pub const BrainDeps = struct {
     greeting_service: greeting_client.GreetingService,
     intent_service: intent_mod.IntentService,
     chat_service: chat_mod.ChatService,
+    memory_extraction_service: ?memory_extraction_mod.MemoryExtractionService = null,
+    memory_selection_service: ?memory_selection_mod.MemorySelectionService = null,
     email_service: ?email_mod.EmailService = null,
     image_generation_service: image_mod.ImageGenerationService,
     audio_inspection_service: ?audio_mod.AudioInspectionService = null,
     autonomy_planner: ?autonomy_mod.AutonomyPlanner = null,
     psyche_service: ?psyche_client.PsycheService = null,
     want_achievement_detector: want_achievement_mod.WantAchievementDetector,
+    process_composer: ?process_goal_mod.ProcessComposer = null,
     speech_service: speech_mod.SpeechService,
     speaker: speaker_mod.Speaker,
     input: input_mod.UserInput,
     store: store_mod.MemoryStore,
     graph: graph_store.GraphStore,
-    command_log: ?command_log_mod.CommandLog = null,
+    event_log: ?event_log_mod.EventLog = null,
     facial_expression_output: ?facial_expression.Output = null,
+    mise_en_scene_output: ?mise_en_scene_mod.Output = null,
     orientation_query: ?orientation_mod.Query = null,
     output: ?output_mod.Output = null,
     system_senses: system_senses_mod.SystemSenses,
@@ -62,10 +70,11 @@ pub const BrainDeps = struct {
     id_monitor_sources: []const id_monitor.Source = &.{},
 };
 
-pub const CommandBatchResult = struct {
+pub const ActionPressureBatchResult = struct {
     spoken_text: ?[]const u8 = null,
     ended_with_speech: bool = false,
     interrupted_by: ?interrupt_mod.Stimulus = null,
+    selected_primary_action: ?chat_mod.ActionProposalType = null,
 };
 
 pub const ConversationTurnResult = struct {
@@ -73,7 +82,20 @@ pub const ConversationTurnResult = struct {
     spoken_text: []const u8,
     user_summary: []const u8,
     brain_summary: []const u8,
+    /// Correlates logs and host responses for this dispatch; empty when unavailable.
+    dispatch_id: []const u8 = "",
     interrupted_by: ?interrupt_mod.Stimulus = null,
+    /// True when the turn paused mid-loop waiting for a host-delivered sense
+    /// observation. The host should keep the turn open and expect a follow-up
+    /// user_text or sense_observation once the awaited sense arrives.
+    awaiting_host_sense: bool = false,
+    /// Stable ID for a multi-step activity the brain opened. Absent on single-step turns.
+    activity_id: ?[]const u8 = null,
+    activity_kind: ?[]const u8 = null,
+    activity_kind_label: ?[]const u8 = null,
+    activity_state: ?[]const u8 = null,
+    activity_goal: ?[]const u8 = null,
+    activity_awaiting: ?[]const u8 = null,
 };
 
 pub const PsycheHabituation = struct {
@@ -116,7 +138,7 @@ pub const PsycheHabituation = struct {
 pub const SenseStimulusState = stimulus.DualProcessState;
 
 pub const PendingHardError = struct {
-    command: []const u8,
+    action_pressure: []const u8,
     error_name: []const u8,
     recovery_hint: []const u8,
 };

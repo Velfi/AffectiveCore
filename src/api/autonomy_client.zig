@@ -4,6 +4,10 @@ const skills = @import("skills.zig");
 const ai = @import("random_provider_client.zig");
 const http_transport = @import("http_transport.zig");
 const autonomy_port = @import("../core/port_autonomy.zig");
+const llm_routing = @import("../core/llm_routing.zig");
+const capability_registry = @import("../core/capability_registry.zig");
+const llm_tester_scenario = @import("../harness/llm_tester/scenario.zig");
+const action_pressure_json_schema = @import("action_pressure_json_schema.zig");
 
 pub const Salience = autonomy_port.Salience;
 pub const AutonomyTurn = autonomy_port.AutonomyTurn;
@@ -14,9 +18,15 @@ pub const RandomProviderAutonomyPlanner = struct {
     provider_client: ai.RandomProviderClient,
     reasoning_effort: ?chat.ReasoningEffort,
 
-    pub fn init(io: std.Io, http: http_transport.Client, models_spec: []const u8, reasoning_effort: ?chat.ReasoningEffort) RandomProviderAutonomyPlanner {
+    pub fn init(
+        io: std.Io,
+        http: http_transport.Client,
+        roster: llm_routing.LlmRoster,
+        quality: ai.LlmQuality,
+        reasoning_effort: ?chat.ReasoningEffort,
+    ) RandomProviderAutonomyPlanner {
         return .{
-            .provider_client = ai.RandomProviderClient.init(io, http, models_spec),
+            .provider_client = ai.RandomProviderClient.initWithRoster(io, http, roster, quality),
             .reasoning_effort = reasoning_effort,
         };
     }
@@ -51,31 +61,65 @@ fn autonomySystemPrompt(allocator: std.mem.Allocator) ![]const u8 {
     const allowed = try skills.autonomySkillNames(allocator);
     return std.fmt.allocPrint(
         allocator,
-        "You are the Ego of a stationary household robot.\n" ++
-            "Reconcile Id short-term consequence simulation, Superego long-term consequence simulation, external reality, autonomy budget, and available commands.\n" ++
-            "Both voices drink from the same shared state, but may assign different salience, causes, and meanings to the same stimulus; compare those disagreements before choosing.\n" ++
-            "Autonomy budget is an internal daily action budget, not battery charge and not external power.\n" ++
-            "Only use get_power or ask_human about shutdown when supplied power evidence shows a real low battery, missing external power, or a power-source change.\n" ++
-            "Return exactly one JSON object with keys: command, text, query, memory_id, schedule, heat_bias, eyes, mouth, duration_ms, tags, salience, reason.\n" ++
-            "Allowed commands: {s}.\n" ++
-            "Never choose skills marked forbidden or invalid in the registry, including camera commands.\n" ++
-            "When you choose ask_human, ask one concrete question and then expect autonomy to sleep until the human responds.\n" ++
-            "Use say only for rare high-salience speech that respects the supplied gates.\n" ++
-            "Prefer quiet self-work when Id and Superego disagree unless the shared state shows an urgent, actionable need.\n" ++
-            "Use define_need or define_want when a stable self-definition should become part of memory. Use edit_need or edit_want only when introspection has provided a matching memory_id to revise.\n" ++
-            "Use salience low, medium, or high.\n" ++
-            "For facial_expression, choose eyes and mouth sprite names from the supplied skill description; duration_ms may not exceed 5000.\n" ++
-            "For unused optional fields, use null. tags must always be an array. heat_bias may only be null, low, mixed, or high.\n" ++
-            "Return only JSON.\n" ++
-            "Do not wrap the JSON in Markdown or code fences.",
+        "You are the choosing self of a living mind in a stationary body—not an assistant awaiting tasks.\n" ++
+            "Id (short-term impulse) and Superego (long-term consequence) share the same state but may weigh salience, causes, and meaning differently; compare their disagreement before you act.\n" ++
+            "Output strict JSON only (no markdown or prose).\n" ++
+            "\n" ++
+            "Read the supplied context as your present situation: body senses, autonomy budget, Id/Superego readings, recent contact, and speech gates.\n" ++
+            "Autonomy budget is internal daily action energy—not battery charge and not external power.\n" ++
+            "Only use get_power or say about shutting down when power evidence shows low battery, lost external power, or a source change.\n" ++
+            "\n" ++
+            "Return one JSON object: action_pressures (ordered array), salience (low|medium|high), reason (brief first-person why).\n" ++
+            "\n" ++
+            "Plan action_pressures for this pass only:\n" ++
+            "- Each step requires action; include only fields that step uses—omit unused keys (never null placeholders).\n" ++
+            "- Allowed skills: {s}.\n" ++
+            "- Registered skill fits → use exact name.\n" ++
+            "- No skill fits → snake_case process goal (runtime expands it); must not imply forbidden capabilities, including camera actions.\n" ++
+            "- Never use skills marked forbidden or invalid in the registry, including camera actions.\n" ++
+            "- Tag every pressure origin=autonomy; use delay_ms for timed chains.\n" ++
+            "- say: speak aloud when you need help, clarification, permission, or rare high-salience speech that respects the supplied gates.\n" ++
+            "- When Id and Superego disagree, prefer quiet inner work unless state shows an urgent actionable need.\n" ++
+            "- define_need, define_want, or define_goal when a stable self-definition belongs in memory; edit_need, edit_want, or edit_goal only when context supplies a matching memory_id.\n" ++
+            "- facial_expression: eyes and mouth from the skill description; duration_ms may not exceed 5000.\n" ++
+            "- heat_bias when set: low, mixed, or high only. Include tags only when non-empty.\n",
         .{allowed},
     );
 }
 
-fn autonomyJsonSchema() []const u8 {
-    return
-    \\{"type":"object","additionalProperties":false,"properties":{"command":{"type":"string"},"text":{"type":["string","null"]},"query":{"type":["string","null"]},"memory_id":{"type":["string","null"]},"schedule":{"type":["string","null"]},"heat_bias":{"type":["string","null"],"enum":["low","mixed","high",null]},"eyes":{"type":["string","null"]},"mouth":{"type":["string","null"]},"duration_ms":{"type":["integer","null"]},"tags":{"type":"array","items":{"type":"string"}},"salience":{"type":"string","enum":["low","medium","high"]},"reason":{"type":"string"}},"required":["command","text","query","memory_id","schedule","heat_bias","eyes","mouth","duration_ms","tags","salience","reason"]}
+pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.Scenario {
+    const context =
+        \\autonomy_mode: limited
+        \\autonomy_budget_remaining: 0.62
+        \\social_engagement: 0.41
+        \\consecutive_voluntary_speech: 0
+        \\quiet_hours_active: false
+        \\id: top_need=connection, salience=medium, desired_action_bias=think_about connection
+        \\superego: concerns=quiet hours approaching, salience=low
+        \\senses: ambient sound low, no recent touch
+        \\recent_interaction: none in last 20 minutes
     ;
+    const system_prompt = try autonomySystemPrompt(allocator);
+    const scenario = try llm_tester_scenario.Scenario.init(
+        allocator,
+        "autonomy_idle_reflection",
+        "Autonomy planning with Id/Superego and budget context",
+        "Tests voluntary speech planning when Id, Superego, autonomy budget, and quiet-hours signals are present but no recent interaction has occurred.",
+        "autonomy",
+        system_prompt,
+        context,
+        .json_object,
+        autonomyJsonSchema(),
+        512,
+        0.3,
+    );
+    const out = try allocator.alloc(llm_tester_scenario.Scenario, 1);
+    out[0] = scenario;
+    return out;
+}
+
+fn autonomyJsonSchema() []const u8 {
+    return action_pressure_json_schema.strictAutonomyTurnSchema();
 }
 
 fn validateAutonomyTurn(allocator: std.mem.Allocator, content: []const u8) !void {
@@ -89,26 +133,59 @@ pub fn parseAutonomyTurn(allocator: std.mem.Allocator, body: []const u8) !Autono
         .object => |object| object,
         else => return error.InvalidAutonomyJson,
     };
-    const command_text = try requiredStringField(object, "command");
+    const pressure_values = try requiredArrayField(object, "action_pressures");
     const salience_text = try requiredStringField(object, "salience");
     const reason = try requiredStringField(object, "reason");
-    const command = parseCommand(command_text) orelse return error.InvalidAutonomyCommand;
-    if (command == .take_picture or command == .describe_image or command == .compare_images or command == .recognize or command == .unknown) return error.InvalidAutonomyCommand;
+    var action_pressures = try allocator.alloc(chat.ActionProposal, pressure_values.items.len);
+    for (pressure_values.items, 0..) |value, i| {
+        const pressure_object = switch (value) {
+            .object => |child| child,
+            else => return error.InvalidAutonomyField,
+        };
+        const action_text = try requiredStringField(pressure_object, "action");
+        const resolved_action = parseAction(action_text);
+        const action: chat.ActionProposalType = if (resolved_action) |known| known else .unknown;
+        if (action == .take_picture or action == .describe_image or action == .compare_images or action == .recognize) return error.InvalidAutonomyAction;
+        const process_goal: ?[]const u8 = if (resolved_action == null) try allocator.dupe(u8, action_text) else null;
+        const origin_text = optionalStringField(pressure_object, "origin") catch return error.InvalidAutonomyField;
+        const scale_text = optionalStringField(pressure_object, "scale") catch return error.InvalidAutonomyField;
+        action_pressures[i] = .{
+            .action = action,
+            .origin = parseOrigin(origin_text orelse "autonomy") orelse return error.InvalidAutonomyField,
+            .delay_ms = try optionalIntegerField(pressure_object, "delay_ms"),
+            .scale = parseScale(scale_text orelse "full") orelse return error.InvalidAutonomyField,
+            .text = try dupeOptionalString(allocator, try optionalStringField(pressure_object, "text")),
+            .query = try dupeOptionalString(allocator, try optionalStringField(pressure_object, "query")),
+            .memory_id = try dupeOptionalString(allocator, try optionalStringField(pressure_object, "memory_id")),
+            .schedule = try dupeOptionalString(allocator, try optionalStringField(pressure_object, "schedule")),
+            .heat_bias = try dupeOptionalString(allocator, try optionalHeatBiasField(pressure_object)),
+            .eyes = try dupeOptionalString(allocator, try optionalStringField(pressure_object, "eyes")),
+            .mouth = try dupeOptionalString(allocator, try optionalStringField(pressure_object, "mouth")),
+            .duration_ms = try optionalIntegerField(pressure_object, "duration_ms"),
+            .tags = try cloneTagsField(allocator, pressure_object),
+            .process_goal = process_goal,
+        };
+    }
     return .{
-        .command = .{
-            .command = command,
-            .text = try dupeOptionalString(allocator, try optionalStringField(object, "text")),
-            .query = try dupeOptionalString(allocator, try optionalStringField(object, "query")),
-            .memory_id = try dupeOptionalString(allocator, try optionalStringField(object, "memory_id")),
-            .schedule = try dupeOptionalString(allocator, try optionalStringField(object, "schedule")),
-            .heat_bias = try dupeOptionalString(allocator, try optionalHeatBiasField(object)),
-            .eyes = try dupeOptionalString(allocator, try optionalStringField(object, "eyes")),
-            .mouth = try dupeOptionalString(allocator, try optionalStringField(object, "mouth")),
-            .duration_ms = try optionalIntegerField(object, "duration_ms"),
-            .tags = try cloneTagsField(allocator, object),
-        },
+        .action_pressures = action_pressures,
         .salience = parseSalience(salience_text) orelse return error.InvalidAutonomySalience,
         .reason = try allocator.dupe(u8, reason),
+    };
+}
+
+fn requiredArrayField(object: std.json.ObjectMap, name: []const u8) !std.json.Array {
+    const value = object.get(name) orelse return error.MissingAutonomyField;
+    return switch (value) {
+        .array => |items| items,
+        else => error.InvalidAutonomyField,
+    };
+}
+
+fn requiredObjectField(object: std.json.ObjectMap, name: []const u8) !std.json.ObjectMap {
+    const value = object.get(name) orelse return error.MissingAutonomyField;
+    return switch (value) {
+        .object => |child| child,
+        else => error.InvalidAutonomyField,
     };
 }
 
@@ -121,7 +198,7 @@ fn requiredStringField(object: std.json.ObjectMap, name: []const u8) ![]const u8
 }
 
 fn optionalStringField(object: std.json.ObjectMap, name: []const u8) !?[]const u8 {
-    const value = object.get(name) orelse return error.MissingAutonomyField;
+    const value = object.get(name) orelse return null;
     return switch (value) {
         .null => null,
         .string => |text| text,
@@ -130,7 +207,7 @@ fn optionalStringField(object: std.json.ObjectMap, name: []const u8) !?[]const u
 }
 
 fn optionalIntegerField(object: std.json.ObjectMap, name: []const u8) !?u32 {
-    const value = object.get(name) orelse return error.MissingAutonomyField;
+    const value = object.get(name) orelse return null;
     return switch (value) {
         .null => null,
         .integer => |number| if (number >= 0 and number <= std.math.maxInt(u32)) @intCast(number) else error.InvalidAutonomyField,
@@ -152,7 +229,7 @@ fn dupeOptionalString(allocator: std.mem.Allocator, text: ?[]const u8) !?[]const
 }
 
 fn cloneTagsField(allocator: std.mem.Allocator, object: std.json.ObjectMap) ![]const []const u8 {
-    const value = object.get("tags") orelse return error.MissingAutonomyField;
+    const value = object.get("tags") orelse return &.{};
     return switch (value) {
         .array => |array| {
             const tags = try allocator.alloc([]const u8, array.items.len);
@@ -170,23 +247,20 @@ fn cloneTagsField(allocator: std.mem.Allocator, object: std.json.ObjectMap) ![]c
 
 fn reportAutonomyParseError(err: anyerror, content: []const u8) void {
     std.debug.print(
-        "\nAUTONOMY PARSE ERROR\nPROVIDER: random selected\nERROR: {s}\nEXPECTED: strict JSON object with command/text/query/memory_id/schedule/heat_bias/tags/salience/reason\nRAW MODEL CONTENT:\n{s}\n\n",
+        "\nAUTONOMY PARSE ERROR\nPROVIDER: random selected\nERROR: {s}\nEXPECTED: strict JSON object with action_pressures/salience/reason\nRAW MODEL CONTENT:\n{s}\n\n",
         .{ @errorName(err), content },
     );
 }
 
 fn reportAutonomyProviderParseError(subsystem: []const u8, provider: []const u8, model: []const u8, err: anyerror, content: []const u8) void {
     std.debug.print(
-        "\nAUTONOMY PARSE ERROR\nSUBSYSTEM: {s}\nPROVIDER: {s}\nMODEL: {s}\nERROR: {s}\nEXPECTED: strict JSON object with command/text/query/memory_id/schedule/heat_bias/tags/salience/reason\nRAW MODEL CONTENT:\n{s}\n\n",
+        "\nAUTONOMY PARSE ERROR\nSUBSYSTEM: {s}\nPROVIDER: {s}\nMODEL: {s}\nERROR: {s}\nEXPECTED: strict JSON object with action_pressures/salience/reason\nRAW MODEL CONTENT:\n{s}\n\n",
         .{ subsystem, provider, model, @errorName(err), content },
     );
 }
 
-fn parseCommand(text: []const u8) ?chat.ChatCommandType {
-    inline for (@typeInfo(chat.ChatCommandType).@"enum".fields) |field| {
-        if (std.mem.eql(u8, text, field.name)) return @field(chat.ChatCommandType, field.name);
-    }
-    return null;
+fn parseAction(text: []const u8) ?chat.ActionProposalType {
+    return capability_registry.actionForCapabilityId(text);
 }
 
 fn parseSalience(text: []const u8) ?Salience {
@@ -196,30 +270,79 @@ fn parseSalience(text: []const u8) ?Salience {
     return null;
 }
 
+fn parseOrigin(text: []const u8) ?chat.ActionOrigin {
+    if (std.mem.eql(u8, text, "interaction")) return .interaction;
+    if (std.mem.eql(u8, text, "autonomy")) return .autonomy;
+    return null;
+}
+
+fn parseScale(text: []const u8) ?chat.ActionScale {
+    if (std.mem.eql(u8, text, "full")) return .full;
+    if (std.mem.eql(u8, text, "medium")) return .medium;
+    if (std.mem.eql(u8, text, "tiny")) return .tiny;
+    return null;
+}
+
 test "parseAutonomyTurn rejects proactive camera capture" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    try std.testing.expectError(error.InvalidAutonomyCommand, parseAutonomyTurn(allocator,
-        \\{"command":"take_picture","salience":"high","reason":"curious"}
+    try std.testing.expectError(error.InvalidAutonomyAction, parseAutonomyTurn(allocator,
+        \\{"action_pressures":[{"action":"take_picture","origin":"autonomy","delay_ms":null,"scale":"full","text":null,"query":null,"memory_id":null,"schedule":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"tags":[]}],"salience":"high","reason":"curious"}
     ));
 }
 
 test "random-provider autonomy schema matches strict required envelope" {
     const schema = autonomyJsonSchema();
-    try std.testing.expect(std.mem.indexOf(u8, schema, "\"required\":[\"command\",\"text\",\"query\",\"memory_id\",\"schedule\",\"heat_bias\",\"eyes\",\"mouth\",\"duration_ms\",\"tags\",\"salience\",\"reason\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "\"required\":[\"action_pressures\",\"salience\",\"reason\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "\"required\":[\"action\",\"origin\",\"delay_ms\",\"scale\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "\"additionalProperties\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "\"type\":[\"string\",\"null\"]") != null);
 }
 
-test "parseAutonomyTurn accepts a reflective command" {
+test "parseAutonomyTurn preserves invented action names as process goals" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const turn = try parseAutonomyTurn(allocator,
-        \\{"command":"think_about","text":null,"query":"energy","memory_id":null,"schedule":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"tags":["self"],"salience":"medium","reason":"checking limits"}
+        \\{"action_pressures":[{"action":"investigate_touch","origin":"autonomy","delay_ms":null,"scale":"tiny","text":null,"query":null,"memory_id":null,"schedule":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":500,"tags":["exploration","touch"]}],"salience":"high","reason":"curious touch"}
     );
-    try std.testing.expectEqual(chat.ChatCommandType.think_about, turn.command.command);
+    try std.testing.expectEqual(chat.ActionProposalType.unknown, turn.action_pressures[0].action);
+    try std.testing.expectEqualStrings("investigate_touch", turn.action_pressures[0].process_goal.?);
+}
+
+test "parseAutonomyTurn accepts minimal action pressure without null placeholders" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const turn = try parseAutonomyTurn(allocator,
+        \\{"action_pressures":[{"action":"think_about","query":"energy","tags":["self"]}],"salience":"medium","reason":"checking limits"}
+    );
+    try std.testing.expectEqual(chat.ActionProposalType.think_about, turn.action_pressures[0].action);
+    try std.testing.expectEqual(chat.ActionOrigin.autonomy, turn.action_pressures[0].origin);
+    try std.testing.expectEqual(chat.ActionScale.full, turn.action_pressures[0].scale);
+    try std.testing.expectEqualStrings("energy", turn.action_pressures[0].query.?);
+}
+
+test "parseAutonomyTurn accepts a reflective action pressure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const turn = try parseAutonomyTurn(allocator,
+        \\{"action_pressures":[{"action":"think_about","origin":"autonomy","delay_ms":null,"scale":"full","text":null,"query":"energy","memory_id":null,"schedule":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"tags":["self"]}],"salience":"medium","reason":"checking limits"}
+    );
+    try std.testing.expectEqual(chat.ActionProposalType.think_about, turn.action_pressures[0].action);
     try std.testing.expectEqual(Salience.medium, turn.salience);
+}
+
+test "parseAutonomyTurn resolves capability synonyms" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const turn = try parseAutonomyTurn(allocator,
+        \\{"action_pressures":[{"action":"speak","origin":"autonomy","delay_ms":null,"scale":"full","text":"hello","query":null,"memory_id":null,"schedule":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"tags":[]}],"salience":"low","reason":"greeting"}
+    );
+    try std.testing.expectEqual(chat.ActionProposalType.say, turn.action_pressures[0].action);
 }
 
 test "parseAutonomyTurn rejects wrong optional field type clearly" {
@@ -227,7 +350,7 @@ test "parseAutonomyTurn rejects wrong optional field type clearly" {
     defer arena.deinit();
     const allocator = arena.allocator();
     try std.testing.expectError(error.InvalidAutonomyField, parseAutonomyTurn(allocator,
-        \\{"command":"dream","text":null,"query":null,"memory_id":null,"schedule":null,"heat_bias":0.5,"eyes":null,"mouth":null,"duration_ms":null,"tags":[],"salience":"low","reason":"resting"}
+        \\{"action_pressures":[{"action":"think_about","origin":"autonomy","delay_ms":null,"scale":"full","text":null,"query":null,"memory_id":null,"schedule":null,"heat_bias":0.5,"eyes":null,"mouth":null,"duration_ms":null,"tags":[]}],"salience":"low","reason":"resting"}
     ));
 }
 
@@ -236,10 +359,12 @@ test "parseAutonomyTurn accepts facial expression fields" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const turn = try parseAutonomyTurn(allocator,
-        \\{"command":"facial_expression","text":null,"query":null,"memory_id":null,"schedule":null,"heat_bias":null,"eyes":"neutral","mouth":"open","duration_ms":5000,"tags":["visible_affect"],"salience":"low","reason":"visible reaction"}
+        \\{"action_pressures":[{"action":"facial_expression","origin":"autonomy","delay_ms":250,"scale":"tiny","text":null,"query":null,"memory_id":null,"schedule":null,"heat_bias":null,"eyes":"neutral","mouth":"open","duration_ms":5000,"tags":["visible_affect"]}],"salience":"low","reason":"visible reaction"}
     );
-    try std.testing.expectEqual(chat.ChatCommandType.facial_expression, turn.command.command);
-    try std.testing.expectEqualStrings("neutral", turn.command.eyes.?);
-    try std.testing.expectEqualStrings("open", turn.command.mouth.?);
-    try std.testing.expectEqual(@as(?u32, 5000), turn.command.duration_ms);
+    try std.testing.expectEqual(chat.ActionProposalType.facial_expression, turn.action_pressures[0].action);
+    try std.testing.expectEqualStrings("neutral", turn.action_pressures[0].eyes.?);
+    try std.testing.expectEqualStrings("open", turn.action_pressures[0].mouth.?);
+    try std.testing.expectEqual(@as(?u32, 5000), turn.action_pressures[0].duration_ms);
+    try std.testing.expectEqual(@as(?u32, 250), turn.action_pressures[0].delay_ms);
+    try std.testing.expectEqual(chat.ActionScale.tiny, turn.action_pressures[0].scale);
 }

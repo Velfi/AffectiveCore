@@ -1,0 +1,7 @@
+{
+  "image_path": "/tmp/affective-camera.jpg",
+  "memory_path": "/path/to/brain/memory/people.sqlite",
+  "embeddings_dir": "/path/to/brain/memory/face_embeddings",
+  "known_threshold": 0.85,
+  "uncertain_threshold": 0.6
+}

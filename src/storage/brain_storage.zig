@@ -16,15 +16,14 @@ pub const BrainStorage = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         memory_path: []const u8,
-        events_path: []const u8,
         graph_path: []const u8,
         captures_dir: []const u8,
     ) !BrainStorage {
         const memory_impl = try allocator.create(json_store.JsonMemoryStore);
         memory_impl.* = if (captures_dir.len > 0)
-            json_store.JsonMemoryStore.initWithCaptureDir(allocator, io, memory_path, events_path, captures_dir)
+            json_store.JsonMemoryStore.initWithCaptureDir(allocator, io, memory_path, captures_dir)
         else
-            json_store.JsonMemoryStore.init(allocator, io, memory_path, events_path);
+            json_store.JsonMemoryStore.init(allocator, io, memory_path);
 
         const graph_impl = try allocator.create(graph_store.SqliteGraphStore);
         graph_impl.* = try graph_store.SqliteGraphStore.init(allocator, io, graph_path);

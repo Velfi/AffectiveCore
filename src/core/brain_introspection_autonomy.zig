@@ -27,7 +27,7 @@ const camera_mod = ports.camera;
 const speaker_mod = ports.speaker;
 const input_mod = ports.input;
 const button_mod = ports.button;
-const command_log_mod = ports.command_log;
+const event_log_mod = ports.event_log;
 const facial_expression = ports.facial_expression;
 const system_senses_mod = ports.system_senses;
 const time_mod = @import("time.zig");
@@ -41,10 +41,13 @@ const emotion = @import("emotion.zig");
 const process = ports.process;
 const helpers = @import("brain_helpers.zig");
 const brain_autonomy = @import("brain_autonomy.zig");
+const capability_registry = @import("capability_registry.zig");
+const skill_tree = @import("skill_tree.zig");
+const llm_routing = @import("llm_routing.zig");
 
 const Brain = brain_mod.Brain;
 const BrainDeps = brain_mod.BrainDeps;
-const CommandBatchResult = brain_mod.CommandBatchResult;
+const ActionPressureBatchResult = brain_mod.ActionPressureBatchResult;
 const ConversationTurnResult = brain_mod.ConversationTurnResult;
 const ConversationSpeakerContext = brain_mod.Brain.ConversationSpeakerContext;
 const QuietHours = brain_mod.Brain.QuietHours;
@@ -57,27 +60,43 @@ const speech_artifact_prefix = brain_mod.speech_artifact_prefix;
 const speech_audio_suffix = brain_mod.speech_audio_suffix;
 const speech_transcription_json_suffix = brain_mod.speech_transcription_json_suffix;
 
-const IntrospectionFieldSize = struct {
-    name: []const u8 = "none",
-    bytes: usize = 0,
-
-    fn note(self: *IntrospectionFieldSize, name: []const u8, bytes: usize) void {
-        if (bytes > self.bytes) {
-            self.* = .{ .name = name, .bytes = bytes };
-        }
-    }
-
-    fn trace(self: IntrospectionFieldSize, brain: *Brain) void {
-        brain.outputFmt("TRACE now={d} stage=introspect.largest_field name={s} bytes={d}\n", .{ brain.now_seconds, self.name, self.bytes });
-    }
-};
-
 fn traceIntrospectionLoad(self: *Brain, name: []const u8, count: usize) void {
     self.outputFmt("TRACE now={d} stage=introspect.load.done name={s} count={d}\n", .{ self.now_seconds, name, count });
 }
 
-pub fn introspect(self: *Brain) ![]const u8 {
-    self.outputFmt("TRACE now={d} stage=introspect.start\n", .{self.now_seconds});
+fn skillAvailability(ctx: *anyopaque, id: skill_tree.SkillId) bool {
+    const self: *Brain = @ptrCast(@alignCast(ctx));
+    return actionIsAvailable(self, id);
+}
+
+fn skillAvailabilityContext(self: *Brain) skill_tree.Availability {
+    return .{ .ctx = self, .isAvailable = skillAvailability };
+}
+
+pub fn introspect(self: *Brain, query: ?[]const u8) ![]const u8 {
+    const target = skill_tree.parseIntrospectQuery(query);
+    self.outputFmt("TRACE now={d} stage=introspect.start query={s}\n", .{
+        self.now_seconds,
+        query orelse "",
+    });
+    return switch (target) {
+        .overview => try introspectOverview(self),
+        .skills_tree => try introspectSkillsTree(self),
+        .skills_group => |group| try introspectSkillsGroup(self, group),
+        .skill => |id| try introspectSkillDetail(self, id),
+        .memory => try introspectMemory(self),
+        .facts => try introspectFacts(self),
+        .needs => try introspectNeeds(self),
+        .capabilities => try introspectCapabilities(self),
+        .senses => try introspectSenses(self),
+        .autonomy => try introspectAutonomy(self),
+        .focus => try introspectFocus(self),
+        .identity => try introspectIdentity(self),
+        .unknown => |topic| try std.fmt.allocPrint(self.allocator, "introspection: unknown query topic \"{s}\"\nDrill-down topics: skills, skill/<name>, skills/<group>, memory, facts, needs, capabilities, senses, autonomy, focus, identity\n", .{topic}),
+    };
+}
+
+fn introspectOverview(self: *Brain) ![]const u8 {
     const can_read_memory = capabilityAvailable(self, .stored_memory_read);
     self.outputFmt("TRACE now={d} stage=introspect.memory_capability available={any}\n", .{ self.now_seconds, can_read_memory });
     const memories = if (can_read_memory) blk: {
@@ -101,11 +120,10 @@ pub fn introspect(self: *Brain) ![]const u8 {
         break :blk loaded;
     } else &[_]schema.Appraisal{};
     const dreams = if (can_read_memory) blk: {
-        const loaded = try self.deps.store.loadDreamRecords(self.allocator);
-        traceIntrospectionLoad(self, "dreams", loaded.len);
+        const loaded = try self.deps.store.loadDreamTimeRecords(self.allocator);
+        traceIntrospectionLoad(self, "dream_time_records", loaded.len);
         break :blk loaded;
-    } else &[_]schema.DreamRecord{};
-    var largest = IntrospectionFieldSize{};
+    } else &[_]schema.DreamTimeRecord{};
     var long_count: usize = 0;
     var short_count: usize = 0;
     var score_total: i64 = 0;
@@ -121,46 +139,174 @@ pub fn introspect(self: *Brain) ![]const u8 {
         if (salient == null or helpers.memoryIsMoreSalient(memory, salient.?)) salient = memory;
     }
     const salient_text = if (salient) |memory| try memoryOneLineSummary(self, memory) else "none yet";
-    largest.note("salient_memory", salient_text.len);
-    largest.trace(self);
     const recent_appraisal = if (appraisals.len > 0) appraisals[appraisals.len - 1].freeform else "none yet";
-    largest.note("recent_appraisal", recent_appraisal.len);
-    largest.trace(self);
-    const affordances = try affordanceCatalog(self);
-    largest.note("skills", affordances.len);
-    largest.trace(self);
-    const autonomy_status = try brain_autonomy.autonomyIntrospection(self);
-    largest.note("autonomy_status", autonomy_status.len);
-    largest.trace(self);
-    const needs_status = try activeNeedsSummary(self);
-    largest.note("needs_status", needs_status.len);
-    largest.trace(self);
-    const flexible_identity_status = try flexibleIdentitySummary(self, memories);
-    largest.note("flexible_identity_status", flexible_identity_status.len);
-    largest.trace(self);
-    const self_facts = try selfFactsSummary(self);
-    largest.note("self_facts", self_facts.len);
-    largest.trace(self);
-    const senses = try sensesSummary(self);
-    largest.note("senses", senses.len);
-    largest.trace(self);
-    const capabilities = try capabilityCatalog(self);
-    largest.note("capabilities", capabilities.len);
-    largest.trace(self);
     const memory_status = if (can_read_memory)
         try std.fmt.allocPrint(self.allocator, "{d} long-term, {d} short-term, {d} recent summaries", .{ long_count, short_count, summaries.len })
     else
         try std.fmt.allocPrint(self.allocator, "unavailable: {s}", .{try capabilityUnavailableReason(self, .stored_memory_read)});
-    largest.note("memory_status", memory_status.len);
-    largest.trace(self);
     const focus_status = try focusStatusSummary(self);
-    largest.note("focus", focus_status.len);
-    largest.trace(self);
+    const active_need_count = try countActiveNeeds(self);
+    const fact_count = try countActiveFacts(self);
+    const capability_counts = try capabilityAvailabilityCounts(self);
+    var skill_summary = std.ArrayList(u8).empty;
+    defer skill_summary.deinit(self.allocator);
+    try skill_tree.appendSkillsTree(self.allocator, &skill_summary, skillAvailabilityContext(self));
+    const autonomy_line = try autonomyOverviewLine(self);
     return std.fmt.allocPrint(
         self.allocator,
-        "introspection:\n{s}- senses: {s}\n- capabilities:\n{s}- memory: {s}\n- impressions={d} appraisals={d} dreams={d}\n- memory_score_total: {d}\n- memory_access_total: {d}\n- salient_memory: {s}\n- recent_appraisal: {s}\n- focus: {s}\n- uncertainty/human_needs: ask_human is available when an appraisal needs human help, clarification, or permission; use think_about for private reflection or model-mediated judgment\n{s}{s}{s}\n- skills:\n{s}",
-        .{ self_facts, senses, capabilities, memory_status, impressions.len, appraisals.len, dreams.len, score_total, access_total, salient_text, recent_appraisal, focus_status, autonomy_status, needs_status, flexible_identity_status, affordances },
+        "introspection overview:\n- memory: {s}\n- impressions={d} appraisals={d} dreams={d}\n- memory_score_total: {d}\n- memory_access_total: {d}\n- salient_memory: {s}\n- recent_appraisal: {s}\n- focus: {s}\n- needs: {d} active (query=needs)\n- facts: {d} active (query=facts)\n- capabilities: {d} available, {d} unavailable (query=capabilities)\n- autonomy: {s} (query=autonomy)\n{s}\nDrill-down topics: skills, skill/<name>, skills/<group>, memory, facts, needs, capabilities, senses, autonomy, focus, identity\n- uncertainty/human_needs: use say when an appraisal needs human help, clarification, or permission; use think_about for private reflection or model-mediated judgment\n",
+        .{ memory_status, impressions.len, appraisals.len, dreams.len, score_total, access_total, salient_text, recent_appraisal, focus_status, active_need_count, fact_count, capability_counts.available, capability_counts.unavailable, autonomy_line, skill_summary.items },
     );
+}
+
+fn introspectSkillsTree(self: *Brain) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    try out.appendSlice(self.allocator, "introspection:\n");
+    try skill_tree.appendSkillsTree(self.allocator, &out, skillAvailabilityContext(self));
+    return out.toOwnedSlice(self.allocator);
+}
+
+fn introspectSkillsGroup(self: *Brain, group: skill_tree.SkillGroup) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    try out.appendSlice(self.allocator, "introspection:\n");
+    try skill_tree.appendGroupCatalog(self.allocator, &out, group, skillAvailabilityContext(self));
+    return out.toOwnedSlice(self.allocator);
+}
+
+fn introspectSkillDetail(self: *Brain, id: skill_tree.SkillId) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    try out.appendSlice(self.allocator, "introspection:\n");
+    try skill_tree.appendSkillDetail(self.allocator, &out, id, skillAvailabilityContext(self));
+    if (try actionUnavailableReason(self, id)) |reason| {
+        try out.print(self.allocator, "unavailable_reason: {s}\n", .{reason});
+    }
+    return out.toOwnedSlice(self.allocator);
+}
+
+fn introspectMemory(self: *Brain) ![]const u8 {
+    const can_read_memory = capabilityAvailable(self, .stored_memory_read);
+    const memories = if (can_read_memory) try self.deps.store.loadMemoryRecords(self.allocator) else &[_]schema.MemoryRecord{};
+    const summaries = if (can_read_memory) try self.deps.store.loadConversationSummaries(self.allocator) else &[_]schema.ConversationSummary{};
+    var long_count: usize = 0;
+    var short_count: usize = 0;
+    var score_total: i64 = 0;
+    var access_total: u64 = 0;
+    var salient: ?schema.MemoryRecord = null;
+    for (memories) |memory| {
+        switch (memory.scope) {
+            .long_term => long_count += 1,
+            .short_term => short_count += 1,
+        }
+        score_total += memory.score;
+        access_total += memory.access_count;
+        if (salient == null or helpers.memoryIsMoreSalient(memory, salient.?)) salient = memory;
+    }
+    const salient_text = if (salient) |memory| try memoryOneLineSummary(self, memory) else "none yet";
+    const memory_status = if (can_read_memory)
+        try std.fmt.allocPrint(self.allocator, "{d} long-term, {d} short-term, {d} recent summaries", .{ long_count, short_count, summaries.len })
+    else
+        try std.fmt.allocPrint(self.allocator, "unavailable: {s}", .{try capabilityUnavailableReason(self, .stored_memory_read)});
+    return std.fmt.allocPrint(
+        self.allocator,
+        "introspection memory:\n- memory: {s}\n- memory_score_total: {d}\n- memory_access_total: {d}\n- salient_memory: {s}\n",
+        .{ memory_status, score_total, access_total, salient_text },
+    );
+}
+
+fn introspectFacts(self: *Brain) ![]const u8 {
+    const self_facts = try selfFactsSummary(self);
+    return std.fmt.allocPrint(self.allocator, "introspection facts:\n{s}", .{self_facts});
+}
+
+fn introspectNeeds(self: *Brain) ![]const u8 {
+    const needs_status = try activeNeedsSummary(self);
+    return std.fmt.allocPrint(self.allocator, "introspection needs:\n{s}", .{needs_status});
+}
+
+fn introspectCapabilities(self: *Brain) ![]const u8 {
+    const capabilities = try capabilityCatalog(self);
+    return std.fmt.allocPrint(self.allocator, "introspection capabilities:\n{s}", .{capabilities});
+}
+
+fn introspectSenses(self: *Brain) ![]const u8 {
+    const senses = try sensesSummary(self);
+    return std.fmt.allocPrint(self.allocator, "introspection senses:\n- senses: {s}\n", .{senses});
+}
+
+fn introspectAutonomy(self: *Brain) ![]const u8 {
+    const autonomy_status = try brain_autonomy.autonomyIntrospection(self);
+    return std.fmt.allocPrint(self.allocator, "introspection autonomy:\n{s}", .{autonomy_status});
+}
+
+fn introspectFocus(self: *Brain) ![]const u8 {
+    const focus_status = try focusStatusSummary(self);
+    return std.fmt.allocPrint(self.allocator, "introspection focus:\n- focus: {s}\n", .{focus_status});
+}
+
+fn introspectIdentity(self: *Brain) ![]const u8 {
+    const can_read_memory = capabilityAvailable(self, .stored_memory_read);
+    const memories = if (can_read_memory) try self.deps.store.loadMemoryRecords(self.allocator) else &[_]schema.MemoryRecord{};
+    const flexible_identity_status = try flexibleIdentitySummary(self, memories);
+    return std.fmt.allocPrint(self.allocator, "introspection identity:\n{s}", .{flexible_identity_status});
+}
+
+fn countActiveFacts(self: *Brain) !usize {
+    const records = try self.deps.store.loadFactRecords(self.allocator);
+    var count: usize = 0;
+    for (records) |record| {
+        if (record.active) count += 1;
+    }
+    return count;
+}
+
+fn countActiveNeeds(self: *Brain) !usize {
+    const summaries = try self.deps.store.loadConversationSummaries(self.allocator);
+    const memories = try self.deps.store.loadMemoryRecords(self.allocator);
+    const power = try self.deps.system_senses.power(self.allocator);
+    const autonomy_state = try brain_autonomy.autonomyStateForNeeds(self);
+    const active_needs = try needs_mod.evaluate(self.allocator, .{
+        .now_seconds = self.now_seconds,
+        .conversation_summaries = summaries,
+        .memory_records = memories,
+        .relationship_graph = try self.deps.graph.summary(self.allocator, 8),
+        .power = power,
+        .autonomy_control_capacity = if (autonomy_state) |state| state.control_capacity else null,
+        .autonomy_max_capacity = if (autonomy_state) |state| state.max_capacity else self.cfg.autonomy_full_max_capacity,
+        .autonomy_sleeping = if (autonomy_state) |state| state.sleeping else null,
+    });
+    defer needs_mod.freeNeeds(self.allocator, active_needs);
+    return active_needs.len;
+}
+
+const CapabilityCounts = struct {
+    available: usize,
+    unavailable: usize,
+};
+
+fn capabilityAvailabilityCounts(self: *Brain) !CapabilityCounts {
+    var counts = CapabilityCounts{ .available = 0, .unavailable = 0 };
+    inline for (@typeInfo(chat_mod.Capability).@"enum".fields) |field| {
+        const capability: chat_mod.Capability = @field(chat_mod.Capability, field.name);
+        if (capabilityAvailable(self, capability)) {
+            counts.available += 1;
+        } else {
+            counts.unavailable += 1;
+        }
+    }
+    return counts;
+}
+
+fn autonomyOverviewLine(self: *Brain) ![]const u8 {
+    const state = try brain_autonomy.autonomyStateForNeeds(self);
+    if (state) |value| {
+        return std.fmt.allocPrint(self.allocator, "mode={s} control={d:.2}/{d:.2} sleeping={any}", .{
+            self.cfg.autonomy_mode,
+            value.control_capacity,
+            value.max_capacity,
+            value.sleeping,
+        });
+    }
+    return std.fmt.allocPrint(self.allocator, "mode={s} state=unavailable", .{self.cfg.autonomy_mode});
 }
 
 /// One-line view of working memory for the introspect summary.
@@ -198,8 +344,16 @@ pub fn affordanceObservation(self: *Brain) ![]const u8 {
 }
 
 pub fn appendAffordanceObservation(self: *Brain, out: *std.ArrayList(u8)) !void {
+    try appendLlmPolicyObservation(self, out);
     try out.appendSlice(self.allocator, "Current skill availability:\n");
     try appendAffordanceCatalog(self, out);
+}
+
+pub fn appendLlmPolicyObservation(self: *Brain, out: *std.ArrayList(u8)) !void {
+    const quality = llm_routing.LlmQuality.parse(self.cfg.llm_quality) catch .auto;
+    const policy = try llm_routing.formatLlmPolicyObservation(self.allocator, quality, self.last_conversation_effort_tier);
+    defer self.allocator.free(policy);
+    try out.appendSlice(self.allocator, policy);
 }
 
 pub fn affordanceCatalog(self: *Brain) ![]const u8 {
@@ -209,35 +363,39 @@ pub fn affordanceCatalog(self: *Brain) ![]const u8 {
 }
 
 pub fn appendAffordanceCatalog(self: *Brain, out: *std.ArrayList(u8)) !void {
+    try skill_tree.appendConversationSummary(self.allocator, out, skillAvailabilityContext(self));
+}
+
+pub fn appendAffordanceCatalogFull(self: *Brain, out: *std.ArrayList(u8)) !void {
     try out.appendSlice(self.allocator, "callable:\n");
-    inline for (@typeInfo(chat_mod.ChatCommandType).@"enum".fields) |field| {
-        const command: chat_mod.ChatCommandType = @field(chat_mod.ChatCommandType, field.name);
-        if (chat_mod.commandSpec(command)) |spec| {
-            if (commandIsAvailable(self, command)) {
-                try out.print(self.allocator, "- {s}: {s}\n", .{ skills_mod.name(command), spec.description });
+    inline for (@typeInfo(chat_mod.ActionProposalType).@"enum".fields) |field| {
+        const action: chat_mod.ActionProposalType = @field(chat_mod.ActionProposalType, field.name);
+        if (chat_mod.actionSpec(action)) |spec| {
+            if (actionIsAvailable(self, action)) {
+                try out.print(self.allocator, "- {s}: {s}\n", .{ skills_mod.name(action), spec.description });
             }
         }
     }
 }
 
-pub fn commandUnavailableReason(self: *Brain, command: chat_mod.ChatCommandType) !?[]const u8 {
-    var visiting = [_]bool{false} ** @typeInfo(chat_mod.ChatCommandType).@"enum".fields.len;
-    return skillUnavailableReason(self, command, &visiting);
+pub fn actionUnavailableReason(self: *Brain, action: chat_mod.ActionProposalType) !?[]const u8 {
+    var visiting = [_]bool{false} ** @typeInfo(chat_mod.ActionProposalType).@"enum".fields.len;
+    return skillUnavailableReason(self, action, &visiting);
 }
 
-pub fn commandIsAvailable(self: *Brain, command: chat_mod.ChatCommandType) bool {
-    var visiting = [_]bool{false} ** @typeInfo(chat_mod.ChatCommandType).@"enum".fields.len;
-    return skillIsAvailable(self, command, &visiting);
+pub fn actionIsAvailable(self: *Brain, action: chat_mod.ActionProposalType) bool {
+    var visiting = [_]bool{false} ** @typeInfo(chat_mod.ActionProposalType).@"enum".fields.len;
+    return skillIsAvailable(self, action, &visiting);
 }
 
-pub fn skillIsAvailable(self: *Brain, command: chat_mod.ChatCommandType, visiting: *[@typeInfo(chat_mod.ChatCommandType).@"enum".fields.len]bool) bool {
-    const spec = skills_mod.spec(command) orelse return false;
-    const index = @intFromEnum(command);
+pub fn skillIsAvailable(self: *Brain, action: chat_mod.ActionProposalType, visiting: *[@typeInfo(chat_mod.ActionProposalType).@"enum".fields.len]bool) bool {
+    const spec = skills_mod.spec(action) orelse return false;
+    const index = @intFromEnum(action);
     if (visiting[index]) return false;
     visiting[index] = true;
     defer visiting[index] = false;
 
-    if (command == .describe_image) {
+    if (action == .describe_image) {
         if (!senseAvailable(self, .visual_description)) return false;
         if (!senseAvailable(self, .live_camera) and !senseAvailable(self, .stored_image_read)) return false;
     } else {
@@ -251,14 +409,15 @@ pub fn skillIsAvailable(self: *Brain, command: chat_mod.ChatCommandType, visitin
     return true;
 }
 
-pub fn skillUnavailableReason(self: *Brain, command: chat_mod.ChatCommandType, visiting: *[@typeInfo(chat_mod.ChatCommandType).@"enum".fields.len]bool) !?[]const u8 {
-    const spec = skills_mod.spec(command) orelse return "unknown skill";
-    const index = @intFromEnum(command);
+pub fn skillUnavailableReason(self: *Brain, action: chat_mod.ActionProposalType, visiting: *[@typeInfo(chat_mod.ActionProposalType).@"enum".fields.len]bool) !?[]const u8 {
+    if (action == .unknown) return "unknown skill";
+    const spec = skills_mod.spec(action) orelse return "unknown skill";
+    const index = @intFromEnum(action);
     if (visiting[index]) return error.CyclicSkillDependency;
     visiting[index] = true;
     defer visiting[index] = false;
 
-    if (command == .describe_image) {
+    if (action == .describe_image) {
         if (!senseAvailable(self, .visual_description)) return try capabilityUnavailableReason(self, .visual_description);
         if (!senseAvailable(self, .live_camera) and !senseAvailable(self, .stored_image_read)) return "no live camera or uploaded image is available for this body";
     } else {
@@ -279,6 +438,20 @@ pub fn capabilityAvailable(self: *Brain, capability: chat_mod.Capability) bool {
 }
 
 pub fn senseAvailable(self: *Brain, capability: chat_mod.Capability) bool {
+    const capability_id = @tagName(capability);
+    const statuses = self.deps.store.loadCapabilityStatuses(self.allocator) catch return depsSenseAvailable(self, capability);
+    if (statuses.len > 0) {
+        for (statuses) |status| {
+            const canonical = capability_registry.canonicalId(status.capability_id);
+            if (!std.mem.eql(u8, canonical, capability_id) and !std.mem.eql(u8, status.capability_id, capability_id)) continue;
+            return status.availability == .available or status.availability == .degraded;
+        }
+        return depsSenseAvailable(self, capability);
+    }
+    return depsSenseAvailable(self, capability);
+}
+
+fn depsSenseAvailable(self: *Brain, capability: chat_mod.Capability) bool {
     if (!self.deps.capabilities.has(capability)) return false;
     return switch (capability) {
         .stored_image_read => self.last_visual_observation_path != null,
@@ -463,7 +636,12 @@ fn totalDatabaseBytes(database: system_senses_mod.DatabaseSnapshot) u64 {
 
 pub fn selfFactsSummary(self: *Brain) ![]const u8 {
     const records = try self.deps.store.loadFactRecords(self.allocator);
-    return facts.formatSummary(self.allocator, records, self.now_seconds);
+    return facts.formatSummary(self.allocator, records, self.now_seconds, null);
+}
+
+pub fn selfFactsConversationSummary(self: *Brain) ![]const u8 {
+    const records = try self.deps.store.loadFactRecords(self.allocator);
+    return facts.formatSummary(self.allocator, records, self.now_seconds, facts.conversation_self_facts_max_bytes);
 }
 
 pub fn activeNeedsSummary(self: *Brain) ![]const u8 {
@@ -477,8 +655,8 @@ pub fn activeNeedsSummary(self: *Brain) ![]const u8 {
         .memory_records = memories,
         .relationship_graph = try self.deps.graph.summary(self.allocator, 8),
         .power = power,
-        .autonomy_energy_remaining = if (autonomy_state) |state| state.energy_remaining else null,
-        .autonomy_daily_energy = self.cfg.autonomy_daily_energy,
+        .autonomy_control_capacity = if (autonomy_state) |state| state.control_capacity else null,
+        .autonomy_max_capacity = if (autonomy_state) |state| state.max_capacity else self.cfg.autonomy_full_max_capacity,
         .autonomy_sleeping = if (autonomy_state) |state| state.sleeping else null,
     });
     return needs_mod.formatNeeds(self.allocator, active_needs);

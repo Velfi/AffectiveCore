@@ -7,9 +7,9 @@ const config_mod = @import("../core/config.zig");
 const chat = @import("../api/chat_client.zig");
 const input_mod = @import("../platform/common/input.zig");
 
-pub const CommandInfo = brain_types.CommandInfo;
-pub const CommandResult = brain_types.CommandResult;
-pub const ConversationTurnResult = brain_types.ConversationTurnResult;
+pub const CapabilityInfo = brain_types.CapabilityInfo;
+pub const ActionExecutionResult = brain_types.ActionExecutionResult;
+pub const UserTextOutcome = brain_types.UserTextOutcome;
 
 pub const BrainHandle = struct {
     brain_id: []const u8,
@@ -37,25 +37,25 @@ pub const AppCore = struct {
         return self.findBrain(brain_id) orelse error.UnknownBrainId;
     }
 
-    pub fn executeCommand(self: *AppCore, brain_id: []const u8, command: chat.ChatCommand) !CommandResult {
+    pub fn executeActionProposal(self: *AppCore, brain_id: []const u8, proposal: chat.ActionProposal) !ActionExecutionResult {
         const brain = try self.requireBrain(brain_id);
-        return executeBrainCommand(self.allocator, brain, command);
+        return executeBrainActionProposal(self.allocator, brain, proposal);
     }
 
-    pub fn conversationTurn(self: *AppCore, brain_id: []const u8, text: []const u8) !ConversationTurnResult {
+    pub fn userText(self: *AppCore, brain_id: []const u8, text: []const u8) !UserTextOutcome {
         const brain = try self.requireBrain(brain_id);
-        return conversationBrainTurn(brain, try input_mod.HeardSpeech.typed(self.allocator, text));
+        return handleUserText(brain, try input_mod.HeardSpeech.typed(self.allocator, text), .{});
     }
 
-    pub fn availableCommands(self: *AppCore, brain_id: []const u8) ![]CommandInfo {
+    pub fn availableCapabilities(self: *AppCore, brain_id: []const u8) ![]CapabilityInfo {
         const brain = try self.requireBrain(brain_id);
-        return availableBrainCommands(self.allocator, brain);
+        return availableBrainCapabilities(self.allocator, brain);
     }
 
     pub fn configureBrain(self: *AppCore, brain_id: []const u8, settings: config_mod.BrainSettings) !void {
         const brain = try self.requireBrain(brain_id);
         if (settings.brain_id.len > 0 and !std.mem.eql(u8, settings.brain_id, brain.cfg.brain_id)) return error.BrainSettingsIdMismatch;
-        brain.cfg = brain.cfg.withBrainSettings(settings);
+        brain.cfg = try brain.cfg.withBrainSettings(settings);
     }
 
     pub fn brainSettings(self: *AppCore, brain_id: []const u8) !config_mod.BrainSettings {
@@ -90,24 +90,24 @@ pub const AppCore = struct {
     }
 };
 
-pub fn executeBrainCommand(
+pub fn executeBrainActionProposal(
     allocator: std.mem.Allocator,
     brain: *brain_mod.Brain,
-    command: chat.ChatCommand,
-) !CommandResult {
-    var commands = [_]chat.ChatCommand{command};
-    return executeBrainCommands(allocator, brain, commands[0..]);
+    proposal: chat.ActionProposal,
+) !ActionExecutionResult {
+    var proposals = [_]chat.ActionProposal{proposal};
+    return executeBrainActionProposals(allocator, brain, proposals[0..]);
 }
 
-pub fn executeBrainCommands(
+pub fn executeBrainActionProposals(
     allocator: std.mem.Allocator,
     brain: *brain_mod.Brain,
-    commands: []chat.ChatCommand,
-) !CommandResult {
+    proposals: []chat.ActionProposal,
+) !ActionExecutionResult {
     var observations = std.ArrayList(u8).empty;
-    const result = try brain.executeCommands(commands, &observations);
+    const result = try brain.executeActionProposals(proposals, &observations);
     return .{
-        .command = if (commands.len > 0) commands[commands.len - 1].command else .unknown,
+        .action = if (proposals.len > 0) proposals[proposals.len - 1].action else .unknown,
         .observation = try observations.toOwnedSlice(allocator),
         .spoken_text = result.spoken_text,
         .ended_with_speech = result.ended_with_speech,
@@ -115,18 +115,18 @@ pub fn executeBrainCommands(
     };
 }
 
-pub fn availableBrainCommands(
+pub fn availableBrainCapabilities(
     allocator: std.mem.Allocator,
     brain: *brain_mod.Brain,
-) ![]CommandInfo {
-    var out = std.ArrayList(CommandInfo).empty;
-    inline for (@typeInfo(chat.ChatCommandType).@"enum".fields) |field| {
-        const command: chat.ChatCommandType = @field(chat.ChatCommandType, field.name);
-        if (chat.commandSpec(command)) |spec| {
-            const available = try brain.commandIsCallable(command);
+) ![]CapabilityInfo {
+    var out = std.ArrayList(CapabilityInfo).empty;
+    inline for (@typeInfo(chat.ActionProposalType).@"enum".fields) |field| {
+        const action: chat.ActionProposalType = @field(chat.ActionProposalType, field.name);
+        if (chat.actionSpec(action)) |spec| {
+            const available = try brain.actionIsCallable(action);
             try out.append(allocator, .{
-                .command = command,
-                .name = chat.skills.name(command),
+                .capability = action,
+                .name = chat.skills.name(action),
                 .description = spec.description,
                 .available = available,
             });
@@ -135,16 +135,24 @@ pub fn availableBrainCommands(
     return out.toOwnedSlice(allocator);
 }
 
-pub fn conversationBrainTurn(brain: *brain_mod.Brain, heard_speech: brain_mod.HeardSpeech) !ConversationTurnResult {
-    return conversationResult(try brain.handleConversationText(heard_speech));
+pub fn handleUserText(brain: *brain_mod.Brain, heard_speech: brain_mod.HeardSpeech, dispatch: brain_mod.StimulusDispatch) !UserTextOutcome {
+    return userTextOutcome(try brain.handleConversationText(heard_speech, dispatch));
 }
 
-pub fn conversationResult(result: brain_mod.ConversationTurnResult) ConversationTurnResult {
+pub fn userTextOutcome(result: brain_mod.ConversationTurnResult) UserTextOutcome {
     return .{
-        .user_text = result.user_text,
+        .text = result.user_text,
         .spoken_text = result.spoken_text,
         .user_summary = result.user_summary,
         .brain_summary = result.brain_summary,
+        .dispatch_id = result.dispatch_id,
         .interrupted_by = if (result.interrupted_by) |stimulus| @tagName(stimulus.kind) else null,
+        .awaiting_host_sense = result.awaiting_host_sense,
+        .activity_id = result.activity_id,
+        .activity_kind = result.activity_kind,
+        .activity_kind_label = result.activity_kind_label,
+        .activity_state = result.activity_state,
+        .activity_goal = result.activity_goal,
+        .activity_awaiting = result.activity_awaiting,
     };
 }

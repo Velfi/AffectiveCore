@@ -1,4 +1,4 @@
-pub const CommandInfo = @import("app_core.zig").CommandInfo;
-pub const CommandResult = @import("app_core.zig").CommandResult;
-pub const ConversationTurnResult = @import("app_core.zig").ConversationTurnResult;
+pub const CapabilityInfo = @import("app_core.zig").CapabilityInfo;
+pub const ActionExecutionResult = @import("app_core.zig").ActionExecutionResult;
+pub const UserTextOutcome = @import("app_core.zig").UserTextOutcome;
 pub const Brain = @import("../core/brain.zig").Brain;

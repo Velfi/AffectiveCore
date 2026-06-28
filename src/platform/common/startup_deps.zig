@@ -1,4 +1,5 @@
 const std = @import("std");
+const config_mod = @import("../../core/config.zig");
 
 pub fn checkMacos(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, cfg: config_mod.Config) !void {
     if (std.mem.eql(u8, cfg.activation_mode, "webview")) {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("random_provider_client.zig");
 const openai = @import("../core/port_openai.zig");
+const llm_tester_scenario = @import("../harness/llm_tester/scenario.zig");
 
 const IdentityComparison = openai.IdentityComparison;
 const IdentityComparisonService = openai.IdentityComparisonService;
@@ -43,6 +44,8 @@ pub const RandomProviderIdentityComparisonService = struct {
             \\Do not infer or use race, ethnicity, gender identity, age, health, disability, attractiveness, emotion, or socioeconomic status.
             \\Return only JSON with keys: same_person, confidence, reason.
             \\confidence must be a number from 0 to 1.
+            \\Calibrate confidence: same outfit on a different day may warrant moderate confidence; clear mismatches in clothing or accessories warrant low confidence and same_person=false.
+            \\Return only valid JSON. No markdown, code fences, or prose outside the object.
         ;
         const user_prompt = try std.fmt.allocPrint(
             allocator,
@@ -84,6 +87,41 @@ fn parseIdentityComparison(allocator: std.mem.Allocator, body: []const u8) !Iden
 fn validateIdentityComparison(allocator: std.mem.Allocator, content: []const u8) !void {
     const comparison = try parseIdentityComparison(allocator, content);
     allocator.free(comparison.reason);
+}
+
+pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.Scenario {
+    const system_prompt =
+        \\Compare two non-sensitive visual descriptions of people for household robot identity recognition.
+        \\Use only visible non-sensitive appearance details such as clothing, accessories, carried items, hair/clothing changes, and posture.
+        \\Do not infer or use race, ethnicity, gender identity, age, health, disability, attractiveness, emotion, or socioeconomic status.
+        \\Return only JSON with keys: same_person, confidence, reason.
+        \\confidence must be a number from 0 to 1.
+        \\Calibrate confidence: same outfit on a different day may warrant moderate confidence; clear mismatches in clothing or accessories warrant low confidence and same_person=false.
+        \\Return only valid JSON. No markdown, code fences, or prose outside the object.
+    ;
+    const current = "dark hoodie, glasses, carrying a notebook, short hair";
+    const stored = "dark hoodie, glasses, holding a coffee mug, short hair";
+    const user_prompt = try std.fmt.allocPrint(
+        allocator,
+        "Current description:\n{s}\n\nStored description:\n{s}",
+        .{ current, stored },
+    );
+    const scenario = try llm_tester_scenario.Scenario.init(
+        allocator,
+        "identity_comparison_outfit_change",
+        "Compare current and stored visual descriptions",
+        "Tests calibrated same-person judgment when clothing and held items differ slightly between current and stored non-sensitive visual descriptions.",
+        "identity_comparison",
+        system_prompt,
+        user_prompt,
+        .json_object,
+        identityComparisonJsonSchema(),
+        256,
+        0,
+    );
+    const out = try allocator.alloc(llm_tester_scenario.Scenario, 1);
+    out[0] = scenario;
+    return out;
 }
 
 fn identityComparisonJsonSchema() []const u8 {

@@ -10,7 +10,7 @@ The main conversational loop is `handleConversationTurn` in `src/core/brain.zig`
 
 1. Reads user input.
 2. Stores the utterance as an experience, impression, and appraisal.
-3. Optionally identifies the current speaker with the camera and recognizer.
+3. Scores the speech stimulus using any cached speaker context (no automatic camera capture).
 4. Builds a sectioned first-pass prompt from compact memory, user input, and observations.
 5. Calls the chat service.
 6. Receives JSON commands from the language mind.
@@ -59,11 +59,11 @@ world/body senses
   -> cognition again
 ```
 
-## Face Memory Path
+## Touch and Face Memory Path
 
-The face-memory path is the more direct embodied path. A button activation calls `handleFaceMemoryActivation`: capture image, recognize identity, branch into known/unknown/uncertain handling, update person memory, sightings, and graph, then speak.
+A short touch calls `handleFaceMemoryActivation`, which records a touch stimulus and may react to salient sense pressure. It does not automatically capture or recognize a face. When the language mind needs visual identity, it uses the `recognize` skill (or `recognizeFromCapturedPath` when a frame is already available).
 
-Conversation uses a softer version of the same thing: it recognizes the speaker when needed and inserts a `Current speaker recognition...` line into the chat memory context.
+Cached speaker context, when present, feeds `assignSpeechStimulus` continuity scoring; recognition observations use `conversationSpeakerLine` formatting when the `recognize` skill runs.
 
 ## Short Version
 

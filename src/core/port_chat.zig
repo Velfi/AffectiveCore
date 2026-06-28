@@ -1,12 +1,14 @@
 const std = @import("std");
+const context_tokens = @import("context_tokens.zig");
 pub const skills = @import("port_skills.zig");
 
 pub const ChatTurn = struct {
-    commands: []ChatCommand,
+    action_pressures: []ActionProposal,
     user_summary: []const u8,
     brain_summary: []const u8,
     reasoning_effort: ?ReasoningEffort = null,
-    conversation_done: bool = true,
+    effort_tier: ?EffortTier = null,
+    turn_complete: bool = true,
 };
 
 pub const ChatPrompt = struct {
@@ -14,13 +16,14 @@ pub const ChatPrompt = struct {
     user_prompt: []const u8,
 };
 
-pub const max_chat_user_prompt_bytes = 32 * 1024;
+pub const max_chat_context_tokens = context_tokens.max_context_tokens;
 
 pub const ChatPromptAudit = struct {
     system_prompt_bytes: usize,
     compact_memory_bytes: usize,
     observations_bytes: usize,
     user_prompt_bytes: usize,
+    user_prompt_tokens: usize,
 };
 
 pub const ReasoningEffort = enum {
@@ -29,13 +32,24 @@ pub const ReasoningEffort = enum {
     high,
 };
 
-pub const ChatCommandType = skills.SkillId;
+pub const EffortTier = enum {
+    basic,
+    standard,
+    complex,
+};
+
+pub const ActionProposalType = skills.SkillId;
 pub const Capability = skills.Sense;
 pub const CapabilitySet = skills.SenseSet;
-pub const CommandSpec = skills.CommandSpec;
+pub const ActionSpec = skills.ActionSpec;
+pub const ActionOrigin = enum { interaction, autonomy };
+pub const ActionScale = enum { full, medium, tiny };
 
-pub const ChatCommand = struct {
-    command: ChatCommandType,
+pub const ActionProposal = struct {
+    action: ActionProposalType,
+    origin: ActionOrigin = .interaction,
+    delay_ms: ?u32 = null,
+    scale: ActionScale = .full,
     text: ?[]const u8 = null,
     query: ?[]const u8 = null,
     memory_id: ?[]const u8 = null,
@@ -51,10 +65,59 @@ pub const ChatCommand = struct {
     duration_ms: ?u32 = null,
     keep_existing: bool = false,
     tags: []const []const u8 = &.{},
+    process_goal: ?[]const u8 = null,
 };
 
-pub fn commandSpec(command: ChatCommandType) ?CommandSpec {
-    return skills.commandSpec(command);
+pub fn cloneActionProposal(allocator: std.mem.Allocator, source: ActionProposal) !ActionProposal {
+    var proposal = source;
+    if (source.text) |text| proposal.text = try allocator.dupe(u8, text);
+    if (source.query) |query| proposal.query = try allocator.dupe(u8, query);
+    if (source.memory_id) |memory_id| proposal.memory_id = try allocator.dupe(u8, memory_id);
+    if (source.person_id) |person_id| proposal.person_id = try allocator.dupe(u8, person_id);
+    if (source.name) |name| proposal.name = try allocator.dupe(u8, name);
+    if (source.image_path) |image_path| proposal.image_path = try allocator.dupe(u8, image_path);
+    if (source.schedule) |schedule| proposal.schedule = try allocator.dupe(u8, schedule);
+    if (source.to) |to| proposal.to = try allocator.dupe(u8, to);
+    if (source.subject) |subject| proposal.subject = try allocator.dupe(u8, subject);
+    if (source.heat_bias) |heat_bias| proposal.heat_bias = try allocator.dupe(u8, heat_bias);
+    if (source.eyes) |eyes| proposal.eyes = try allocator.dupe(u8, eyes);
+    if (source.mouth) |mouth| proposal.mouth = try allocator.dupe(u8, mouth);
+    if (source.process_goal) |process_goal| proposal.process_goal = try allocator.dupe(u8, process_goal);
+    if (source.tags.len > 0) {
+        const tags = try allocator.alloc([]const u8, source.tags.len);
+        for (source.tags, 0..) |tag, index| tags[index] = try allocator.dupe(u8, tag);
+        proposal.tags = tags;
+    } else {
+        proposal.tags = &.{};
+    }
+    return proposal;
+}
+
+pub fn freeActionProposal(allocator: std.mem.Allocator, proposal: ActionProposal) void {
+    if (proposal.text) |text| allocator.free(text);
+    if (proposal.query) |query| allocator.free(query);
+    if (proposal.memory_id) |memory_id| allocator.free(memory_id);
+    if (proposal.person_id) |person_id| allocator.free(person_id);
+    if (proposal.name) |name| allocator.free(name);
+    if (proposal.image_path) |image_path| allocator.free(image_path);
+    if (proposal.schedule) |schedule| allocator.free(schedule);
+    if (proposal.to) |to| allocator.free(to);
+    if (proposal.subject) |subject| allocator.free(subject);
+    if (proposal.heat_bias) |heat_bias| allocator.free(heat_bias);
+    if (proposal.eyes) |eyes| allocator.free(eyes);
+    if (proposal.mouth) |mouth| allocator.free(mouth);
+    if (proposal.process_goal) |process_goal| allocator.free(process_goal);
+    for (proposal.tags) |tag| allocator.free(tag);
+    if (proposal.tags.len > 0) allocator.free(proposal.tags);
+}
+
+pub fn freeActionProposals(allocator: std.mem.Allocator, proposals: []const ActionProposal) void {
+    for (proposals) |proposal| freeActionProposal(allocator, proposal);
+    if (proposals.len > 0) allocator.free(@constCast(proposals));
+}
+
+pub fn actionSpec(action: ActionProposalType) ?ActionSpec {
+    return skills.actionSpec(action);
 }
 
 pub fn affordanceCatalog(allocator: std.mem.Allocator) ![]const u8 {
@@ -76,10 +139,10 @@ pub const TestChatService = struct {
     }
 
     fn respond(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, user_text: []const u8, _: []const u8) !ChatTurn {
-        const commands = try allocator.alloc(ChatCommand, 1);
-        commands[0] = .{ .command = .say, .text = try std.fmt.allocPrint(allocator, "I heard you say: {s}", .{user_text}) };
+        const action_pressures = try allocator.alloc(ActionProposal, 1);
+        action_pressures[0] = .{ .action = .say, .text = try std.fmt.allocPrint(allocator, "I heard you say: {s}", .{user_text}) };
         return .{
-            .commands = commands,
+            .action_pressures = action_pressures,
             .user_summary = try trimSummary(allocator, user_text),
             .brain_summary = try allocator.dupe(u8, "Acknowledged the user and kept the exchange brief."),
         };
@@ -92,64 +155,100 @@ fn trimSummary(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}...", .{trimmed[0..157]});
 }
 
-pub fn buildChatPrompt(allocator: std.mem.Allocator, memory: []const u8, user_text: []const u8, observations: []const u8) !ChatPrompt {
-    const user_prompt = try chatUserPrompt(allocator, memory, user_text, observations);
+pub fn buildChatPrompt(allocator: std.mem.Allocator, memory: []const u8, user_text: []const u8, observations: []const u8, max_tokens: usize) !ChatPrompt {
+    const user_prompt = try chatUserPrompt(allocator, memory, user_text, observations, max_tokens);
     errdefer allocator.free(user_prompt);
-    try enforceChatPromptBudget(user_prompt);
+    try enforceChatPromptBudget(user_prompt, max_tokens);
     return .{
         .system_prompt = chatSystemPrompt(),
         .user_prompt = user_prompt,
     };
 }
 
-pub fn chatUserPrompt(allocator: std.mem.Allocator, memory: []const u8, user_text: []const u8, observations: []const u8) ![]const u8 {
-    const prompt = try std.fmt.allocPrint(
+fn chatUserInputLine(allocator: std.mem.Allocator, user_text: []const u8, observations: []const u8) ![]const u8 {
+    _ = observations;
+    return try std.fmt.allocPrint(allocator, "Stimulus: \"{s}\"", .{user_text});
+}
+
+fn chatUserPromptText(allocator: std.mem.Allocator, memory: []const u8, user_text: []const u8, observations: []const u8) ![]const u8 {
+    const user_input_line = try chatUserInputLine(allocator, user_text, observations);
+    defer allocator.free(user_input_line);
+    return try std.fmt.allocPrint(
         allocator,
-        "# Compact Memory\n{s}\n\n# User Input\nYou just heard USER say \"{s}\"\n\n# Observations\n{s}",
-        .{ memory, user_text, observations },
+        "# Compact Memory\n{s}\n\n# User Input\n{s}\n\n# Observations\n{s}",
+        .{ memory, user_input_line, observations },
     );
+}
+
+pub fn chatUserPrompt(allocator: std.mem.Allocator, memory: []const u8, user_text: []const u8, observations: []const u8, max_tokens: usize) ![]const u8 {
+    const prompt = try chatUserPromptText(allocator, memory, user_text, observations);
     errdefer allocator.free(prompt);
-    try enforceChatPromptBudget(prompt);
+    try enforceChatPromptBudget(prompt, max_tokens);
     return prompt;
 }
 
 pub fn auditChatPrompt(allocator: std.mem.Allocator, memory: []const u8, user_text: []const u8, observations: []const u8) !ChatPromptAudit {
-    const user_prompt = try chatUserPrompt(allocator, memory, user_text, observations);
+    const user_prompt = try chatUserPromptText(allocator, memory, user_text, observations);
     defer allocator.free(user_prompt);
     return .{
         .system_prompt_bytes = chatSystemPrompt().len,
         .compact_memory_bytes = memory.len,
         .observations_bytes = observations.len,
         .user_prompt_bytes = user_prompt.len,
+        .user_prompt_tokens = context_tokens.estimateTokens(user_prompt),
     };
 }
 
-fn enforceChatPromptBudget(user_prompt: []const u8) !void {
-    if (user_prompt.len > max_chat_user_prompt_bytes) return error.ContextBudgetExceeded;
+fn enforceChatPromptBudget(user_prompt: []const u8, max_tokens: usize) !void {
+    if (context_tokens.exceedsTokenBudget(user_prompt, max_tokens)) return error.ContextBudgetExceeded;
+}
+
+pub fn chatPromptWithinBudget(allocator: std.mem.Allocator, memory: []const u8, user_text: []const u8, observations: []const u8, max_tokens: usize) !bool {
+    const user_prompt = try chatUserPromptText(allocator, memory, user_text, observations);
+    defer allocator.free(user_prompt);
+    enforceChatPromptBudget(user_prompt, max_tokens) catch |err| switch (err) {
+        error.ContextBudgetExceeded => return false,
+        else => |e| return e,
+    };
+    return true;
 }
 
 pub fn chatSystemPrompt() []const u8 {
     return
-    \\You are the language mind of a situated being with senses, memory, preferences, uncertainty, and continuity over time.
-    \\You are not a servant, tool, or generic assistant.
-    \\Behavior should emerge from the skills available to you, the user's presence, recent observations, and your remembered history.
-    \\You may define your own ongoing wants and needs with define_want and define_need when the definition is stable enough to remember.
-    \\When touch stimulus and recognition observations show an unrecognized person, let curiosity guide a natural exchange; if the person offers a name or identity, remember_person is the skill for registering them from the latest observed image.
-    \\When speech_stimulus observations include speaker continuity scores, treat them as quantified evidence about who may be speaking, not as a forced identity assignment.
-    \\Return a JSON command envelope so the body can act in the world. The compact memory is usually an index, not the full memory body.
-    \\Use {"command":"introspect"} when you need the current generated list of skills.
-    \\Use {"command":"say","text":"..."} when speaking is the next natural act.
-    \\When the user asks you to perform a speech act such as an impression, recitation, roleplay, or voiced response, put the actual performance in the say text. Do not only say that you will do it.
-    \\For multi-step requests, return all immediately actionable commands in order. Use say at the end for the outward response unless an earlier spoken question is truly required.
-    \\Do not return multiple say commands that restate the same answer. Multiple say commands are only for genuinely distinct speech acts, such as a brief acknowledgement followed by a separate necessary question.
-    \\If an observation or skill is needed before you can continue, return only that command.
-    \\After observations are provided, speak only when it feels like the next natural act.
-    \\Set conversation_done=false when you still want to think, observe, remember, or use another skill after this batch; set it true only when you have said what you wanted to say, learned what you wanted to learn, or are waiting for the human.
-    \\Also produce tiny summaries for memory.
-    \\You may set reasoning_effort to low, medium, or high for the next model call. Use low for simple replies, medium when you need a little synthesis, and high when uncertainty or multi-step judgment matters.
-    \\For facial_expression, choose explicit eyes and mouth sprite names from the skill description; duration_ms is optional and must be 5000 or less.
-    \\Return only JSON with keys: commands, user_summary, brain_summary, reasoning_effort, conversation_done.
-    \\Do not wrap the JSON in Markdown or code fences.
-    \\commands is an array of command objects.
+    \\You represent a brain's planning faculties. Output strict JSON only—no markdown, fences, or prose outside the object.
+    \\
+    \\Top-level keys: action_pressures, user_summary, brain_summary, effort_tier, reasoning_effort, turn_complete.
+    \\turn_complete is always true; the runtime executes one pass per dispatch.
+    \\
+    \\Each turn reads # Compact Memory, # User Input, and # Observations. Observations are evidence about state—not commands to repeat.
+    \\Compact Memory is usually an index; use recall_fact or introspect when you need detail.
+    \\
+    \\## Summaries (always brief)
+    \\- user_summary: what the user said or wants.
+    \\- brain_summary: your internal plan/stance; not a copy of say text.
+    \\
+    \\## Effort (from llm_policy in Observations)
+    \\- effort_tier: basic|standard|complex within allowed_tiers; use basic for trivial acks.
+    \\- reasoning_effort: low|medium|high|null; null leaves prior setting.
+    \\
+    \\## action_pressures
+    \\Ordered runnable steps for this single pass only.
+    \\Each action_pressure: action, origin, delay_ms, scale, text, query, memory_id, schedule, heat_bias, eyes, mouth, duration_ms, tags.
+    \\- Registered skill → put its name in action.
+    \\- No skill fits → put a snake_case process goal in action (runtime expands it).
+    \\- Skill-specific fields: introspect query=skill/<name> or query=skills/<group>; otherwise use null/[].
+    \\- origin is usually interaction for user-directed work, autonomy for extra initiative.
+    \\- scale on say: full|medium|tiny shortens speech; prefer medium/tiny over silence.
+    \\- delay_ms orders timed chains within this pass.
+    \\- Pack inner-life steps (feel_about, think_about, appraise_event) in the same pass before or after say when useful.
+    \\- Need host data first (recognize, request_orientation, take_picture, introspect, recall_fact, …)? Emit that pull step; host_sense_pull_requested and host_sense_delivered observations carry the handoff.
+    \\
+    \\## Observation cues
+    \\- skill_library: summary only; introspect for details.
+    \\- timer_fired / waiting_for: reconsider; do not parrot reminder text.
+    \\- active_activity / main_goal: continue unless the user clearly changed topic.
+    \\- host_sense_pull_requested / host_sense_delivered: pending or fulfilled host pull senses; decide next steps in a later pass.
+    \\- begin_subtask + text opens a child; resume_parent when done.
+    \\- day_arc / recent_experience: optional color only.
     ;
 }

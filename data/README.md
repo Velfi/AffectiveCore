@@ -4,26 +4,29 @@ Runtime config files live in this directory. The brain still accepts hardware an
 
 ## `llm_providers.json`
 
-Controls model routing for conversation and psyche calls.
+Template for per-brain LLM routing. Copy into `{brain_root}/llm_providers.json` when creating a brain (for example from `data/llm_providers.json`). Runtime loads the brain-local file; this repo copy is not read at startup.
 
 Fields:
 
 - `mode`: conversation mode. Use `random`; provider-specific modes are no longer wired into the app entrypoints.
 - `reasoning_effort`: initial conversation reasoning effort, or `auto`.
 - `psyche_reasoning_effort`: reasoning effort for psyche calls.
-- `models`: ordered provider/model roster for conversation.
+- `models`: ordered provider/model roster for conversation. Each entry may include `tier`: `basic`, `standard`, or `complex`.
 - `psyche_models`: ordered provider/model roster for autonomy psyche calls.
+
+User-facing quality tier (`frugal`, `auto`, `best`) lives in per-brain `runtime_options.json`, not in `llm_providers.json`.
 
 Each model entry has:
 
 ```json
 {
   "provider": "openai",
-  "model": "gpt-4.1-nano"
+  "model": "gpt-4.1-nano",
+  "tier": "basic"
 }
 ```
 
-Valid providers are `openai`, `anthropic`, and `google`/`gemini`. Empty provider or model entries are ignored. Invalid providers fail when the model roster is parsed for use.
+Valid providers are `openai`, `anthropic`, `google`/`gemini`, and `deepseek`. Empty provider or model entries are ignored. Invalid providers fail when the model roster is parsed for use.
 
 ## `email.json`
 
@@ -44,7 +47,7 @@ If `data/email.json` is absent, email stays unavailable. If it exists, `smtp_url
 
 ## `runtime_options.json`
 
-Runtime preferences changed from the macOS WebView Options tab are stored per brain outside the repo at `~/Library/Application Support/AffectiveCore/brains/<brain>/runtime_options.json`.
+Runtime preferences changed from the macOS dashboard or MCP `set_runtime_option` are stored per brain outside the repo at `~/Library/Application Support/AffectiveCore/brains/<brain>/runtime_options.json`. Supported fields include `llm_quality` (`frugal`, `auto`, `best`) and an optional `capacity` object (activity stack, memory selection, chat context token limits, dispatch envelope limits).
 
 ## Local State
 

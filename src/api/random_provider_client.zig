@@ -1,12 +1,13 @@
 const std = @import("std");
 const chat = @import("chat_client.zig");
 const http_transport = @import("http_transport.zig");
+const http_log = @import("http_log.zig");
+const llm_routing = @import("../core/llm_routing.zig");
+const brain_context_stats = @import("../core/brain_context_stats.zig");
 
-pub const Provider = enum {
-    openai,
-    anthropic,
-    google,
-};
+pub const Provider = llm_routing.Provider;
+pub const EffortTier = llm_routing.EffortTier;
+pub const LlmQuality = llm_routing.LlmQuality;
 
 pub const ResponseFormat = enum {
     text,
@@ -26,6 +27,7 @@ pub const TextRequest = struct {
     temperature: f32 = 0.2,
     response_format: ResponseFormat = .json_object,
     response_size: ResponseSize = .medium,
+    effort_tier: ?EffortTier = null,
     reasoning_effort: ?chat.ReasoningEffort = null,
     json_schema: []const u8 = default_json_schema,
     response_validator: ?*const fn (std.mem.Allocator, []const u8) anyerror!void = null,
@@ -39,6 +41,7 @@ pub const VisionRequest = struct {
     temperature: f32 = 0.2,
     response_format: ResponseFormat = .text,
     response_size: ResponseSize = .medium,
+    effort_tier: ?EffortTier = null,
     json_schema: []const u8 = default_json_schema,
 };
 
@@ -51,77 +54,180 @@ pub const ProviderModel = struct {
 
 const max_response_bytes: usize = 1024 * 1024;
 
+pub const LlmStatsRecorder = struct {
+    ctx: *anyopaque,
+    record_fn: *const fn (ctx: *anyopaque, record: brain_context_stats.LlmCompletionRecord) void,
+
+    pub fn record(self: LlmStatsRecorder, completion: brain_context_stats.LlmCompletionRecord) void {
+        self.record_fn(self.ctx, completion);
+    }
+};
+
 pub const RandomProviderClient = struct {
     io: std.Io,
     http: http_transport.Client,
+    roster: llm_routing.LlmRoster,
+    llm_quality: LlmQuality,
     models_spec: []const u8,
+    stats_recorder: ?LlmStatsRecorder = null,
 
     pub fn init(io: std.Io, http: http_transport.Client, models_spec: []const u8) RandomProviderClient {
-        return initHostManaged(io, http, models_spec);
+        return initConfigured(io, http, .{ .entries = &.{} }, .auto, models_spec);
     }
 
-    pub fn initHostManaged(io: std.Io, http: http_transport.Client, models_spec: []const u8) RandomProviderClient {
+    pub fn initWithRoster(io: std.Io, http: http_transport.Client, roster: llm_routing.LlmRoster, quality: LlmQuality) RandomProviderClient {
+        return initConfigured(io, http, roster, quality, "");
+    }
+
+    fn initConfigured(io: std.Io, http: http_transport.Client, roster: llm_routing.LlmRoster, quality: LlmQuality, models_spec: []const u8) RandomProviderClient {
         return .{
             .io = io,
             .http = http,
+            .roster = roster,
+            .llm_quality = quality,
             .models_spec = models_spec,
         };
     }
 
+    pub fn initHostManaged(io: std.Io, http: http_transport.Client, roster: llm_routing.LlmRoster, quality: LlmQuality) RandomProviderClient {
+        return initWithRoster(io, http, roster, quality, "");
+    }
+
+    fn effectiveRoster(self: *RandomProviderClient, allocator: std.mem.Allocator) !llm_routing.LlmRoster {
+        if (self.roster.entries.len > 0) return self.roster;
+        return llm_routing.parseRosterFromModelsSpec(allocator, self.models_spec);
+    }
+
+    fn resolvedModelsSpec(self: *RandomProviderClient, allocator: std.mem.Allocator, subsystem: []const u8, effort_tier: ?EffortTier) ![]const u8 {
+        const roster = try self.effectiveRoster(allocator);
+        const tier = effort_tier orelse llm_routing.defaultEffortTierForSubsystem(subsystem);
+        return llm_routing.resolveModelsSpec(allocator, roster, self.llm_quality, tier);
+    }
+
+    /// Records one stats entry per HTTP attempt (see brain_context_stats module doc).
     pub fn completeText(self: *RandomProviderClient, allocator: std.mem.Allocator, request: TextRequest) ![]const u8 {
         _ = self.io;
-        const content = try callHostLLMComplete(allocator, self.http, self.models_spec, request);
+        const models_spec = try self.resolvedModelsSpec(allocator, request.subsystem, request.effort_tier);
+        defer allocator.free(models_spec);
+        const tier = request.effort_tier orelse llm_routing.defaultEffortTierForSubsystem(request.subsystem);
+        const primary = try primaryResolvedModel(allocator, models_spec);
+        defer allocator.free(primary.model);
+        const reasoning_effort = llm_routing.clampReasoningEffort(self.llm_quality, request.reasoning_effort);
+        var routed = request;
+        routed.reasoning_effort = reasoning_effort;
+        const request_bytes = request.system_prompt.len + request.user_prompt.len;
+        const content = callHostLLMComplete(allocator, self.http, models_spec, routed) catch |err| {
+            self.recordLlmCompletion(.{
+                .subsystem = request.subsystem,
+                .provider = primary.provider,
+                .model = primary.model,
+                .effort_tier = @tagName(tier),
+                .reasoning_effort = if (reasoning_effort) |effort| @tagName(effort) else null,
+                .request_bytes = request_bytes,
+                .response_bytes = 0,
+                .outcome = .provider_error,
+            });
+            return err;
+        };
         if (request.response_validator) |validate| {
             validate(allocator, content) catch |err| {
                 if (request.bad_response_logger) |logBadResponse| logBadResponse(request.subsystem, "host", "host_llm_complete", err, content);
+                self.recordLlmCompletion(.{
+                    .subsystem = request.subsystem,
+                    .provider = primary.provider,
+                    .model = primary.model,
+                    .effort_tier = @tagName(tier),
+                    .reasoning_effort = if (reasoning_effort) |effort| @tagName(effort) else null,
+                    .request_bytes = request_bytes,
+                    .response_bytes = content.len,
+                    .outcome = .validation_error,
+                });
                 allocator.free(content);
                 return err;
             };
         }
+        self.recordLlmCompletion(.{
+            .subsystem = request.subsystem,
+            .provider = primary.provider,
+            .model = primary.model,
+            .effort_tier = @tagName(tier),
+            .reasoning_effort = if (reasoning_effort) |effort| @tagName(effort) else null,
+            .request_bytes = request_bytes,
+            .response_bytes = content.len,
+            .outcome = .success,
+        });
         return content;
     }
 
     pub fn completeVision(self: *RandomProviderClient, allocator: std.mem.Allocator, request: VisionRequest) ![]const u8 {
         _ = self.io;
         if (request.image_paths.len == 0) return error.NoImagesProvided;
-        return try callHostVisionComplete(allocator, self.http, self.models_spec, request);
+        const models_spec = try self.resolvedModelsSpec(allocator, request.subsystem, request.effort_tier);
+        defer allocator.free(models_spec);
+        const tier = request.effort_tier orelse llm_routing.defaultEffortTierForSubsystem(request.subsystem);
+        const primary = try primaryResolvedModel(allocator, models_spec);
+        defer allocator.free(primary.model);
+        var request_bytes: usize = request.prompt.len;
+        for (request.image_paths) |path| request_bytes += path.len;
+        const content = callHostVisionComplete(allocator, self.http, models_spec, request) catch |err| {
+            self.recordLlmCompletion(.{
+                .subsystem = request.subsystem,
+                .provider = primary.provider,
+                .model = primary.model,
+                .effort_tier = @tagName(tier),
+                .reasoning_effort = null,
+                .request_bytes = request_bytes,
+                .response_bytes = 0,
+                .outcome = .provider_error,
+            });
+            return err;
+        };
+        self.recordLlmCompletion(.{
+            .subsystem = request.subsystem,
+            .provider = primary.provider,
+            .model = primary.model,
+            .effort_tier = @tagName(tier),
+            .reasoning_effort = null,
+            .request_bytes = request_bytes,
+            .response_bytes = content.len,
+            .outcome = .success,
+        });
+        return content;
+    }
+
+    fn recordLlmCompletion(self: *RandomProviderClient, record: brain_context_stats.LlmCompletionRecord) void {
+        if (self.stats_recorder) |recorder| recorder.record(record);
     }
 };
 
 pub fn parseProviderModels(allocator: std.mem.Allocator, spec: []const u8) ![]ProviderModel {
-    const text = std.mem.trim(u8, spec, " \r\n\t");
-    if (text.len == 0) return error.NoRandomProviderModels;
-
-    var out = std.ArrayList(ProviderModel).empty;
-    var parts = std.mem.splitScalar(u8, text, ',');
-    while (parts.next()) |raw_part| {
-        const part = std.mem.trim(u8, raw_part, " \r\n\t");
-        if (part.len == 0) continue;
-        const sep = std.mem.indexOfScalar(u8, part, ':') orelse return error.InvalidRandomProviderModel;
-        const provider_text = std.mem.trim(u8, part[0..sep], " \r\n\t");
-        const model_text = std.mem.trim(u8, part[sep + 1 ..], " \r\n\t");
-        if (provider_text.len == 0 or model_text.len == 0) return error.InvalidRandomProviderModel;
-        try out.append(allocator, .{
-            .provider = parseProvider(provider_text) orelse return error.InvalidRandomProvider,
-            .model = model_text,
-        });
+    const roster = try llm_routing.parseRosterFromModelsSpec(allocator, spec);
+    defer roster.deinit(allocator);
+    var out = try allocator.alloc(ProviderModel, roster.entries.len);
+    errdefer allocator.free(out);
+    for (roster.entries, 0..) |entry, i| {
+        out[i] = .{
+            .provider = entry.provider,
+            .model = try allocator.dupe(u8, entry.model),
+        };
     }
-    if (out.items.len == 0) return error.NoRandomProviderModels;
-    return out.toOwnedSlice(allocator);
-}
-
-fn parseProvider(text: []const u8) ?Provider {
-    if (std.ascii.eqlIgnoreCase(text, "openai")) return .openai;
-    if (std.ascii.eqlIgnoreCase(text, "anthropic")) return .anthropic;
-    if (std.ascii.eqlIgnoreCase(text, "google") or std.ascii.eqlIgnoreCase(text, "gemini")) return .google;
-    return null;
+    return out;
 }
 
 fn providerName(provider: Provider) []const u8 {
-    return switch (provider) {
-        .openai => "openai",
-        .anthropic => "anthropic",
-        .google => "google",
+    return llm_routing.providerName(provider);
+}
+
+fn primaryResolvedModel(allocator: std.mem.Allocator, models_spec: []const u8) !struct { provider: []const u8, model: []const u8 } {
+    const models = try parseProviderModels(allocator, models_spec);
+    defer {
+        for (models) |model| allocator.free(model.model);
+        allocator.free(models);
+    }
+    if (models.len == 0) return error.NoRandomProviderModels;
+    return .{
+        .provider = providerName(models[0].provider),
+        .model = try allocator.dupe(u8, models[0].model),
     };
 }
 
@@ -179,6 +285,10 @@ fn callHostVisionComplete(allocator: std.mem.Allocator, http: http_transport.Cli
 
 fn providerModelsJson(allocator: std.mem.Allocator, models_spec: []const u8) ![]const u8 {
     const models = try parseProviderModels(allocator, models_spec);
+    defer {
+        for (models) |model| allocator.free(model.model);
+        allocator.free(models);
+    }
     var out = std.ArrayList(u8).empty;
     try out.append(allocator, '[');
     for (models, 0..) |model, i| {
@@ -194,18 +304,22 @@ fn providerModelsJson(allocator: std.mem.Allocator, models_spec: []const u8) ![]
 }
 
 fn postJson(allocator: std.mem.Allocator, http: http_transport.Client, url: []const u8, extra_headers: []const http_transport.Header, body: []const u8) ![]u8 {
-    std.debug.print("HTTP start method=POST url={s} payload_bytes={d} response_limit={d}\n", .{ url, body.len, max_response_bytes });
-    const bytes = try http.postJson(allocator, .{
+    http_log.logStart(url, body.len, max_response_bytes);
+    const bytes = http.postJson(allocator, .{
         .url = url,
         .headers = extra_headers,
         .body = body,
         .max_response_bytes = max_response_bytes,
-    });
+    }) catch |err| {
+        http_log.logError(url, err);
+        return err;
+    };
     errdefer allocator.free(bytes);
     if (bytes.len > max_response_bytes) {
-        std.debug.print("HTTP response_too_large url={s} response_bytes={d} response_limit={d}\n", .{ url, bytes.len, max_response_bytes });
+        http_log.logResponseTooLarge(url, bytes.len, max_response_bytes);
         return error.StreamTooLong;
     }
+    http_log.logDone(url, bytes.len);
     return bytes;
 }
 
@@ -215,23 +329,6 @@ fn maxTokens(size: ResponseSize) u32 {
         .medium => 800,
         .large => 1600,
     };
-}
-
-fn openAIJsonResponseFormat(allocator: std.mem.Allocator, name: []const u8, json_schema: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        ",\"response_format\":{{\"type\":\"json_schema\",\"json_schema\":{{\"name\":{s},\"strict\":true,\"schema\":{s}}}}}",
-        .{ try jsonString(allocator, name), json_schema },
-    );
-}
-
-fn supportsReasoningEffort(model: []const u8) bool {
-    return std.mem.startsWith(u8, model, "o") or std.mem.startsWith(u8, model, "gpt-5");
-}
-
-fn randomSeed(io: std.Io) u64 {
-    const now = std.Io.Clock.now(.boot, io).nanoseconds;
-    return @as(u64, @truncate(@as(u128, @intCast(@abs(now)))));
 }
 
 fn jsonString(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
@@ -280,7 +377,8 @@ test "default random provider construction routes text through host" {
     var io_threaded: std.Io.Threaded = .init_single_threaded;
     defer io_threaded.deinit();
     var transport = CapturingHttpTransport{};
-    var client = RandomProviderClient.init(io_threaded.io(), transport.client(), "openai:gpt-4.1-nano");
+    const roster = try llm_routing.parseRosterFromModelsSpec(allocator, "openai:gpt-4.1-nano");
+    var client = RandomProviderClient.initWithRoster(io_threaded.io(), transport.client(), roster, .auto);
 
     const text = try client.completeText(allocator, .{
         .subsystem = "conversation",
@@ -306,7 +404,8 @@ test "default random provider construction routes vision through host" {
     var io_threaded: std.Io.Threaded = .init_single_threaded;
     defer io_threaded.deinit();
     var transport = CapturingHttpTransport{};
-    var client = RandomProviderClient.init(io_threaded.io(), transport.client(), "google:gemini-3.1-flash-lite");
+    const roster = try llm_routing.parseRosterFromModelsSpec(allocator, "google:gemini-3.1-flash-lite");
+    var client = RandomProviderClient.initWithRoster(io_threaded.io(), transport.client(), roster, .auto);
 
     const text = try client.completeVision(allocator, .{
         .subsystem = "vision_description",
@@ -321,4 +420,73 @@ test "default random provider construction routes vision through host" {
     try std.testing.expect(std.mem.indexOf(u8, transport.body, "\"models\":[{\"provider\":\"google\",\"model\":\"gemini-3.1-flash-lite\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.body, "\"prompt\":\"describe this\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.body, "\"image_paths\":[\"/tmp/does-not-need-to-exist.png\"]") != null);
+}
+
+const MockLlmStats = struct {
+    count: u64 = 0,
+    last_outcome: brain_context_stats.LlmCompletionOutcome = .success,
+    last_response_bytes: usize = 0,
+
+    fn recorder(self: *MockLlmStats) LlmStatsRecorder {
+        return .{
+            .ctx = self,
+            .record_fn = MockLlmStats.record,
+        };
+    }
+
+    fn record(ctx: *anyopaque, completion: brain_context_stats.LlmCompletionRecord) void {
+        const self: *MockLlmStats = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        self.last_outcome = completion.outcome;
+        self.last_response_bytes = completion.response_bytes;
+    }
+};
+
+test "completeText records success and error outcomes via stats recorder" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var io_threaded: std.Io.Threaded = .init_single_threaded;
+    defer io_threaded.deinit();
+
+    const FailingHttpTransport = struct {
+        fn client(_: *@This()) http_transport.Client {
+            return .{ .ctx = @as(*anyopaque, @ptrFromInt(1)), .postJsonFn = failingPostJson };
+        }
+
+        fn failingPostJson(_: *anyopaque, _: std.mem.Allocator, _: http_transport.JsonPostRequest) ![]u8 {
+            return error.ConnectionRefused;
+        }
+    };
+    var failing_transport = FailingHttpTransport{};
+    const roster = try llm_routing.parseRosterFromModelsSpec(allocator, "openai:gpt-4.1-nano");
+    var client = RandomProviderClient.initWithRoster(io_threaded.io(), failing_transport.client(), roster, .auto);
+    var stats = MockLlmStats{};
+    client.stats_recorder = stats.recorder();
+
+    const err_result = client.completeText(allocator, .{
+        .subsystem = "conversation",
+        .system_prompt = "system",
+        .user_prompt = "user",
+        .response_format = .text,
+    });
+    try std.testing.expectError(error.ConnectionRefused, err_result);
+    try std.testing.expectEqual(@as(u64, 1), stats.count);
+    try std.testing.expectEqual(brain_context_stats.LlmCompletionOutcome.provider_error, stats.last_outcome);
+
+    var transport = CapturingHttpTransport{};
+    client = RandomProviderClient.initWithRoster(io_threaded.io(), transport.client(), roster, .auto);
+    client.stats_recorder = stats.recorder();
+    stats.count = 0;
+
+    const text = try client.completeText(allocator, .{
+        .subsystem = "conversation",
+        .system_prompt = "system",
+        .user_prompt = "user",
+        .response_format = .text,
+    });
+    try std.testing.expectEqualStrings("host completion", text);
+    try std.testing.expectEqual(@as(u64, 1), stats.count);
+    try std.testing.expectEqual(brain_context_stats.LlmCompletionOutcome.success, stats.last_outcome);
+    try std.testing.expectEqual(@as(usize, "host completion".len), stats.last_response_bytes);
 }

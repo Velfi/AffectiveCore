@@ -3,6 +3,34 @@ const ports = @import("ports.zig");
 const files = ports.files;
 const FileSystem = files.FileSystem;
 const config_files = @import("config_files.zig");
+const llm_routing = @import("llm_routing.zig");
+const cognitive_capacity = @import("cognitive_capacity.zig");
+
+pub const CapacityConfig = struct {
+    activity_stack_max: usize = 8,
+    focus_slots_max: usize = 1,
+    memory_selected_max: usize = 5,
+    memory_prefilter_max: usize = 15,
+    candidate_actions_max: usize = 5,
+    open_loops_soft_max: usize = 4,
+    conversation_summaries_in_context_max: usize = 8,
+    chat_context_tokens_max: usize = 120_000,
+    dispatch_envelope_bytes_max: usize = 16 * 1024,
+    dispatch_event_count_max: usize = 12,
+};
+
+pub const CapacityConfigPartial = struct {
+    activity_stack_max: ?usize = null,
+    focus_slots_max: ?usize = null,
+    memory_selected_max: ?usize = null,
+    memory_prefilter_max: ?usize = null,
+    candidate_actions_max: ?usize = null,
+    open_loops_soft_max: ?usize = null,
+    conversation_summaries_in_context_max: ?usize = null,
+    chat_context_tokens_max: ?usize = null,
+    dispatch_envelope_bytes_max: ?usize = null,
+    dispatch_event_count_max: ?usize = null,
+};
 
 pub const Config = struct {
     brain_id: []const u8 = "default",
@@ -15,14 +43,25 @@ pub const Config = struct {
     conversation_model: []const u8 = "gpt-4.1-nano",
     conversation_models: []const u8 = "",
     conversation_reasoning_effort: []const u8 = "auto",
+    llm_quality: []const u8 = "auto",
+    conversation_roster: llm_routing.LlmRoster = .{ .entries = &.{} },
+    psyche_roster: llm_routing.LlmRoster = .{ .entries = &.{} },
     image_generation_model: []const u8 = "gemini-3.1-flash-image",
     image_generation_output_dir: []const u8 = "",
     autonomy_mode: []const u8 = "off",
-    autonomy_interval_seconds: u64 = 300,
     autonomy_sleep: []const u8 = "off",
     autonomy_quiet_hours: []const u8 = "22:00-08:00",
-    autonomy_speech_cooldown_minutes: u64 = 120,
-    autonomy_daily_energy: u32 = 20,
+    autonomy_limited_max_capacity: f32 = 0.45,
+    autonomy_full_max_capacity: f32 = 0.85,
+    autonomy_limited_threshold_bias: f32 = 0.20,
+    autonomy_full_threshold_bias: f32 = 0.00,
+    autonomy_social_engagement_boost: f32 = 0.18,
+    autonomy_limited_replenish_actions_per_minute: f32 = 1.0,
+    autonomy_full_replenish_actions_per_minute: f32 = 4.0,
+    autonomy_planner_min_capacity: f32 = 0.12,
+    autonomy_social_reserve: f32 = 0.12,
+    autonomy_safety_reserve: f32 = 0.20,
+    autonomy_opportunity_reserve: f32 = 0.15,
     id_monitors_mode: []const u8 = "on",
     id_monitor_interval_seconds: u64 = 5,
     id_monitor_external_command: []const u8 = "",
@@ -46,9 +85,9 @@ pub const Config = struct {
     memory_path: []const u8 = "",
     graph_path: []const u8 = "",
     seed_path: []const u8 = "data/seeds/default.md",
-    events_path: []const u8 = "",
     maintenance_schedule_path: []const u8 = "",
     maintenance_state_path: []const u8 = "",
+    context_stats_path: []const u8 = "",
     runtime_options_path: []const u8 = "",
     captures_dir: []const u8 = "",
     capture_scratch_dir: []const u8 = "",
@@ -61,12 +100,14 @@ pub const Config = struct {
     button_line: []const u8 = "17",
     button_hold_ms: u64 = 450,
     conversation_idle_timeout_seconds: u64 = 120,
+    capacity: CapacityConfig = .{},
+    llm_providers_path: []const u8 = "",
 
     pub fn fromArgs(args: []const []const u8) !Config {
         var cfg = Config{};
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
-            if ((std.mem.eql(u8, args[i], "--brain") or std.mem.eql(u8, args[i], "--profile")) and i + 1 < args.len) {
+            if (std.mem.eql(u8, args[i], "--brain") and i + 1 < args.len) {
                 i += 1;
                 cfg.brain_id = args[i];
             } else if (std.mem.eql(u8, args[i], "--camera") and i + 1 < args.len) {
@@ -90,6 +131,9 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, args[i], "--conversation-reasoning-effort") and i + 1 < args.len) {
                 i += 1;
                 cfg.conversation_reasoning_effort = args[i];
+            } else if (std.mem.eql(u8, args[i], "--llm-quality") and i + 1 < args.len) {
+                i += 1;
+                cfg.llm_quality = args[i];
             } else if (std.mem.eql(u8, args[i], "--image-generation-model") and i + 1 < args.len) {
                 i += 1;
                 cfg.image_generation_model = args[i];
@@ -98,22 +142,46 @@ pub const Config = struct {
                 cfg.image_generation_output_dir = args[i];
             } else if (std.mem.eql(u8, args[i], "--autonomy") and i + 1 < args.len) {
                 i += 1;
-                cfg.autonomy_mode = args[i];
-            } else if (std.mem.eql(u8, args[i], "--autonomy-interval-seconds") and i + 1 < args.len) {
+                cfg.autonomy_mode = try parseAutonomyMode(args[i]);
+            } else if (std.mem.eql(u8, args[i], "--autonomy-limited-replenish-actions-per-minute") and i + 1 < args.len) {
                 i += 1;
-                cfg.autonomy_interval_seconds = try std.fmt.parseInt(u64, args[i], 10);
+                cfg.autonomy_limited_replenish_actions_per_minute = try std.fmt.parseFloat(f32, args[i]);
+            } else if (std.mem.eql(u8, args[i], "--autonomy-full-replenish-actions-per-minute") and i + 1 < args.len) {
+                i += 1;
+                cfg.autonomy_full_replenish_actions_per_minute = try std.fmt.parseFloat(f32, args[i]);
+            } else if (std.mem.eql(u8, args[i], "--autonomy-planner-min-capacity") and i + 1 < args.len) {
+                i += 1;
+                cfg.autonomy_planner_min_capacity = try std.fmt.parseFloat(f32, args[i]);
             } else if (std.mem.eql(u8, args[i], "--autonomy-sleep") and i + 1 < args.len) {
                 i += 1;
                 cfg.autonomy_sleep = args[i];
             } else if (std.mem.eql(u8, args[i], "--autonomy-quiet-hours") and i + 1 < args.len) {
                 i += 1;
                 cfg.autonomy_quiet_hours = args[i];
-            } else if (std.mem.eql(u8, args[i], "--autonomy-speech-cooldown-minutes") and i + 1 < args.len) {
+            } else if (std.mem.eql(u8, args[i], "--autonomy-limited-max-capacity") and i + 1 < args.len) {
                 i += 1;
-                cfg.autonomy_speech_cooldown_minutes = try std.fmt.parseInt(u64, args[i], 10);
-            } else if (std.mem.eql(u8, args[i], "--autonomy-daily-energy") and i + 1 < args.len) {
+                cfg.autonomy_limited_max_capacity = try std.fmt.parseFloat(f32, args[i]);
+            } else if (std.mem.eql(u8, args[i], "--autonomy-full-max-capacity") and i + 1 < args.len) {
                 i += 1;
-                cfg.autonomy_daily_energy = try std.fmt.parseInt(u32, args[i], 10);
+                cfg.autonomy_full_max_capacity = try std.fmt.parseFloat(f32, args[i]);
+            } else if (std.mem.eql(u8, args[i], "--autonomy-limited-threshold-bias") and i + 1 < args.len) {
+                i += 1;
+                cfg.autonomy_limited_threshold_bias = try std.fmt.parseFloat(f32, args[i]);
+            } else if (std.mem.eql(u8, args[i], "--autonomy-full-threshold-bias") and i + 1 < args.len) {
+                i += 1;
+                cfg.autonomy_full_threshold_bias = try std.fmt.parseFloat(f32, args[i]);
+            } else if (std.mem.eql(u8, args[i], "--autonomy-social-engagement-boost") and i + 1 < args.len) {
+                i += 1;
+                cfg.autonomy_social_engagement_boost = try std.fmt.parseFloat(f32, args[i]);
+            } else if (std.mem.eql(u8, args[i], "--autonomy-social-reserve") and i + 1 < args.len) {
+                i += 1;
+                cfg.autonomy_social_reserve = try std.fmt.parseFloat(f32, args[i]);
+            } else if (std.mem.eql(u8, args[i], "--autonomy-safety-reserve") and i + 1 < args.len) {
+                i += 1;
+                cfg.autonomy_safety_reserve = try std.fmt.parseFloat(f32, args[i]);
+            } else if (std.mem.eql(u8, args[i], "--autonomy-opportunity-reserve") and i + 1 < args.len) {
+                i += 1;
+                cfg.autonomy_opportunity_reserve = try std.fmt.parseFloat(f32, args[i]);
             } else if (std.mem.eql(u8, args[i], "--id-monitors") and i + 1 < args.len) {
                 i += 1;
                 cfg.id_monitors_mode = args[i];
@@ -165,9 +233,6 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, args[i], "--seed") and i + 1 < args.len) {
                 i += 1;
                 cfg.seed_path = args[i];
-            } else if (std.mem.eql(u8, args[i], "--events-path") and i + 1 < args.len) {
-                i += 1;
-                cfg.events_path = args[i];
             } else if (std.mem.eql(u8, args[i], "--maintenance-schedule") and i + 1 < args.len) {
                 i += 1;
                 cfg.maintenance_schedule_path = args[i];
@@ -195,6 +260,17 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, args[i], "--face-embeddings-dir") and i + 1 < args.len) {
                 i += 1;
                 cfg.face_embeddings_dir = args[i];
+            } else if (std.mem.eql(u8, args[i], "--capacity-activity-stack-max") and i + 1 < args.len) {
+                i += 1;
+                cfg.capacity.activity_stack_max = try std.fmt.parseInt(usize, args[i], 10);
+            } else if (std.mem.eql(u8, args[i], "--capacity-memory-selected-max") and i + 1 < args.len) {
+                i += 1;
+                cfg.capacity.memory_selected_max = try std.fmt.parseInt(usize, args[i], 10);
+            } else if (std.mem.eql(u8, args[i], "--capacity-chat-context-tokens-max") and i + 1 < args.len) {
+                i += 1;
+                cfg.capacity.chat_context_tokens_max = try std.fmt.parseInt(usize, args[i], 10);
+            } else if (std.mem.startsWith(u8, args[i], "--")) {
+                return error.UnknownConfigFlag;
             }
         }
         return cfg;
@@ -208,9 +284,9 @@ pub const Config = struct {
         const tmp_brain_root = try std.fs.path.join(allocator, &.{ tmp_root, "brains", cfg.brain_id });
         if (self.memory_path.len == 0) cfg.memory_path = try config_files.brainPath(allocator, cfg.brain_root, "memory/people.sqlite");
         if (self.graph_path.len == 0) cfg.graph_path = try config_files.brainPath(allocator, cfg.brain_root, "memory/relationships.sqlite");
-        if (self.events_path.len == 0) cfg.events_path = try config_files.brainPath(allocator, cfg.brain_root, "events.jsonl");
         if (self.maintenance_schedule_path.len == 0) cfg.maintenance_schedule_path = try config_files.brainPath(allocator, cfg.brain_root, "maintenance.md");
         if (self.maintenance_state_path.len == 0) cfg.maintenance_state_path = try config_files.brainPath(allocator, cfg.brain_root, "maintenance_state.json");
+        if (self.context_stats_path.len == 0) cfg.context_stats_path = try config_files.brainPath(allocator, cfg.brain_root, "context_stats.json");
         if (self.runtime_options_path.len == 0) cfg.runtime_options_path = try config_files.brainPath(allocator, cfg.brain_root, "runtime_options.json");
         if (self.face_embeddings_dir.len == 0) cfg.face_embeddings_dir = try config_files.brainPath(allocator, cfg.brain_root, "memory/face_embeddings");
         if (self.captures_dir.len == 0) cfg.captures_dir = try config_files.brainPath(allocator, cfg.brain_root, "captures");
@@ -218,21 +294,65 @@ pub const Config = struct {
         if (self.audio_input_dir.len == 0) cfg.audio_input_dir = try config_files.brainPath(allocator, tmp_brain_root, "audio/input");
         if (self.audio_output_dir.len == 0) cfg.audio_output_dir = try config_files.brainPath(allocator, tmp_brain_root, "audio/output");
         if (self.image_generation_output_dir.len == 0) cfg.image_generation_output_dir = try config_files.brainPath(allocator, cfg.brain_root, "generated/images");
+        if (self.llm_providers_path.len == 0) cfg.llm_providers_path = try config_files.brainPath(allocator, cfg.brain_root, "llm_providers.json");
+        return cfg;
+    }
+
+    pub fn ensureBrainPaths(self: Config, allocator: std.mem.Allocator) !Config {
+        if (self.brain_root.len == 0) return error.MissingBrainRoot;
+        var cfg = self;
+        if (cfg.runtime_options_path.len == 0) cfg.runtime_options_path = try config_files.brainPath(allocator, cfg.brain_root, "runtime_options.json");
+        if (cfg.llm_providers_path.len == 0) cfg.llm_providers_path = try config_files.brainPath(allocator, cfg.brain_root, "llm_providers.json");
+        if (cfg.context_stats_path.len == 0) cfg.context_stats_path = try config_files.brainPath(allocator, cfg.brain_root, "context_stats.json");
+        return cfg;
+    }
+
+    pub fn loadForBrain(self: Config, allocator: std.mem.Allocator, fs: FileSystem, io: std.Io) !Config {
+        var cfg = try self.ensureBrainPaths(allocator);
+        cfg = try cfg.withLlmConfig(allocator, fs, io);
+        cfg = try cfg.withRuntimeOptions(allocator, fs, io);
+        try cognitive_capacity.validate(cfg.capacity);
         return cfg;
     }
 
     pub fn withLlmConfig(self: Config, allocator: std.mem.Allocator, fs: FileSystem, io: std.Io) !Config {
+        if (self.llm_providers_path.len == 0) return error.MissingLlmProvidersPath;
         var cfg = self;
-        const loaded = try config_files.loadLlmConfig(allocator, fs, io);
-        if (loaded.mode) |mode| cfg.ai_mode = mode;
-        if (loaded.reasoning_effort) |effort| cfg.conversation_reasoning_effort = effort;
-        if (loaded.psyche_reasoning_effort) |effort| cfg.psyche_reasoning_effort = effort;
+        var loaded = try config_files.loadLlmConfigFromPath(allocator, fs, io, self.llm_providers_path);
+        defer loaded.deinit(allocator);
+        if (loaded.mode) |mode| cfg.ai_mode = try allocator.dupe(u8, mode);
+        if (loaded.reasoning_effort) |effort| cfg.conversation_reasoning_effort = try allocator.dupe(u8, effort);
+        if (loaded.psyche_reasoning_effort) |effort| cfg.psyche_reasoning_effort = try allocator.dupe(u8, effort);
         if (loaded.models.len > 0) {
             cfg.conversation_models = loaded.models;
-            if (loaded.default_model) |model| cfg.conversation_model = model;
+            loaded.models = "";
+            if (loaded.default_model) |model| cfg.conversation_model = try allocator.dupe(u8, model);
         }
-        if (loaded.psyche_models.len > 0) cfg.psyche_models = loaded.psyche_models;
+        if (loaded.psyche_models.len > 0) {
+            cfg.psyche_models = loaded.psyche_models;
+            loaded.psyche_models = "";
+        }
+        cfg.conversation_roster = loaded.conversation_roster;
+        loaded.conversation_roster = .{ .entries = &.{} };
+        cfg.psyche_roster = loaded.psyche_roster;
+        loaded.psyche_roster = .{ .entries = &.{} };
+        try cfg.ensureRostersFromModelSpecs(allocator);
         return cfg;
+    }
+
+    pub fn ensureRostersFromModelSpecs(self: *Config, allocator: std.mem.Allocator) !void {
+        if (self.conversation_roster.entries.len == 0) {
+            const spec = std.mem.trim(u8, self.conversation_models, " \r\n\t");
+            if (spec.len > 0) {
+                self.conversation_roster = try llm_routing.parseRosterFromModelsSpec(allocator, spec);
+            }
+        }
+        if (self.psyche_roster.entries.len == 0) {
+            const spec = std.mem.trim(u8, self.psyche_models, " \r\n\t");
+            if (spec.len > 0) {
+                self.psyche_roster = try llm_routing.parseRosterFromModelsSpec(allocator, spec);
+            }
+        }
     }
 
     pub fn withEmailConfig(self: Config, allocator: std.mem.Allocator, fs: FileSystem, io: std.Io) !Config {
@@ -285,14 +405,23 @@ pub const Config = struct {
             .conversation_model = self.conversation_model,
             .conversation_models = self.conversation_models,
             .conversation_reasoning_effort = self.conversation_reasoning_effort,
+            .llm_quality = self.llm_quality,
             .image_generation_model = self.image_generation_model,
             .image_generation_output_dir = self.image_generation_output_dir,
             .autonomy_mode = self.autonomy_mode,
-            .autonomy_interval_seconds = self.autonomy_interval_seconds,
             .autonomy_sleep = self.autonomy_sleep,
             .autonomy_quiet_hours = self.autonomy_quiet_hours,
-            .autonomy_speech_cooldown_minutes = self.autonomy_speech_cooldown_minutes,
-            .autonomy_daily_energy = self.autonomy_daily_energy,
+            .autonomy_limited_max_capacity = self.autonomy_limited_max_capacity,
+            .autonomy_full_max_capacity = self.autonomy_full_max_capacity,
+            .autonomy_limited_threshold_bias = self.autonomy_limited_threshold_bias,
+            .autonomy_full_threshold_bias = self.autonomy_full_threshold_bias,
+            .autonomy_social_engagement_boost = self.autonomy_social_engagement_boost,
+            .autonomy_limited_replenish_actions_per_minute = self.autonomy_limited_replenish_actions_per_minute,
+            .autonomy_full_replenish_actions_per_minute = self.autonomy_full_replenish_actions_per_minute,
+            .autonomy_planner_min_capacity = self.autonomy_planner_min_capacity,
+            .autonomy_social_reserve = self.autonomy_social_reserve,
+            .autonomy_safety_reserve = self.autonomy_safety_reserve,
+            .autonomy_opportunity_reserve = self.autonomy_opportunity_reserve,
             .id_monitors_mode = self.id_monitors_mode,
             .id_monitor_interval_seconds = self.id_monitor_interval_seconds,
             .id_monitor_external_command = self.id_monitor_external_command,
@@ -310,12 +439,14 @@ pub const Config = struct {
             .memory_path = self.memory_path,
             .graph_path = self.graph_path,
             .seed_path = self.seed_path,
-            .events_path = self.events_path,
             .maintenance_schedule_path = self.maintenance_schedule_path,
             .maintenance_state_path = self.maintenance_state_path,
+            .context_stats_path = self.context_stats_path,
             .runtime_options_path = self.runtime_options_path,
+            .llm_providers_path = self.llm_providers_path,
             .captures_dir = self.captures_dir,
             .conversation_idle_timeout_seconds = self.conversation_idle_timeout_seconds,
+            .capacity = self.capacity,
         };
     }
 
@@ -338,7 +469,7 @@ pub const Config = struct {
         return cfg;
     }
 
-    pub fn withBrainSettings(self: Config, settings: BrainSettings) Config {
+    pub fn withBrainSettings(self: Config, settings: BrainSettings) !Config {
         var cfg = self;
         if (settings.brain_id.len > 0) cfg.brain_id = settings.brain_id;
         if (settings.brain_root.len > 0) cfg.brain_root = settings.brain_root;
@@ -348,14 +479,23 @@ pub const Config = struct {
         if (settings.conversation_model.len > 0) cfg.conversation_model = settings.conversation_model;
         if (settings.conversation_models.len > 0) cfg.conversation_models = settings.conversation_models;
         if (settings.conversation_reasoning_effort.len > 0) cfg.conversation_reasoning_effort = settings.conversation_reasoning_effort;
+        if (settings.llm_quality.len > 0) cfg.llm_quality = settings.llm_quality;
         if (settings.image_generation_model.len > 0) cfg.image_generation_model = settings.image_generation_model;
         if (settings.image_generation_output_dir.len > 0) cfg.image_generation_output_dir = settings.image_generation_output_dir;
-        if (settings.autonomy_mode.len > 0) cfg.autonomy_mode = settings.autonomy_mode;
-        if (settings.autonomy_interval_seconds) |v| cfg.autonomy_interval_seconds = v;
+        if (settings.autonomy_mode.len > 0) cfg.autonomy_mode = normalizeAutonomyModeCompat(settings.autonomy_mode);
         if (settings.autonomy_sleep.len > 0) cfg.autonomy_sleep = settings.autonomy_sleep;
         if (settings.autonomy_quiet_hours.len > 0) cfg.autonomy_quiet_hours = settings.autonomy_quiet_hours;
-        if (settings.autonomy_speech_cooldown_minutes) |v| cfg.autonomy_speech_cooldown_minutes = v;
-        if (settings.autonomy_daily_energy) |v| cfg.autonomy_daily_energy = v;
+        if (settings.autonomy_limited_max_capacity) |v| cfg.autonomy_limited_max_capacity = v;
+        if (settings.autonomy_full_max_capacity) |v| cfg.autonomy_full_max_capacity = v;
+        if (settings.autonomy_limited_threshold_bias) |v| cfg.autonomy_limited_threshold_bias = v;
+        if (settings.autonomy_full_threshold_bias) |v| cfg.autonomy_full_threshold_bias = v;
+        if (settings.autonomy_social_engagement_boost) |v| cfg.autonomy_social_engagement_boost = v;
+        if (settings.autonomy_limited_replenish_actions_per_minute) |v| cfg.autonomy_limited_replenish_actions_per_minute = v;
+        if (settings.autonomy_full_replenish_actions_per_minute) |v| cfg.autonomy_full_replenish_actions_per_minute = v;
+        if (settings.autonomy_planner_min_capacity) |v| cfg.autonomy_planner_min_capacity = v;
+        if (settings.autonomy_social_reserve) |v| cfg.autonomy_social_reserve = v;
+        if (settings.autonomy_safety_reserve) |v| cfg.autonomy_safety_reserve = v;
+        if (settings.autonomy_opportunity_reserve) |v| cfg.autonomy_opportunity_reserve = v;
         if (settings.id_monitors_mode.len > 0) cfg.id_monitors_mode = settings.id_monitors_mode;
         if (settings.id_monitor_interval_seconds) |v| cfg.id_monitor_interval_seconds = v;
         if (settings.id_monitor_external_command.len > 0) cfg.id_monitor_external_command = settings.id_monitor_external_command;
@@ -373,12 +513,15 @@ pub const Config = struct {
         if (settings.memory_path.len > 0) cfg.memory_path = settings.memory_path;
         if (settings.graph_path.len > 0) cfg.graph_path = settings.graph_path;
         if (settings.seed_path.len > 0) cfg.seed_path = settings.seed_path;
-        if (settings.events_path.len > 0) cfg.events_path = settings.events_path;
         if (settings.maintenance_schedule_path.len > 0) cfg.maintenance_schedule_path = settings.maintenance_schedule_path;
         if (settings.maintenance_state_path.len > 0) cfg.maintenance_state_path = settings.maintenance_state_path;
+        if (settings.context_stats_path.len > 0) cfg.context_stats_path = settings.context_stats_path;
         if (settings.runtime_options_path.len > 0) cfg.runtime_options_path = settings.runtime_options_path;
         if (settings.captures_dir.len > 0) cfg.captures_dir = settings.captures_dir;
         if (settings.conversation_idle_timeout_seconds) |v| cfg.conversation_idle_timeout_seconds = v;
+        if (settings.llm_providers_path.len > 0) cfg.llm_providers_path = settings.llm_providers_path;
+        if (settings.capacity) |capacity| cfg.capacity = capacity;
+        try cognitive_capacity.validate(cfg.capacity);
         return cfg;
     }
 };
@@ -411,14 +554,23 @@ pub const BrainSettings = struct {
     conversation_model: []const u8 = "",
     conversation_models: []const u8 = "",
     conversation_reasoning_effort: []const u8 = "",
+    llm_quality: []const u8 = "",
     image_generation_model: []const u8 = "",
     image_generation_output_dir: []const u8 = "",
     autonomy_mode: []const u8 = "",
-    autonomy_interval_seconds: ?u64 = null,
     autonomy_sleep: []const u8 = "",
     autonomy_quiet_hours: []const u8 = "",
-    autonomy_speech_cooldown_minutes: ?u64 = null,
-    autonomy_daily_energy: ?u32 = null,
+    autonomy_limited_max_capacity: ?f32 = null,
+    autonomy_full_max_capacity: ?f32 = null,
+    autonomy_limited_threshold_bias: ?f32 = null,
+    autonomy_full_threshold_bias: ?f32 = null,
+    autonomy_social_engagement_boost: ?f32 = null,
+    autonomy_limited_replenish_actions_per_minute: ?f32 = null,
+    autonomy_full_replenish_actions_per_minute: ?f32 = null,
+    autonomy_planner_min_capacity: ?f32 = null,
+    autonomy_social_reserve: ?f32 = null,
+    autonomy_safety_reserve: ?f32 = null,
+    autonomy_opportunity_reserve: ?f32 = null,
     id_monitors_mode: []const u8 = "",
     id_monitor_interval_seconds: ?u64 = null,
     id_monitor_external_command: []const u8 = "",
@@ -436,13 +588,36 @@ pub const BrainSettings = struct {
     memory_path: []const u8 = "",
     graph_path: []const u8 = "",
     seed_path: []const u8 = "",
-    events_path: []const u8 = "",
     maintenance_schedule_path: []const u8 = "",
     maintenance_state_path: []const u8 = "",
+    context_stats_path: []const u8 = "",
     runtime_options_path: []const u8 = "",
+    llm_providers_path: []const u8 = "",
     captures_dir: []const u8 = "",
     conversation_idle_timeout_seconds: ?u64 = null,
+    capacity: ?CapacityConfig = null,
 };
+
+fn parseAutonomyMode(mode: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, mode, "on")) return "full";
+    if (std.mem.eql(u8, mode, "off") or std.mem.eql(u8, mode, "limited") or std.mem.eql(u8, mode, "full")) return mode;
+    return error.InvalidAutonomyMode;
+}
+
+fn normalizeAutonomyModeCompat(mode: []const u8) []const u8 {
+    if (std.mem.eql(u8, mode, "on")) return "full";
+    return mode;
+}
+
+pub const LoadedLlmConfig = config_files.LoadedLlmConfig;
+
+pub fn parseLlmConfig(allocator: std.mem.Allocator, bytes: []const u8) !LoadedLlmConfig {
+    return config_files.parseLlmConfig(allocator, bytes);
+}
+
+pub fn llmQualityFromConfig(cfg: Config) !llm_routing.LlmQuality {
+    return llm_routing.LlmQuality.parse(cfg.llm_quality);
+}
 
 pub const LoadedEmailConfig = config_files.LoadedEmailConfig;
 
@@ -458,6 +633,22 @@ pub fn parseRuntimeOptionsConfig(allocator: std.mem.Allocator, base: Config, byt
     return config_files.parseRuntimeOptionsConfig(allocator, base, bytes);
 }
 
-pub fn saveRuntimeOptions(fs: FileSystem, io: std.Io, cfg: Config) !void {
-    return config_files.saveRuntimeOptions(fs, io, cfg);
+pub fn saveRuntimeOptions(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, cfg: Config) !void {
+    return config_files.saveRuntimeOptions(allocator, fs, io, cfg);
+}
+
+pub fn provisionBrainConfigFiles(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, cfg: Config) !void {
+    return config_files.provisionBrainConfigFiles(allocator, fs, io, cfg);
+}
+
+pub fn saveLlmProviders(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, cfg: Config) !void {
+    return config_files.saveLlmProviders(allocator, fs, io, cfg);
+}
+
+pub fn seedLlmProvidersFromTemplate(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, dest_path: []const u8, template_path: []const u8) !void {
+    return config_files.seedLlmProvidersFromTemplate(allocator, fs, io, dest_path, template_path);
+}
+
+pub fn validateCapacityConfig(cfg: CapacityConfig) !void {
+    return cognitive_capacity.validate(cfg);
 }

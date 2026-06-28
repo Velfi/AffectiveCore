@@ -64,6 +64,7 @@ pub fn compactEvents(
     allocator: std.mem.Allocator,
     now_seconds: i64,
     request_id: []const u8,
+    activity_id: []const u8,
     events: []const embedded_protocol.HostEvent,
     config: BudgetConfig,
 ) !CompactEventsResult {
@@ -78,6 +79,8 @@ pub fn compactEvents(
             allocator,
             now_seconds,
             request_id,
+            activity_id,
+            out_index,
             events[event_index],
             config.max_event_text_bytes,
             &raw_refs,
@@ -116,6 +119,8 @@ fn compactEvent(
     allocator: std.mem.Allocator,
     now_seconds: i64,
     request_id: []const u8,
+    activity_id: []const u8,
+    out_index: usize,
     event: embedded_protocol.HostEvent,
     max_text_bytes: usize,
     raw_refs: *std.ArrayList(RawRef),
@@ -123,6 +128,11 @@ fn compactEvent(
 ) !embedded_protocol.HostEvent {
     var out = event;
     out.request_id = if (request_id.len == 0) null else try allocator.dupe(u8, request_id);
+    if (activity_id.len > 0) {
+        out.activity_id = try allocator.dupe(u8, activity_id);
+    }
+    const id_prefix = if (request_id.len == 0) "event" else request_id;
+    out.id = try std.fmt.allocPrint(allocator, "{s}_{d}_{s}", .{ id_prefix, out_index, event.type });
     out.text = try compactOptionalField(allocator, now_seconds, "event_text", event.text, max_text_bytes, raw_refs, compacted, &out.raw_ref, &out.original_bytes);
     out.body = try compactOptionalField(allocator, now_seconds, "event_body", event.body, max_text_bytes, raw_refs, compacted, &out.raw_ref, &out.original_bytes);
     return out;
@@ -212,7 +222,7 @@ test "context gate compacts large host events" {
         .title = "huge",
         .body = huge,
     }};
-    const result = try compactEvents(allocator, 10, "request", events[0..], .{ .max_event_text_bytes = 64 });
+    const result = try compactEvents(allocator, 10, "request", "proc_test", events[0..], .{ .max_event_text_bytes = 64 });
     try std.testing.expect(result.budget.compacted);
     try std.testing.expectEqual(@as(usize, 1), result.raw_refs.len);
     try std.testing.expect(result.events[0].body.?.len < huge.len);

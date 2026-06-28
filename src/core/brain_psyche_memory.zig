@@ -1,5 +1,6 @@
 const std = @import("std");
 const brain_mod = @import("brain.zig");
+const brain_process = @import("brain_process.zig");
 const config_mod = @import("config.zig");
 const events = @import("events.zig");
 const facts = @import("facts.zig");
@@ -27,7 +28,7 @@ const camera_mod = ports.camera;
 const speaker_mod = ports.speaker;
 const input_mod = ports.input;
 const button_mod = ports.button;
-const command_log_mod = ports.command_log;
+const event_log_mod = ports.event_log;
 const facial_expression = ports.facial_expression;
 const system_senses_mod = ports.system_senses;
 const time_mod = @import("time.zig");
@@ -40,10 +41,12 @@ const vector_index = @import("vector_index.zig");
 const emotion = @import("emotion.zig");
 const process = ports.process;
 const helpers = @import("brain_helpers.zig");
+const context_composition = @import("context_composition.zig");
+const experience_kinds = @import("experience_kinds.zig");
 
 const Brain = brain_mod.Brain;
 const BrainDeps = brain_mod.BrainDeps;
-const CommandBatchResult = brain_mod.CommandBatchResult;
+const ActionPressureBatchResult = brain_mod.ActionPressureBatchResult;
 const ConversationTurnResult = brain_mod.ConversationTurnResult;
 const ConversationSpeakerContext = brain_mod.Brain.ConversationSpeakerContext;
 const QuietHours = brain_mod.Brain.QuietHours;
@@ -55,7 +58,7 @@ const speech_artifact_ttl_seconds = brain_mod.speech_artifact_ttl_seconds;
 const speech_artifact_prefix = brain_mod.speech_artifact_prefix;
 const speech_audio_suffix = brain_mod.speech_audio_suffix;
 const speech_transcription_json_suffix = brain_mod.speech_transcription_json_suffix;
-pub fn experienceExpiry(self: *Brain, retention: schema.ExperienceRetention) !?[]const u8 {
+pub fn experienceExpiry(self: *Brain, retention: schema.MemoryExperienceRetention) !?[]const u8 {
     const seconds: ?i64 = switch (retention) {
         .raw_ephemeral => 7 * 86_400,
         .discard => 86_400,
@@ -163,6 +166,7 @@ pub fn detectWantAchievements(self: *Brain, event_text: []const u8) !usize {
     const memories = try self.deps.store.loadMemoryRecords(self.allocator);
     const candidates = try helpers.wantAchievementCandidates(self.allocator, memories);
     if (candidates.len == 0) return 0;
+    try self.traceContextComposition(context_composition.auditWantAchievement(trimmed, candidates));
     const result = try self.deps.want_achievement_detector.detect(self.allocator, trimmed, candidates);
     var reinforced: usize = 0;
     for (result.matches) |match| {
@@ -229,7 +233,7 @@ pub fn reinforceAchievedWant(self: *Brain, want: schema.MemoryRecord, match: wan
     pending.valence = 0.35 + strength * 0.45;
     pending.interpretation = try std.fmt.allocPrint(self.allocator, "pending flexible identity from achieved want {s}: {s}", .{ want.memory_id, match.evidence });
     try self.deps.store.saveMemoryRecord(pending);
-    try self.recordRuntimeEvent(.{
+    try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "brain",
         .title = "want_achievement",
@@ -259,13 +263,28 @@ pub fn thinkAbout(self: *Brain, query: []const u8, tags: []const []const u8) ![]
     memory.confidence = appraisal.confidence;
     memory.salience = @max(0.35, appraisal.curiosity * 0.6 + appraisal.uncertainty * 0.3);
     memory.interpretation = try std.fmt.allocPrint(self.allocator, "reflection on {s}: {s}", .{ topic, appraisal.freeform });
+    // TODO(memory-runtime-merge): remove direct memory writes once runtime candidate reconciliation is fully registered.
+    try self.recordMemoryCandidateEvent(
+        .memory_mutation,
+        "memory",
+        "memory.candidate",
+        memory.interpretation,
+        .brain,
+        .memory_update,
+        .keep_disposition,
+        "thought",
+        topic,
+        memory.interpretation,
+        &[_][]const u8{},
+        memory.tags,
+    );
     try self.deps.store.saveMemoryRecord(memory);
-    try self.recordRuntimeEvent(.{
+    try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "memory",
         .title = "thought",
         .body = memory.interpretation,
-        .command = "think_about",
+        .action = "think_about",
         .subject = "thought",
         .raw = topic,
         .interpretation = memory.interpretation,
@@ -300,8 +319,24 @@ pub fn defineSelf(self: *Brain, kind: SelfDirectiveKind, text: []const u8, tags:
     memory.confidence = @max(0.75, appraisal.confidence);
     memory.salience = @max(0.70, emotion.estimateSalience(trimmed, directive_tags));
     memory.interpretation = try std.fmt.allocPrint(self.allocator, "self-defined {s}: {s}", .{ @tagName(kind), trimmed });
+    if (kind == .want) try helpers.assignWantFulfillmentCriterion(self.allocator, &memory);
+    // TODO(memory-runtime-merge): remove direct memory writes once runtime candidate reconciliation is fully registered.
+    try self.recordMemoryCandidateEvent(
+        .memory_mutation,
+        "brain",
+        "memory.candidate",
+        memory.interpretation,
+        .brain,
+        .self_definition,
+        .keep_disposition,
+        @tagName(kind),
+        trimmed,
+        memory.interpretation,
+        &[_][]const u8{},
+        memory.tags,
+    );
     try self.deps.store.saveMemoryRecord(memory);
-    try self.recordRuntimeEvent(.{
+    try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "brain",
         .title = @tagName(kind),
@@ -334,6 +369,7 @@ pub fn editSelf(self: *Brain, kind: SelfDirectiveKind, memory_id: []const u8, te
     const required_tag = switch (kind) {
         .need => "self_need",
         .want => "self_want",
+        .goal => "self_goal",
     };
     if (!helpers.tagInSlice(existing.tags, required_tag)) return error.SelfDefinitionKindMismatch;
 
@@ -347,14 +383,30 @@ pub fn editSelf(self: *Brain, kind: SelfDirectiveKind, memory_id: []const u8, te
     updated.salience = @max(existing.salience, emotion.estimateSalience(trimmed_text, directive_tags));
     updated.tags = directive_tags;
     updated.score = @max(existing.score, 5);
+    if (kind == .want) try helpers.assignWantFulfillmentCriterion(self.allocator, &updated);
     updated.scope = .long_term;
     updated.revisions = try helpers.appendRevision(self.allocator, existing.revisions, .{
         .time = now,
         .text = try std.fmt.allocPrint(self.allocator, "edited self-defined {s}: {s}", .{ @tagName(kind), trimmed_text }),
         .confidence = updated.confidence,
     });
+    // TODO(memory-runtime-merge): remove direct memory writes once runtime candidate reconciliation is fully registered.
+    try self.recordMemoryCandidateEvent(
+        .memory_mutation,
+        "brain",
+        "memory.candidate",
+        updated.interpretation,
+        .brain,
+        .self_definition,
+        .keep_disposition,
+        @tagName(kind),
+        trimmed_text,
+        updated.interpretation,
+        &[_][]const u8{updated.memory_id},
+        updated.tags,
+    );
     try self.deps.store.saveMemoryRecord(updated);
-    try self.recordRuntimeEvent(.{
+    try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "brain",
         .title = @tagName(kind),
@@ -414,8 +466,8 @@ fn deriveTopPriority(self: *Brain) !DerivedFocus {
         .memory_records = memories,
         .relationship_graph = try self.deps.graph.summary(self.allocator, 8),
         .power = power,
-        .autonomy_energy_remaining = if (autonomy_state) |state| state.energy_remaining else null,
-        .autonomy_daily_energy = self.cfg.autonomy_daily_energy,
+        .autonomy_control_capacity = if (autonomy_state) |state| state.control_capacity else null,
+        .autonomy_max_capacity = if (autonomy_state) |state| state.max_capacity else self.cfg.autonomy_full_max_capacity,
         .autonomy_sleeping = if (autonomy_state) |state| state.sleeping else null,
     });
     for (active_needs) |need| {
@@ -491,13 +543,14 @@ pub fn setFocus(self: *Brain, text: []const u8) ![]const u8 {
         .set_at = self.now_seconds,
         .base_attention = self_set_focus_attention,
     };
-    try self.appendCommandLog("state", "set_focus", trimmed);
+    try self.appendEventLog("state", "set_focus", trimmed);
+    brain_process.syncActivityContextFromBrain(self) catch |err| self.traceError("activity.sync_focus_failed", err);
     return std.fmt.allocPrint(self.allocator, "focus_set:\n- source: self_set\n- text: {s}\n", .{trimmed});
 }
 
 pub fn clearFocus(self: *Brain) ![]const u8 {
     self.current_focus = null;
-    try self.appendCommandLog("state", "clear_focus", "focus cleared");
+    try self.appendEventLog("state", "clear_focus", "focus cleared");
     return self.allocator.dupe(u8, "focus_cleared\n");
 }
 
@@ -548,14 +601,6 @@ fn currentStimulusAttention(context: ?[]const u8, stimulus_seconds: ?i64, now_se
     }
     if (value_end == value_start) return null;
     return std.fmt.parseFloat(f32, text[value_start..value_end]) catch null;
-}
-
-pub fn askHuman(self: *Brain, text: []const u8) ![]const u8 {
-    const impression = try createImpression(self, .self_reflection, text, &[_][]const u8{ "human", "help", "unresolved" });
-    try self.deps.store.addImpression(impression);
-    self.outputBrain(text);
-    try self.appendCommandLog("brain", "Brain", text);
-    return std.fmt.allocPrint(self.allocator, "human_question:\n- text: {s}\n", .{text});
 }
 
 pub fn consolidateMemory(self: *Brain) ![]const u8 {
@@ -619,6 +664,12 @@ pub fn recallMemories(self: *Brain, query: []const u8, tags: []const []const u8)
 
         const impression = try createImpression(self, .recalled_memory, helpers.memoryInterpretation(updated), updated.tags);
         try self.deps.store.addImpression(impression);
+        const recall_payload = try std.fmt.allocPrint(
+            self.allocator,
+            "memory_id={s}\nquery={s}\naccess_count={d}\nscope={s}",
+            .{ updated.memory_id, query, updated.access_count, @tagName(updated.scope) },
+        );
+        _ = try self.recordSimpleExperienceEvent(experience_kinds.memory_recalled, .memory, recall_payload);
 
         const line = try std.fmt.allocPrint(self.allocator, "- {s}: {s} [{s}] scope={s} accessed={d} score={d} confidence={d:.3} salience={d:.3} vector_score={d:.3} similarity={d:.3}\n", .{
             updated.memory_id,
@@ -665,7 +716,7 @@ pub fn logSimple(self: *Brain, state: state_mod.BrainState, image: ?[]const u8, 
     _ = image;
     _ = person_id;
     const interpretation = brain_text orelse update;
-    try self.recordRuntimeEvent(.{
+    try self.recordExperienceLogEvent(.{
         .kind = .state_change,
         .source = "brain",
         .title = state.jsonName(),

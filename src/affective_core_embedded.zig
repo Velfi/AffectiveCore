@@ -2,20 +2,19 @@ const std = @import("std");
 
 const chat = @import("api/chat_client.zig");
 const brain_container = @import("app/brain_container.zig");
-const app_core = @import("app/app_core.zig");
 const host_profiles = @import("app/host_profiles.zig");
 const context_gate = @import("app/context_gate.zig");
 const embedded_protocol = @import("app/embedded_protocol.zig");
 const config_mod = @import("core/config.zig");
 const brain_mod = @import("core/brain.zig");
+const ai_provider = @import("api/random_provider_client.zig");
 const http_transport_mod = @import("api/http_transport.zig");
 const files = @import("platform/common/files.zig");
-const input_mod = @import("platform/common/input.zig");
 const brain_storage = @import("storage/brain_storage.zig");
 const embedded_config = @import("affective_core_embedded_config.zig");
 const embedded_e2e = @import("affective_core_embedded_e2e.zig");
-const embedded_v2 = @import("affective_core_embedded_v2.zig");
 const embedded_dispatch = @import("affective_core_embedded_dispatch.zig");
+const error_descriptions = @import("core/error_descriptions.zig");
 
 pub const AffectiveCoreEmbeddedString = extern struct {
     ptr: ?[*]const u8 = null,
@@ -32,7 +31,6 @@ pub const AffectiveCoreEmbeddedConfig = extern struct {
     memory_path: AffectiveCoreEmbeddedString = .{},
     graph_path: AffectiveCoreEmbeddedString = .{},
     schedule_path: AffectiveCoreEmbeddedString = .{},
-    events_path: AffectiveCoreEmbeddedString = .{},
     maintenance_state_path: AffectiveCoreEmbeddedString = .{},
     face_embeddings_dir: AffectiveCoreEmbeddedString = .{},
     host_manifest_json: AffectiveCoreEmbeddedString = .{},
@@ -70,14 +68,17 @@ pub const AffectiveCoreEmbedded = struct {
     io_threaded: std.Io.Threaded = .init_single_threaded,
     env: std.process.Environ.Map,
     brain: brain_mod.Brain,
+    llm_provider_clients: []*ai_provider.RandomProviderClient = &.{},
     storage_backend: ?brain_storage.BrainStorage = null,
     host_effects: ?*embedded_protocol.HostEffectCollector = null,
+    host_capabilities: chat.CapabilitySet = .{},
     http_transport: HostHttpTransport,
     brain_initialized: bool = false,
     event_queue: std.ArrayList(embedded_protocol.HostEvent) = .empty,
     context_budget: context_gate.BudgetConfig = .{},
     raw_ref_ttl_seconds: i64 = 24 * 60 * 60,
     pending_camera_permission: ?HostCapabilityPending = null,
+    dispatch_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn allocator(self: *AffectiveCoreEmbedded) std.mem.Allocator {
         return self.arena.allocator();
@@ -97,6 +98,8 @@ const FailingHttpTransport = struct {
         return error.HostHttpTransportRequired;
     }
 };
+
+const host_error_detail_unavailable = "host error (detail unavailable)";
 
 const HostHttpTransport = struct {
     services: AffectiveCoreEmbeddedHostServices = .{},
@@ -152,7 +155,7 @@ const HostHttpTransport = struct {
             self.last_error = null;
             return;
         }
-        self.last_error = allocator.dupe(u8, trimmed) catch trimmed;
+        self.last_error = allocator.dupe(u8, trimmed) catch host_error_detail_unavailable;
     }
 };
 
@@ -192,6 +195,7 @@ pub export fn affective_core_embedded_create(
     handle.context_budget = .{};
     handle.raw_ref_ttl_seconds = 24 * 60 * 60;
     handle.pending_camera_permission = null;
+    handle.dispatch_mutex = .unlocked;
     const manifest_json = embedded_config.stringSlice(raw_config.host_manifest_json) orelse "";
     const manifest = embedded_protocol.parseHostManifest(
         allocator,
@@ -207,8 +211,14 @@ pub export fn affective_core_embedded_create(
         return createFailureWithHandle(handle, out_error, "could not build embedded config", err);
     };
     var local_filesystem = files.LocalFileSystem{};
-    var cfg = base_cfg.withRuntimeOptions(allocator, local_filesystem.filesystem(), handle.io()) catch |err| {
-        return createFailureWithHandle(handle, out_error, "could not load embedded runtime options", err);
+    var cfg = base_cfg.ensureBrainPaths(allocator) catch |err| {
+        return createFailureWithHandle(handle, out_error, "could not resolve embedded brain paths", err);
+    };
+    config_mod.provisionBrainConfigFiles(allocator, local_filesystem.filesystem(), handle.io(), cfg) catch |err| {
+        return createFailureWithHandle(handle, out_error, "could not provision embedded brain config files", err);
+    };
+    cfg = cfg.loadForBrain(allocator, local_filesystem.filesystem(), handle.io()) catch |err| {
+        return createFailureWithHandle(handle, out_error, "could not load embedded brain config", err);
     };
     cfg = embedded_config.restoreHostControlledPaths(allocator, raw_config.*, cfg) catch |err| {
         return createFailureWithHandle(handle, out_error, "could not restore embedded host paths", err);
@@ -218,14 +228,19 @@ pub export fn affective_core_embedded_create(
         return createFailureWithHandle(handle, out_error, "could not initialize embedded AffectiveCore runtime", err);
     };
     handle.brain = embedded_brain_host.brain;
+    handle.llm_provider_clients = embedded_brain_host.llm_provider_clients;
+    brain_mod.wireLlmStatsRecorder(&handle.brain, handle.llm_provider_clients);
     handle.storage_backend = embedded_brain_host.storage;
     handle.host_effects = embedded_brain_host.effects;
-    handle.brain_initialized = true;
-    handle.context_budget = .{
-        .max_envelope_bytes = manifest.max_envelope_bytes,
-        .max_event_count = manifest.max_event_count,
-        .max_event_text_bytes = manifest.max_event_text_bytes,
+    handle.host_capabilities = manifest.capabilities;
+    handle.brain.recoverStuckBrainMode() catch |err| {
+        return createFailureWithHandle(handle, out_error, "could not recover embedded brain mode", err);
     };
+    handle.brain.restorePersistedActivity() catch |err| {
+        return createFailureWithHandle(handle, out_error, "could not restore persisted activity", err);
+    };
+    handle.brain_initialized = true;
+    syncContextBudgetFromConfig(handle, cfg, manifest.max_event_text_bytes);
     handle.raw_ref_ttl_seconds = manifest.raw_ref_ttl_seconds;
 
     setHandle(out_handle, handle);
@@ -244,6 +259,17 @@ pub export fn affective_core_embedded_destroy(handle: ?*AffectiveCoreEmbedded) v
     std.heap.page_allocator.destroy(ctx);
 }
 
+fn tryAcquireDispatch(ctx: *AffectiveCoreEmbedded, out_data: ?*AffectiveCoreEmbeddedString, _: ?*AffectiveCoreEmbeddedString) ?c_int {
+    if (!ctx.dispatch_mutex.tryLock()) {
+        return protocolError(ctx, out_data, "", "runtime_error", "embedded dispatch already in progress on this handle");
+    }
+    return null;
+}
+
+fn releaseDispatch(ctx: *AffectiveCoreEmbedded) void {
+    ctx.dispatch_mutex.unlock();
+}
+
 pub export fn affective_core_embedded_dispatch_json(
     handle: ?*AffectiveCoreEmbedded,
     request_json_ptr: ?[*]const u8,
@@ -255,11 +281,13 @@ pub export fn affective_core_embedded_dispatch_json(
     setString(out_error, .{});
 
     const ctx = handle orelse return runtimeFailure(null, out_error, "missing embedded AffectiveCore handle");
+    if (tryAcquireDispatch(ctx, out_data, out_error)) |status| return status;
+    defer releaseDispatch(ctx);
     const request_json = embedded_config.requiredSlice(request_json_ptr, request_json_len) catch {
         return protocolError(ctx, out_data, "", "invalid_request", "missing dispatch request JSON");
     };
-    const output = embedded_v2.dispatchJson(ctx, request_json) catch |err| {
-        const message = std.fmt.allocPrint(std.heap.page_allocator, "dispatch failed: {s}", .{@errorName(err)}) catch "dispatch failed";
+    const output = embedded_dispatch.dispatchJson(ctx, request_json) catch |err| {
+        const message = allocDispatchFailureMessage(ctx, err) catch "dispatch failed";
         defer if (!std.mem.eql(u8, message, "dispatch failed")) std.heap.page_allocator.free(message);
         return protocolError(ctx, out_data, "", "runtime_error", message);
     };
@@ -275,11 +303,13 @@ pub export fn affective_core_embedded_drain_events_json(
     setString(out_error, .{});
 
     const ctx = handle orelse return runtimeFailure(null, out_error, "missing embedded AffectiveCore handle");
+    if (tryAcquireDispatch(ctx, out_data, out_error)) |status| return status;
+    defer releaseDispatch(ctx);
     const request_id = "";
-    const compacted = context_gate.compactEvents(ctx.allocator(), ctx.brain.now_seconds, request_id, ctx.event_queue.items, ctx.context_budget) catch |err| {
+    const compacted = context_gate.compactEvents(ctx.allocator(), ctx.brain.now_seconds, request_id, ctx.brain.activeActivityId() orelse "", ctx.event_queue.items, ctx.context_budget) catch |err| {
         return runtimeError(ctx, out_error, "could not compact drained events", err);
     };
-    embedded_v2.persistRawRefs(ctx, compacted.raw_refs) catch |err| {
+    embedded_dispatch.persistRawRefs(ctx, compacted.raw_refs) catch |err| {
         return runtimeError(ctx, out_error, "could not store compacted drained event refs", err);
     };
     const budget = context_gate.budgetWithResult(ctx.allocator(), compacted.budget, 0, &.{}, false) catch |err| {
@@ -303,53 +333,27 @@ pub export fn affective_core_embedded_raw_ref_lookup_json(
     setString(out_error, .{});
 
     const ctx = handle orelse return runtimeFailure(null, out_error, "missing embedded AffectiveCore handle");
+    if (tryAcquireDispatch(ctx, out_data, out_error)) |status| return status;
+    defer releaseDispatch(ctx);
     const raw_ref = embedded_config.requiredSlice(raw_ref_ptr, raw_ref_len) catch {
         return protocolError(ctx, out_data, "", "invalid_request", "missing raw_ref");
     };
-    const bytes = embedded_v2.lookupRawRef(ctx, raw_ref) catch |err| {
-        return protocolError(ctx, out_data, "", "raw_ref_not_found", @errorName(err));
-    };
-    const compacted = context_gate.compactText(ctx.allocator(), ctx.brain.now_seconds, "raw_ref_lookup", bytes, ctx.context_budget.max_result_bytes) catch |err| {
-        return runtimeError(ctx, out_error, "could not compact raw ref lookup", err);
-    };
-    embedded_v2.persistRawRefs(ctx, compacted.raw_refs) catch |err| {
-        return runtimeError(ctx, out_error, "could not store nested raw refs", err);
-    };
-    const base_budget: context_gate.BudgetReport = .{
-        .max_bytes = ctx.context_budget.max_envelope_bytes,
-        .used_bytes = 0,
-        .compacted = false,
-        .dropped_event_count = 0,
-        .raw_refs = &.{},
-    };
-    const budget = context_gate.budgetWithResult(ctx.allocator(), base_budget, compacted.summary.len, compacted.raw_refs, compacted.compacted) catch |err| {
-        return runtimeError(ctx, out_error, "could not build raw ref budget", err);
+    const bytes = embedded_dispatch.lookupRawRef(ctx, raw_ref) catch |err| {
+        const message = allocEmbeddedErrorMessage(ctx, "raw_ref_not_found", err) catch {
+            return protocolError(ctx, out_data, "", "raw_ref_not_found", embeddedErrorName(ctx, err));
+        };
+        defer std.heap.page_allocator.free(message);
+        return protocolError(ctx, out_data, "", "raw_ref_not_found", message);
     };
     const output = embedded_protocol.successEnvelopeAlloc(std.heap.page_allocator, "", &[_]embedded_protocol.HostEvent{}, .{
         .event_type = "raw_ref_lookup",
-        .raw_ref = raw_ref,
-        .summary = compacted.summary,
-    }, budget) catch |err| {
+        .value = .{
+            .kind = "raw_ref_lookup",
+            .raw_ref = raw_ref,
+            .content = bytes,
+        },
+    }, embedded_dispatch.emptyBudget(ctx)) catch |err| {
         return runtimeError(ctx, out_error, "could not encode raw ref lookup", err);
-    };
-    return success(ctx, out_data, output);
-}
-
-pub export fn affective_core_embedded_introspect_json(
-    handle: ?*AffectiveCoreEmbedded,
-    out_data: ?*AffectiveCoreEmbeddedString,
-    out_error: ?*AffectiveCoreEmbeddedString,
-) c_int {
-    setString(out_data, .{});
-    setString(out_error, .{});
-
-    const ctx = handle orelse return runtimeFailure(null, out_error, "missing embedded AffectiveCore handle");
-    clearHostEffects(ctx);
-    const result = app_core.executeBrainCommand(ctx.allocator(), &ctx.brain, .{ .command = .introspect }) catch |err| {
-        return protocolError(ctx, out_data, "", "introspect_failed", @errorName(err));
-    };
-    const output = embedded_v2.encodeDispatchResult(ctx, "", "introspect_summary", result.observation, true) catch |err| {
-        return runtimeError(ctx, out_error, "could not encode introspect", err);
     };
     return success(ctx, out_data, output);
 }
@@ -368,10 +372,10 @@ pub export fn affective_core_embedded_free_global_string(string: AffectiveCoreEm
     std.heap.page_allocator.free(bytes);
 }
 
-pub export fn affective_core_embedded_conversation_turn(
+pub export fn affective_core_embedded_export_brain(
     handle: ?*AffectiveCoreEmbedded,
-    text_ptr: ?[*]const u8,
-    text_len: usize,
+    brain_file_path_ptr: ?[*]const u8,
+    brain_file_path_len: usize,
     out_data: ?*AffectiveCoreEmbeddedString,
     out_error: ?*AffectiveCoreEmbeddedString,
 ) c_int {
@@ -379,49 +383,31 @@ pub export fn affective_core_embedded_conversation_turn(
     setString(out_error, .{});
 
     const ctx = handle orelse return runtimeFailure(null, out_error, "missing embedded AffectiveCore handle");
-    const text = embedded_config.requiredSlice(text_ptr, text_len) catch {
-        return runtimeFailure(ctx, out_error, "missing conversation text");
+    if (tryAcquireDispatch(ctx, out_data, out_error)) |status| return status;
+    defer releaseDispatch(ctx);
+    const brain_file_path = embedded_config.requiredSlice(brain_file_path_ptr, brain_file_path_len) catch {
+        return runtimeFailure(ctx, out_error, "missing brain export file path");
     };
-    const result = app_core.conversationResult(ctx.brain.handleConversationText(embedded_dispatch.tryTypedSpeech(ctx, text) catch |err| {
-        return runtimeError(ctx, out_error, "could not build conversation input", err);
-    }) catch |err| {
-        return runtimeError(ctx, out_error, "conversation_turn failed", err);
-    });
-    const json = std.json.Stringify.valueAlloc(std.heap.page_allocator, result, .{ .whitespace = .indent_2 }) catch |err| {
-        return runtimeError(ctx, out_error, "could not encode conversation_turn response", err);
+    const manifest = brain_container.exportBrain(ctx.allocator(), ctx.io(), ctx.brain.cfg, brain_file_path) catch |err| {
+        return runtimeError(ctx, out_error, "embedded brain export failed", err);
     };
-    return success(ctx, out_data, json);
-}
-
-pub export fn affective_core_embedded_call_tool(
-    handle: ?*AffectiveCoreEmbedded,
-    name_ptr: ?[*]const u8,
-    name_len: usize,
-    args_json_ptr: ?[*]const u8,
-    args_json_len: usize,
-    out_data: ?*AffectiveCoreEmbeddedString,
-    out_error: ?*AffectiveCoreEmbeddedString,
-) c_int {
-    setString(out_data, .{});
-    setString(out_error, .{});
-
-    const ctx = handle orelse return runtimeFailure(null, out_error, "missing embedded AffectiveCore handle");
-    const name = embedded_config.requiredSlice(name_ptr, name_len) catch {
-        return runtimeFailure(ctx, out_error, "missing embedded tool name");
-    };
-    const args_json = if (args_json_len == 0) "{}" else embedded_config.optionalSlice(args_json_ptr, args_json_len) orelse "{}";
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, args_json, .{}) catch |err| {
-        return runtimeError(ctx, out_error, "could not parse embedded tool arguments", err);
-    };
-    defer parsed.deinit();
-    const output = embedded_dispatch.dispatchTool(ctx, name, parsed.value) catch |err| {
-        return runtimeError(ctx, out_error, "embedded tool call failed", err);
+    _ = ctx.brain.recordSimpleExperienceEvent("Brain.Exported", .system, brain_file_path) catch {};
+    const output = std.json.Stringify.valueAlloc(std.heap.page_allocator, struct { manifest: brain_container.BrainManifest }{ .manifest = manifest }, .{ .whitespace = .indent_2 }) catch |err| {
+        return runtimeError(ctx, out_error, "could not encode brain export response", err);
     };
     return success(ctx, out_data, output);
 }
 
-pub export fn affective_core_embedded_introspect(
+pub export fn affective_core_embedded_import_brain(
     handle: ?*AffectiveCoreEmbedded,
+    brain_file_path_ptr: ?[*]const u8,
+    brain_file_path_len: usize,
+    brain_id_ptr: ?[*]const u8,
+    brain_id_len: usize,
+    brain_root_ptr: ?[*]const u8,
+    brain_root_len: usize,
+    host_id_ptr: ?[*]const u8,
+    host_id_len: usize,
     out_data: ?*AffectiveCoreEmbeddedString,
     out_error: ?*AffectiveCoreEmbeddedString,
 ) c_int {
@@ -429,13 +415,40 @@ pub export fn affective_core_embedded_introspect(
     setString(out_error, .{});
 
     const ctx = handle orelse return runtimeFailure(null, out_error, "missing embedded AffectiveCore handle");
-    const result = app_core.executeBrainCommand(ctx.allocator(), &ctx.brain, .{ .command = .introspect }) catch |err| {
-        return runtimeError(ctx, out_error, "introspect failed", err);
+    if (tryAcquireDispatch(ctx, out_data, out_error)) |status| return status;
+    defer releaseDispatch(ctx);
+    const brain_file_path = embedded_config.requiredSlice(brain_file_path_ptr, brain_file_path_len) catch {
+        return runtimeFailure(ctx, out_error, "missing brain import file path");
     };
-    const copy = std.heap.page_allocator.dupe(u8, result.observation) catch |err| {
-        return runtimeError(ctx, out_error, "could not copy introspect response", err);
+    const maybe_brain_id = optionalNonEmptySlice(brain_id_ptr, brain_id_len);
+    const inspected = if (maybe_brain_id == null)
+        brain_container.inspectBrainFile(ctx.allocator(), ctx.io(), brain_file_path) catch |err| {
+            return runtimeError(ctx, out_error, "embedded brain import inspect failed", err);
+        }
+    else
+        null;
+    const brain_id = maybe_brain_id orelse inspected.?.brain_id;
+    const brain_root = optionalNonEmptySlice(brain_root_ptr, brain_root_len) orelse ctx.brain.cfg.brain_root;
+    const manifest = brain_container.importBrain(ctx.allocator(), ctx.io(), brain_file_path, .{
+        .brain_id = brain_id,
+        .brain_root = brain_root,
+    }) catch |err| {
+        return runtimeError(ctx, out_error, "embedded brain import failed", err);
     };
-    return success(ctx, out_data, copy);
+    reloadEmbeddedBrain(ctx, manifest.brain_id, brain_root) catch |err| {
+        return runtimeError(ctx, out_error, "embedded brain import reload failed", err);
+    };
+    const host_id = optionalNonEmptySlice(host_id_ptr, host_id_len) orelse ctx.brain.currentHostId();
+    const payload = if (host_id.len > 0)
+        std.fmt.allocPrint(ctx.allocator(), "brain_id={s}; brain_root={s}; host_id={s}", .{ manifest.brain_id, brain_root, host_id }) catch ""
+    else
+        std.fmt.allocPrint(ctx.allocator(), "brain_id={s}; brain_root={s}", .{ manifest.brain_id, brain_root }) catch "";
+    if (payload.len > 0) _ = ctx.brain.recordSimpleExperienceEvent("Brain.Imported", .system, payload) catch {};
+    if (host_id.len > 0) _ = ctx.brain.recordSimpleExperienceEvent("Host.BindingChangedAfterImport", .host, host_id) catch {};
+    const output = std.json.Stringify.valueAlloc(std.heap.page_allocator, struct { manifest: brain_container.BrainManifest }{ .manifest = manifest }, .{ .whitespace = .indent_2 }) catch |err| {
+        return runtimeError(ctx, out_error, "could not encode brain import response", err);
+    };
+    return success(ctx, out_data, output);
 }
 
 pub export fn affective_core_embedded_api_e2e(
@@ -474,34 +487,111 @@ pub export fn affective_core_embedded_api_e2e(
     return success(null, out_data, copy);
 }
 
-pub fn dispatchTool(ctx: *AffectiveCoreEmbedded, name: []const u8, args: std.json.Value) ![]u8 {
-    return embedded_dispatch.dispatchTool(ctx, name, args);
+fn syncContextBudgetFromConfig(ctx: *AffectiveCoreEmbedded, cfg: config_mod.Config, max_event_text_bytes: usize) void {
+    ctx.context_budget = .{
+        .max_envelope_bytes = cfg.capacity.dispatch_envelope_bytes_max,
+        .max_event_count = cfg.capacity.dispatch_event_count_max,
+        .max_event_text_bytes = max_event_text_bytes,
+    };
 }
 
-pub fn shortTouchActivation(ctx: *AffectiveCoreEmbedded) !app_core.CommandResult {
-    return embedded_dispatch.shortTouchActivation(ctx);
+pub fn reloadEmbeddedBrain(ctx: *AffectiveCoreEmbedded, brain_id: []const u8, brain_root: []const u8) !void {
+    const allocator = ctx.allocator();
+    if (ctx.storage_backend) |*storage| {
+        storage.deinit(allocator);
+        ctx.storage_backend = null;
+    }
+    ctx.host_effects = null;
+    ctx.event_queue.clearRetainingCapacity();
+    ctx.pending_camera_permission = null;
+
+    var cfg = try embedded_config.rebindConfigBrainRoot(allocator, ctx.brain.cfg, brain_id, brain_root);
+    var local_filesystem = files.LocalFileSystem{};
+    try config_mod.provisionBrainConfigFiles(allocator, local_filesystem.filesystem(), ctx.io(), cfg);
+    cfg = try cfg.loadForBrain(allocator, local_filesystem.filesystem(), ctx.io());
+    try embedded_config.ensureParentDirs(ctx.io(), cfg);
+
+    const embedded_brain_host = try host_profiles.initEmbeddedMacosBrainHost(
+        allocator,
+        ctx.io(),
+        ctx.http_transport.client(),
+        cfg,
+        ctx.host_capabilities,
+    );
+    ctx.brain = embedded_brain_host.brain;
+    ctx.llm_provider_clients = embedded_brain_host.llm_provider_clients;
+    brain_mod.wireLlmStatsRecorder(&ctx.brain, ctx.llm_provider_clients);
+    ctx.storage_backend = embedded_brain_host.storage;
+    ctx.host_effects = embedded_brain_host.effects;
+    ctx.brain_initialized = true;
+    syncContextBudgetFromConfig(ctx, cfg, ctx.context_budget.max_event_text_bytes);
+
+    const payload = try std.fmt.allocPrint(allocator, "brain_id={s}; brain_root={s}", .{ brain_id, brain_root });
+    _ = try ctx.brain.recordSimpleExperienceEvent("Brain.RuntimeReloaded", .system, payload);
 }
 
-pub fn longTouchActivation(ctx: *AffectiveCoreEmbedded) !app_core.CommandResult {
-    return embedded_dispatch.longTouchActivation(ctx);
+pub fn hostHttpErrorDetail(ctx: *AffectiveCoreEmbedded, err: anyerror) ?[]const u8 {
+    if (err != error.HostHttpPostJsonFailed) return null;
+    return lastHostHttpErrorDetail(ctx);
 }
 
-pub fn runStimulusAutonomy(ctx: *AffectiveCoreEmbedded) !void {
-    return embedded_dispatch.runStimulusAutonomy(ctx);
+fn lastHostHttpErrorDetail(ctx: *AffectiveCoreEmbedded) ?[]const u8 {
+    const detail = ctx.http_transport.last_error orelse return null;
+    if (detail.len == 0) return null;
+    return detail;
+}
+
+pub fn embeddedErrorName(ctx: *AffectiveCoreEmbedded, err: anyerror) []const u8 {
+    return hostHttpErrorDetail(ctx, err) orelse @errorName(err);
 }
 
 pub fn hostHttpFailureMessage(ctx: *AffectiveCoreEmbedded, prefix: []const u8, err: anyerror) ?[]const u8 {
-    if (err != error.HostHttpPostJsonFailed) return null;
-    const detail = ctx.http_transport.last_error orelse return null;
-    return std.fmt.allocPrint(ctx.allocator(), "{s}: {s}", .{ prefix, detail }) catch detail;
+    if (hostHttpErrorDetail(ctx, err) == null) return null;
+    return std.fmt.allocPrint(ctx.allocator(), "{s}: {s}", .{ prefix, embeddedErrorName(ctx, err) }) catch embeddedErrorName(ctx, err);
 }
 
-fn dispatchJson(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8 {
-    return embedded_dispatch.dispatchJson(ctx, request_json);
+fn allocEmbeddedErrorMessage(ctx: *AffectiveCoreEmbedded, prefix: []const u8, err: anyerror) ![]u8 {
+    return std.fmt.allocPrint(std.heap.page_allocator, "{s}: {s}", .{ prefix, embeddedErrorName(ctx, err) });
 }
 
-fn encodeDispatchResult(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_type: []const u8, result: anytype) ![]u8 {
-    return embedded_dispatch.encodeDispatchResult(ctx, request_id, event_type, result);
+fn allocEmbeddedRuntimeErrorMessage(ctx: *AffectiveCoreEmbedded, prefix: []const u8, err: anyerror) ![]u8 {
+    const base = if (hostHttpErrorDetail(ctx, err)) |host_detail|
+        try std.fmt.allocPrint(std.heap.page_allocator, "{s}: {s}: {s} (host_detail={s})", .{
+            prefix,
+            error_descriptions.name(err),
+            error_descriptions.detail(err),
+            host_detail,
+        })
+    else
+        try std.fmt.allocPrint(std.heap.page_allocator, "{s}: {s}: {s}", .{
+            prefix,
+            error_descriptions.name(err),
+            error_descriptions.detail(err),
+        });
+    defer std.heap.page_allocator.free(base);
+    return try std.fmt.allocPrint(std.heap.page_allocator, "{s} (last_stage={s})", .{ base, ctx.brain.last_trace_stage });
+}
+
+fn allocDispatchFailureMessage(ctx: *AffectiveCoreEmbedded, err: anyerror) ![]u8 {
+    const detail_owned = error_descriptions.formatFailureDetail(std.heap.page_allocator, err, ctx.brain.chatParseFailureBody()) catch null;
+    const detail: []const u8 = detail_owned orelse error_descriptions.name(err);
+    defer if (detail_owned != null) std.heap.page_allocator.free(detail);
+    if (hostHttpErrorDetail(ctx, err) orelse lastHostHttpErrorDetail(ctx)) |host_detail| {
+        return std.fmt.allocPrint(std.heap.page_allocator, "dispatch failed: {s}: {s} (host_detail={s})", .{
+            error_descriptions.name(err),
+            detail,
+            host_detail,
+        });
+    }
+    return std.fmt.allocPrint(std.heap.page_allocator, "dispatch failed: {s}: {s}", .{
+        error_descriptions.name(err),
+        detail,
+    });
+}
+
+fn optionalNonEmptySlice(ptr: ?[*]const u8, len: usize) ?[]const u8 {
+    if (len == 0) return null;
+    return embedded_config.optionalSlice(ptr, len);
 }
 
 fn protocolError(
@@ -511,14 +601,10 @@ fn protocolError(
     code: []const u8,
     message: []const u8,
 ) c_int {
-    const output = embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, code, message, false, embedded_v2.emptyBudget(ctx)) catch {
+    const output = embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, code, message, false, embedded_dispatch.emptyBudget(ctx)) catch {
         return runtimeFailure(ctx, null, "could not encode embedded protocol error");
     };
     return success(ctx, out_data, output);
-}
-
-pub fn tryTypedSpeech(ctx: *AffectiveCoreEmbedded, text: []const u8) !input_mod.HeardSpeech {
-    return embedded_dispatch.tryTypedSpeech(ctx, text);
 }
 
 fn ensureParentDirsOrFailure(
@@ -528,7 +614,6 @@ fn ensureParentDirsOrFailure(
 ) ?c_int {
     if (ensureParentPathOrFailure(handle, out_error, "memory_path", cfg.memory_path)) |status| return status;
     if (ensureParentPathOrFailure(handle, out_error, "graph_path", cfg.graph_path)) |status| return status;
-    if (ensureParentPathOrFailure(handle, out_error, "events_path", cfg.events_path)) |status| return status;
     if (ensureParentPathOrFailure(handle, out_error, "maintenance_schedule_path", cfg.maintenance_schedule_path)) |status| return status;
     if (ensureParentPathOrFailure(handle, out_error, "maintenance_state_path", cfg.maintenance_state_path)) |status| return status;
     if (cfg.face_embeddings_dir.len > 0) {
@@ -580,24 +665,15 @@ fn runtimeError(
     prefix: []const u8,
     err: anyerror,
 ) c_int {
-    if (ctx) |handle| {
-        if (hostHttpFailureMessage(handle, prefix, err)) |detail| {
-            const message = std.fmt.allocPrint(std.heap.page_allocator, "{s} (last_stage={s})", .{
-                detail,
-                handle.brain.last_trace_stage,
-            }) catch return runtimeFailure(ctx, out_error, "embedded AffectiveCore runtime error");
-            publishOwnedString(out_error, message);
-            return @intFromEnum(AffectiveCoreEmbeddedStatus.runtime_error);
-        }
-    }
-    const message = if (ctx) |handle|
-        std.fmt.allocPrint(std.heap.page_allocator, "{s}: {s} (last_stage={s})", .{
-            prefix,
-            @errorName(err),
-            handle.brain.last_trace_stage,
-        }) catch return runtimeFailure(ctx, out_error, "embedded AffectiveCore runtime error")
-    else
-        std.fmt.allocPrint(std.heap.page_allocator, "{s}: {s}", .{ prefix, @errorName(err) }) catch return runtimeFailure(ctx, out_error, "embedded AffectiveCore runtime error");
+    const message: []u8 = if (ctx) |handle| blk: {
+        break :blk allocEmbeddedRuntimeErrorMessage(handle, prefix, err) catch {
+            return runtimeFailure(ctx, out_error, "embedded AffectiveCore runtime error");
+        };
+    } else blk: {
+        break :blk std.fmt.allocPrint(std.heap.page_allocator, "{s}: {s}", .{ prefix, @errorName(err) }) catch {
+            return runtimeFailure(ctx, out_error, "embedded AffectiveCore runtime error");
+        };
+    };
     publishOwnedString(out_error, message);
     return @intFromEnum(AffectiveCoreEmbeddedStatus.runtime_error);
 }

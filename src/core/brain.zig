@@ -26,7 +26,7 @@ const camera_mod = ports.camera;
 const speaker_mod = ports.speaker;
 const input_mod = ports.input;
 const button_mod = ports.button;
-const command_log_mod = ports.command_log;
+const event_log_mod = ports.event_log;
 const facial_expression = ports.facial_expression;
 const system_senses_mod = ports.system_senses;
 const time_mod = @import("time.zig");
@@ -42,7 +42,7 @@ const stimulus_mod = @import("stimulus.zig");
 
 const brain_types = @import("brain_types.zig");
 pub const BrainDeps = brain_types.BrainDeps;
-pub const CommandBatchResult = brain_types.CommandBatchResult;
+pub const ActionPressureBatchResult = brain_types.ActionPressureBatchResult;
 pub const ConversationTurnResult = brain_types.ConversationTurnResult;
 pub const HeardSpeech = input_mod.HeardSpeech;
 pub const PsycheHabituation = brain_types.PsycheHabituation;
@@ -53,9 +53,11 @@ pub const speech_artifact_prefix = brain_types.speech_artifact_prefix;
 pub const speech_audio_suffix = brain_types.speech_audio_suffix;
 pub const speech_transcription_json_suffix = brain_types.speech_transcription_json_suffix;
 pub const SpeechArtifactSweepResult = brain_types.SpeechArtifactSweepResult;
+pub const HostVisualObservationResult = brain_lifecycle.HostVisualObservationResult;
 
-const brain_command_execution = @import("brain_command_execution.zig");
+const brain_action_execution = @import("brain_action_execution.zig");
 const brain_autonomy = @import("brain_autonomy.zig");
+const brain_context_stats = @import("brain_context_stats.zig");
 const brain_dream_memory = @import("brain_dream_memory.zig");
 const brain_introspection_autonomy = @import("brain_introspection_autonomy.zig");
 const brain_lifecycle = @import("brain_lifecycle.zig");
@@ -63,16 +65,32 @@ const brain_logging_events = @import("brain_logging_events.zig");
 const brain_person_memory = @import("brain_person_memory.zig");
 const brain_psyche_memory = @import("brain_psyche_memory.zig");
 const brain_recognition = @import("brain_recognition.zig");
+const experience_pipeline = @import("experience_pipeline.zig");
+const capabilities = @import("capabilities.zig");
+const capability_registry = @import("capability_registry.zig");
+const read_models = @import("read_models.zig");
+const dream_time = @import("dream_time.zig");
+const action_selection = @import("action_selection.zig");
+const subsystems = @import("subsystems.zig");
+const actors = @import("actors/mod.zig");
+const learning_mod = @import("learning.zig");
+const belief_updates = @import("belief_updates.zig");
+const recognition_composite = @import("recognition_composite.zig");
+const activity_mod = @import("activity.zig");
+const brain_process = @import("brain_process.zig");
+const brain_event = @import("brain_event.zig");
+const brain_actor = @import("brain_actor.zig");
+const brain_runtime = @import("brain_runtime.zig");
+
+pub const BrainEvent = brain_event.BrainEvent;
+pub const BrainEventTypes = brain_event.EventTypes;
+pub const BrainActor = brain_actor.BrainActor;
+pub const BrainActorContext = brain_actor.HandleContext;
+pub const BrainRuntime = brain_runtime.BrainRuntime;
+pub const BrainRuntimePhase = brain_runtime.Phase;
+pub const Actors = actors;
 
 pub const Brain = struct {
-    /// Why a frontend camera pull was requested, so the awaited camera
-    /// observation can complete the originating skill rather than just
-    /// recording a generic visual stimulus.
-    pub const CameraIntent = enum {
-        none,
-        recognize,
-    };
-
     /// Whether the held focus was set deliberately by the bot (a short plan it
     /// chose) or derived automatically from the strongest current attention.
     pub const FocusSource = enum { derived, self_set };
@@ -89,16 +107,40 @@ pub const Brain = struct {
 
     pub const FocusMode = enum { focused, unfocused };
 
+    pub const WaitingKind = enum { timer, human, host_sense };
+
+    pub const WaitingFor = struct {
+        kind: WaitingKind,
+        intent: []const u8,
+        since: i64,
+    };
+
     allocator: std.mem.Allocator,
     cfg: config_mod.Config,
     deps: BrainDeps,
+    runtime: BrainRuntime,
+    runtime_bootstrapped: bool = false,
+    runtime_turn_ctx: ?*anyopaque = null,
     now_seconds: i64,
     conversation_speaker_context: ?ConversationSpeakerContext = null,
     last_conversation_turn_seconds: ?i64 = null,
+    last_conversation_effort_tier: ?chat_mod.EffortTier = null,
     last_visual_observation_path: ?[]const u8 = null,
     last_visual_update_seconds: ?i64 = null,
     last_visual_observation_uploaded: bool = false,
-    pending_camera_intent: CameraIntent = .none,
+    /// Host sense the brain is waiting on to finish an in-flight turn or skill.
+    awaited_host_request: ?@import("awaited_host_request.zig").Request = null,
+    /// Ongoing goal-directed activity currently in flight.
+    active_activity: ?activity_mod.Active = null,
+    /// Paused parent activities waiting for the current subtask to finish (root-first).
+    activity_stack: std.ArrayList(activity_mod.Active) = .empty,
+    /// Dispatch request id for the current host turn; used when the brain opens a process.
+    current_dispatch_request_id: ?[]const u8 = null,
+    /// Monotonic counter for brain-generated dispatch ids when the host omits request_id.
+    dispatch_serial: u64 = 0,
+    /// User speech received while a turn was paused for host sense; processed
+    /// after the paused turn finishes so stimuli are not dropped.
+    pending_deferred_heard_speech: ?input_mod.HeardSpeech = null,
     current_stimulus_context: ?[]const u8 = null,
     current_stimulus_seconds: ?i64 = null,
     current_focus: ?Focus = null,
@@ -108,6 +150,14 @@ pub const Brain = struct {
     psyche_habituation: PsycheHabituation = .{},
     sense_stimulus_state: SenseStimulusState = .{},
     last_trace_stage: []const u8 = "init",
+    current_turn_event_id: ?[]const u8 = null,
+    last_host_capability_digest: ?[]const u8 = null,
+    waiting_for: ?WaitingFor = null,
+    conversation_user_text: ?[]const u8 = null,
+    context_stats: brain_context_stats.State,
+    context_stats_loaded: bool = false,
+    /// Last invalid conversation LLM payload, kept for hard-error detail on this brain only.
+    chat_parse_failure_body: ?[]const u8 = null,
 
     pub const ConversationSpeakerContext = struct {
         capture: events.ImageCapture,
@@ -125,6 +175,7 @@ pub const Brain = struct {
         stimulus_context: []const u8,
         curiosity_score: u8,
         should_look: bool,
+        packet: SenseStimulusPacket,
     };
 
     pub const SenseStimulusInput = stimulus_mod.Input;
@@ -138,17 +189,22 @@ pub const Brain = struct {
     pub const SelfDirectiveKind = enum {
         need,
         want,
+        goal,
     };
 
     pub const init = brain_lifecycle.init;
+
+    pub const clearChatParseFailure = brain_lifecycle.clearChatParseFailure;
+    pub const rememberChatParseFailure = brain_lifecycle.rememberChatParseFailure;
+    pub const chatParseFailureBody = brain_lifecycle.chatParseFailureBody;
 
     pub const seedFromFile = brain_lifecycle.seedFromFile;
 
     pub const seedDocument = brain_lifecycle.seedDocument;
 
-    pub const handleFaceMemoryActivation = brain_lifecycle.handleFaceMemoryActivation;
+    pub const applyNewBrainDefaults = @import("brain_defaults.zig").applyNewBrainDefaults;
 
-    pub const performFaceMemoryActivation = brain_lifecycle.performFaceMemoryActivation;
+    pub const handleFaceMemoryActivation = brain_lifecycle.handleFaceMemoryActivation;
 
     pub const handleLongTouchActivation = brain_lifecycle.handleLongTouchActivation;
 
@@ -156,13 +212,37 @@ pub const Brain = struct {
 
     pub const handleConversationTurn = brain_lifecycle.handleConversationTurn;
 
+    pub const expireConversationIfIdle = brain_lifecycle.expireConversationIfIdle;
+
     pub const handleButtonAction = brain_lifecycle.handleButtonAction;
 
     pub const handleTouchStimulusError = brain_lifecycle.handleTouchStimulusError;
 
+    pub const handleTouchStimulus = brain_lifecycle.handleTouchStimulus;
+
     pub const handleHoldActivation = brain_lifecycle.handleHoldActivation;
 
     pub const handleConversationText = brain_lifecycle.handleConversationText;
+
+    pub const StimulusDispatch = brain_process.StimulusDispatch;
+    pub const reactToSalientSense = brain_lifecycle.reactToSalientSense;
+    pub const conversationAwaitingHost = brain_process.conversationAwaitingHost;
+    pub const activityAwaitingHost = brain_process.activityAwaitingHost;
+    pub const activeActivityId = brain_process.activeActivityId;
+    pub const continueConversationAfterAwaitedVisual = brain_lifecycle.continueConversationAfterAwaitedVisual;
+    pub const handleHostVisualObservation = brain_lifecycle.handleHostVisualObservation;
+    pub const clearActiveActivity = brain_process.clearActiveActivity;
+    pub const restorePersistedActivity = brain_process.restorePersistedActivity;
+    /// Deprecated alias for tests migrating to active_activity.
+    pub const clearPendingConversationPause = brain_process.clearActiveActivity;
+
+    pub const drainPendingDeferredConversation = brain_lifecycle.drainPendingDeferredConversation;
+
+    pub const reconsiderFromReminder = brain_lifecycle.reconsiderFromReminder;
+
+    pub const setWaitingFor = brain_lifecycle.setWaitingFor;
+
+    pub const clearWaitingFor = brain_lifecycle.clearWaitingFor;
 
     pub fn rememberVisualUpdate(self: *Brain, path: []const u8) void {
         self.last_visual_observation_path = path;
@@ -202,7 +282,7 @@ pub const Brain = struct {
         const text = try stimulus_mod.formatPacket(self.allocator, packet);
         const final_text = if (suffix.len == 0) text else try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ text, suffix });
         self.setCurrentStimulusContext(final_text);
-        try self.recordRuntimeEvent(.{
+        try self.recordExperienceLogEvent(.{
             .kind = .observation,
             .source = "sense",
             .title = "sense_stimulus",
@@ -250,31 +330,30 @@ pub const Brain = struct {
 
     pub const runAutonomyTick = brain_lifecycle.runAutonomyTick;
 
+    pub const runAutonomyReplenish = brain_lifecycle.runAutonomyReplenish;
+
+    pub const runAutonomyReplenishFromPush = brain_lifecycle.runAutonomyReplenishFromPush;
+
     pub const runStimulusAutonomy = brain_lifecycle.runStimulusAutonomy;
-
-    pub const handleKnown = brain_recognition.handleKnown;
-
-    pub const generateSimpleGreeting = brain_recognition.generateSimpleGreeting;
-
-    pub const handleUnknown = brain_recognition.handleUnknown;
-
-    pub const handleUncertain = brain_recognition.handleUncertain;
-
-    pub const handleImmediateIntent = brain_recognition.handleImmediateIntent;
-
-    pub const conversationSpeakerContext = brain_recognition.conversationSpeakerContext;
 
     pub const assignSpeechStimulus = brain_recognition.assignSpeechStimulus;
 
     pub const assignTouchStimulus = brain_recognition.assignTouchStimulus;
 
-    pub const handleIdentityClaim = brain_recognition.handleIdentityClaim;
+    pub const clearAwaitedHostRequest = @import("awaited_host_request.zig").clear;
+    pub const setAwaitedHostRequest = @import("awaited_host_request.zig").set;
+    pub const awaitedHostRequestActive = @import("awaited_host_request.zig").active;
+    pub const awaitedHostRequestMatches = @import("awaited_host_request.zig").matches;
+    pub const awaitingHostSense = @import("awaited_host_request.zig").awaitingSense;
+    pub const fulfillAwaitedHostRequestIfMatches = @import("awaited_host_request.zig").fulfillIfMatches;
 
     pub const conversationSpeakerLine = brain_recognition.conversationSpeakerLine;
 
     pub const retainCaptureForPersonMemory = brain_recognition.retainCaptureForPersonMemory;
 
     pub const recognizeForObservation = brain_person_memory.recognizeForObservation;
+    pub const recognitionAlreadyInObservations = brain_person_memory.recognitionAlreadyInObservations;
+    pub const recognitionRecentObservationNote = brain_person_memory.recognitionRecentObservationNote;
 
     /// Identify and greet using a frame that has already been captured (for
     /// example a pulled frontend camera observation), skipping a fresh capture.
@@ -284,9 +363,12 @@ pub const Brain = struct {
 
     pub const rememberPersonForObservation = brain_person_memory.rememberPersonForObservation;
 
+    pub const forgetPersonForObservation = brain_person_memory.forgetPersonForObservation;
+
     pub const updateFacePictureForObservation = brain_person_memory.updateFacePictureForObservation;
 
     pub const uploadedMediaObservation = brain_person_memory.uploadedMediaObservation;
+    pub const uploadedImageObservation = brain_person_memory.uploadedImageObservation;
 
     pub const compareImagesForObservation = brain_person_memory.compareImagesForObservation;
 
@@ -304,19 +386,23 @@ pub const Brain = struct {
 
     pub const addSighting = brain_person_memory.addSighting;
 
+    pub const recordIdentityHypothesis = brain_person_memory.recordIdentityHypothesis;
+
+    pub const recordIdentityCorrectionLearning = brain_person_memory.recordIdentityCorrectionLearning;
+
     pub const say = brain_person_memory.say;
 
     pub const setSendEnabled = brain_logging_events.setSendEnabled;
 
     pub const logUserUtterance = brain_logging_events.logUserUtterance;
 
-    pub const logCommandSent = brain_logging_events.logCommandSent;
+    pub const logCapabilityRequested = brain_logging_events.logCapabilityRequested;
 
-    pub const logCommandResult = brain_logging_events.logCommandResult;
+    pub const logCapabilityResult = brain_logging_events.logCapabilityResult;
 
-    pub const logMaintenanceCommandSent = brain_logging_events.logMaintenanceCommandSent;
+    pub const logMaintenanceCapabilityRequested = brain_logging_events.logMaintenanceCapabilityRequested;
 
-    pub const logMaintenanceCommandResult = brain_logging_events.logMaintenanceCommandResult;
+    pub const logMaintenanceCapabilityResult = brain_logging_events.logMaintenanceCapabilityResult;
 
     pub const logState = brain_logging_events.logState;
 
@@ -328,21 +414,33 @@ pub const Brain = struct {
 
     pub const traceCount = brain_logging_events.traceCount;
 
+    pub const traceContextComposition = brain_logging_events.traceContextComposition;
+    pub const ensureContextStatsLoaded = brain_logging_events.ensureContextStatsLoaded;
+    pub const maybeFlushContextStats = brain_logging_events.maybeFlushContextStats;
+    pub const flushContextStatsIfDirty = brain_logging_events.flushContextStatsIfDirty;
+    pub const recordContextBudgetExceeded = brain_logging_events.recordContextBudgetExceeded;
+    pub const recordProcessGoalComposition = brain_logging_events.recordProcessGoalComposition;
+    pub const recordLlmCompletion = brain_logging_events.recordLlmCompletion;
+    pub const llmStatsRecorder = brain_logging_events.llmStatsRecorder;
+    pub const wireLlmStatsRecorder = brain_logging_events.wireLlmStatsRecorder;
+
     pub const traceIntent = brain_logging_events.traceIntent;
 
     pub const traceTurn = brain_logging_events.traceTurn;
 
-    pub const traceTurnCommands = brain_logging_events.traceTurnCommands;
+    pub const traceTurnActionPressures = brain_logging_events.traceTurnActionPressures;
 
-    pub const traceCommandBatch = brain_logging_events.traceCommandBatch;
+    pub const traceActionPressureBatch = brain_logging_events.traceActionPressureBatch;
 
-    pub const traceCommand = brain_logging_events.traceCommand;
+    pub const traceActionPressure = brain_logging_events.traceActionPressure;
 
-    pub const traceCommandError = brain_logging_events.traceCommandError;
+    pub const traceActionPressureError = brain_logging_events.traceActionPressureError;
 
-    pub const appendCommandLog = brain_logging_events.appendCommandLog;
+    pub const traceActionPressureDeferred = brain_logging_events.traceActionPressureDeferred;
 
-    pub const recordRuntimeEvent = brain_logging_events.recordRuntimeEvent;
+    pub const appendEventLog = brain_logging_events.appendEventLog;
+
+    pub const recordExperienceLogEvent = brain_logging_events.recordExperienceLogEvent;
 
     pub const recordIdMonitorEvent = brain_logging_events.recordIdMonitorEvent;
 
@@ -350,21 +448,65 @@ pub const Brain = struct {
 
     pub const recordMemoryCandidateEvent = brain_logging_events.recordMemoryCandidateEvent;
 
-    pub const formatCommand = brain_logging_events.formatCommand;
+    pub const recordMemoryExperience = experience_pipeline.recordMemoryExperience;
+    pub const ExperiencePipeline = experience_pipeline.ExperiencePipeline;
+    pub const recordExperienceEvent = experience_pipeline.recordExperienceEvent;
+    pub const currentHostId = experience_pipeline.currentHostId;
+    pub const ensureHostBinding = experience_pipeline.ensureHostBinding;
 
-    pub const handleInterruptStimulus = brain_command_execution.handleInterruptStimulus;
+    pub const recordSimpleExperienceEvent = experience_pipeline.recordSimpleExperienceEvent;
 
-    pub const executeCommands = brain_command_execution.executeCommands;
+    pub const recordExperienceLogMirrorEvent = experience_pipeline.recordExperienceLogMirrorEvent;
 
-    pub const appendPendingHardErrorObservation = brain_command_execution.appendPendingHardErrorObservation;
+    pub const recordCapabilityStatus = capabilities.recordCapabilityStatus;
 
-    pub const handleHardCommandError = brain_command_execution.handleHardCommandError;
+    pub const recordCapabilityRequest = capabilities.recordCapabilityRequest;
 
-    pub const executeChatCommands = brain_command_execution.executeChatCommands;
+    pub const recordCapabilityResult = capabilities.recordCapabilityResult;
+    pub const markMailboxRead = capabilities.markMailboxRead;
+    pub const recordManifestStatuses = capabilities.recordManifestStatuses;
+    pub const CapabilityRegistry = capability_registry;
+    pub const CapabilitySynonyms = @import("capability_synonyms.zig");
+    pub const registered_subsystems = subsystems.registered_subsystems;
+    pub const collectSubsystemPressures = subsystems.collectSubsystemPressures;
+    pub const arbitrateSubsystemPressures = subsystems.arbitrateSubsystemPressures;
+    pub const appendSubsystemObservations = subsystems.appendSubsystemObservations;
+    pub const Subsystem = action_selection.Subsystem;
+    pub const SubsystemContext = action_selection.SubsystemContext;
+    pub const proposeActionPressure = action_selection.proposeActionPressure;
+    pub const selectActionPressure = action_selection.selectActionPressure;
+    pub const suppressActionPressure = action_selection.suppressActionPressure;
 
-    pub const commandIsCallable = brain_command_execution.commandIsCallable;
+    pub const readModelsSnapshot = read_models.readModelsSnapshot;
 
-    pub const chatCommandsEndWithSpeech = brain_command_execution.chatCommandsEndWithSpeech;
+    pub const requestDreamTime = dream_time.requestDreamTime;
+    pub const enterDrowsy = dream_time.enterDrowsy;
+    pub const recoverStuckBrainMode = dream_time.recoverStuckBrainMode;
+
+    pub const facultyForCapability = learning_mod.facultyForCapability;
+    pub const selfTrustForFaculty = learning_mod.selfTrustForFaculty;
+    pub const recognizeSubjectComposite = recognition_composite.recognizeSubject;
+
+    pub const formatActionPressure = brain_logging_events.formatActionPressure;
+
+    pub const handleInterruptStimulus = brain_action_execution.handleInterruptStimulus;
+
+    pub const executeActionProposals = brain_lifecycle.executeRuntimeProposalBatch;
+    pub const executeRuntimeAutonomyBatch = brain_lifecycle.executeRuntimeAutonomyBatch;
+    pub const executeActionProposalsDirect = brain_action_execution.executeActionProposalsDirect;
+    pub const publishRuntimeMemoryCandidate = brain_lifecycle.publishRuntimeMemoryCandidate;
+    pub const publishRuntimeMemoryConsolidation = brain_lifecycle.publishRuntimeMemoryConsolidation;
+    pub const publishRuntimeLearningCapabilityRecorded = brain_lifecycle.publishRuntimeLearningCapabilityRecorded;
+    pub const publishRuntimeLearningCorrectionRecorded = brain_lifecycle.publishRuntimeLearningCorrectionRecorded;
+    pub const queryRuntimeMemoryAudit = brain_lifecycle.queryRuntimeMemoryAudit;
+
+    pub const appendPendingHardErrorObservation = brain_action_execution.appendPendingHardErrorObservation;
+
+    pub const handleHardActionError = brain_action_execution.handleHardActionError;
+
+    pub const actionIsCallable = brain_action_execution.actionIsCallable;
+
+    pub const actionProposalsEndWithSpeech = brain_action_execution.actionProposalsEndWithSpeech;
 
     pub const introspect = brain_introspection_autonomy.introspect;
 
@@ -374,9 +516,15 @@ pub const Brain = struct {
 
     pub const appendSocialContextObservation = brain_lifecycle.appendSocialContextObservation;
 
+    pub const appendReadModelsObservation = brain_lifecycle.appendReadModelsObservation;
+
+    pub const appendHostCapabilityObservationIfChanged = brain_lifecycle.appendHostCapabilityObservationIfChanged;
+
     pub const affordanceCatalog = brain_introspection_autonomy.affordanceCatalog;
 
-    pub const commandUnavailableReason = brain_introspection_autonomy.commandUnavailableReason;
+    pub const actionUnavailableReason = brain_introspection_autonomy.actionUnavailableReason;
+
+    pub const actionIsAvailable = brain_introspection_autonomy.actionIsAvailable;
 
     pub const senseAvailable = brain_introspection_autonomy.senseAvailable;
 
@@ -389,6 +537,7 @@ pub const Brain = struct {
     pub const databaseObservation = brain_introspection_autonomy.databaseObservation;
 
     pub const selfFactsSummary = brain_introspection_autonomy.selfFactsSummary;
+    pub const selfFactsConversationSummary = brain_introspection_autonomy.selfFactsConversationSummary;
 
     pub const activeNeedsSummary = brain_introspection_autonomy.activeNeedsSummary;
 
@@ -400,7 +549,7 @@ pub const Brain = struct {
 
     pub const autonomyPlannerCost = brain_autonomy.autonomyPlannerCost;
 
-    pub const autonomyCommandCost = brain_autonomy.autonomyCommandCost;
+    pub const autonomyActionCost = brain_autonomy.autonomyActionCost;
 
     pub const buildAutonomyContext = brain_autonomy.buildAutonomyContext;
 
@@ -414,17 +563,17 @@ pub const Brain = struct {
 
     pub const localDayKey = brain_autonomy.localDayKey;
 
-    pub const dream = brain_dream_memory.dream;
-
     pub const dreamImagePrompt = brain_dream_memory.dreamImagePrompt;
 
     pub const imagineImage = brain_dream_memory.imagineImage;
+    pub const saveFlexibleIdentityReconciliation = brain_dream_memory.saveFlexibleIdentityReconciliation;
 
-    pub const runMaintenanceCommand = brain_dream_memory.runMaintenanceCommand;
+    pub const runMaintenanceCapability = brain_dream_memory.runMaintenanceCapability;
 
     pub const buildConversationMemory = brain_dream_memory.buildConversationMemory;
 
     pub const buildConversationMemoryWithSpeaker = brain_dream_memory.buildConversationMemoryWithSpeaker;
+    pub const selectConversationMemories = @import("memory_selection.zig").selectConversationMemories;
 
     pub const formatConversationSummaryForMemory = brain_dream_memory.formatConversationSummaryForMemory;
 
@@ -438,7 +587,7 @@ pub const Brain = struct {
 
     pub const seedEntryMemory = brain_dream_memory.seedEntryMemory;
 
-    pub const addExperience = brain_dream_memory.addExperience;
+    pub const recordExperienceFromLog = brain_dream_memory.recordExperienceFromLog;
 
     pub const heardSpeechRaw = brain_dream_memory.heardSpeechRaw;
 
@@ -457,6 +606,8 @@ pub const Brain = struct {
     pub const feelAbout = brain_psyche_memory.feelAbout;
 
     pub const detectWantAchievements = brain_psyche_memory.detectWantAchievements;
+
+    pub const classifyIntent = brain_lifecycle.classifyIntent;
 
     pub const thinkAbout = brain_psyche_memory.thinkAbout;
 
@@ -480,8 +631,6 @@ pub const Brain = struct {
         return brain_psyche_memory.currentFocusAttention(self.current_focus, self.now_seconds);
     }
 
-    pub const askHuman = brain_psyche_memory.askHuman;
-
     pub const consolidateMemory = brain_psyche_memory.consolidateMemory;
 
     pub const recallMemories = brain_psyche_memory.recallMemories;
@@ -492,3 +641,7 @@ pub const Brain = struct {
 };
 
 pub const remote_thinking_failure_message = "I'm unable to continue thinking due to a remote error.";
+
+pub const wireLlmStatsRecorder = brain_logging_events.wireLlmStatsRecorder;
+pub const recordLlmCompletion = brain_logging_events.recordLlmCompletion;
+pub const llmStatsRecorder = brain_logging_events.llmStatsRecorder;

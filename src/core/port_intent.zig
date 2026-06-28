@@ -77,19 +77,33 @@ pub fn classifyHeuristic(allocator: std.mem.Allocator, context: IntentContext, t
     }
 
     if (try extractName(allocator, trimmed)) |name| return .{ .action = .provide_name, .value = name };
-    if (context == .name_prompt and looksLikeBareName(trimmed)) return .{ .action = .provide_name, .value = try allocator.dupe(u8, trimmed) };
+    if (looksLikeBareName(trimmed) and (context == .name_prompt or context == .provide_name)) {
+        return .{ .action = .provide_name, .value = try allocator.dupe(u8, trimmed) };
+    }
     return .{ .action = .unknown };
 }
 
 fn isAffirmative(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "yes") or
+    if (std.ascii.eqlIgnoreCase(text, "yes") or
         std.ascii.eqlIgnoreCase(text, "y") or
         std.ascii.eqlIgnoreCase(text, "yep") or
         std.ascii.eqlIgnoreCase(text, "yeah") or
         std.ascii.eqlIgnoreCase(text, "yess") or
         std.ascii.eqlIgnoreCase(text, "sure") or
         std.ascii.eqlIgnoreCase(text, "please do") or
-        std.ascii.indexOfIgnoreCase(text, "you can") != null;
+        std.ascii.indexOfIgnoreCase(text, "you can") != null)
+    {
+        return true;
+    }
+    if (std.ascii.indexOfIgnoreCase(text, "yes") != null and
+        (std.ascii.indexOfIgnoreCase(text, "that's me") != null or
+            std.ascii.indexOfIgnoreCase(text, "that is me") != null or
+            std.ascii.indexOfIgnoreCase(text, "i am") != null or
+            std.ascii.indexOfIgnoreCase(text, "i'm") != null))
+    {
+        return true;
+    }
+    return false;
 }
 
 fn isNegative(text: []const u8) bool {
@@ -176,4 +190,19 @@ test "name prompt accepts plausible bare and conversational names" {
     const conversational = try classifyHeuristic(allocator, .name_prompt, "Hello. I'm Zelda");
     try std.testing.expectEqual(IntentAction.provide_name, conversational.action);
     try std.testing.expectEqualStrings("Zelda", conversational.value.?);
+}
+
+test "provide name context accepts bare names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const bare = try classifyHeuristic(arena.allocator(), .provide_name, "Zelda");
+    try std.testing.expectEqual(IntentAction.provide_name, bare.action);
+    try std.testing.expectEqualStrings("Zelda", bare.value.?);
+}
+
+test "identity confirmation accepts conversational affirmatives" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const confirmed = try classifyHeuristic(arena.allocator(), .identity_confirmation, "Yes, that's me");
+    try std.testing.expectEqual(IntentAction.grant_memory_permission, confirmed.action);
 }

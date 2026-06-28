@@ -9,6 +9,7 @@ const EmbeddedE2EProvider = enum {
     openai,
     anthropic,
     google,
+    deepseek,
 };
 
 const EmbeddedE2EProviderModel = struct {
@@ -157,6 +158,7 @@ fn parseEmbeddedE2EProvider(text: []const u8) ?EmbeddedE2EProvider {
     if (std.ascii.eqlIgnoreCase(text, "openai")) return .openai;
     if (std.ascii.eqlIgnoreCase(text, "anthropic")) return .anthropic;
     if (std.ascii.eqlIgnoreCase(text, "google") or std.ascii.eqlIgnoreCase(text, "gemini")) return .google;
+    if (std.ascii.eqlIgnoreCase(text, "deepseek")) return .deepseek;
     return null;
 }
 
@@ -166,6 +168,7 @@ fn requireEmbeddedE2EProviderKeys(env: *const std.process.Environ.Map, models: [
             .openai => if (env.get("OPENAI_API_KEY") == null) return error.MissingOpenAIAPIKey,
             .anthropic => if (env.get("ANTHROPIC_API_KEY") == null) return error.MissingAnthropicAPIKey,
             .google => if (googleApiKey(env) == null) return error.MissingGoogleAPIKey,
+            .deepseek => if (env.get("DEEPSEEK_API_KEY") == null) return error.MissingDeepSeekAPIKey,
         }
     }
 }
@@ -183,6 +186,7 @@ fn embeddedE2EProviderName(provider: EmbeddedE2EProvider) []const u8 {
         .openai => "openai",
         .anthropic => "anthropic",
         .google => "google",
+        .deepseek => "deepseek",
     };
 }
 

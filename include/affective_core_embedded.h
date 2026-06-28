@@ -25,7 +25,6 @@ typedef struct AffectiveCoreEmbeddedConfig {
     AffectiveCoreEmbeddedString memory_path;
     AffectiveCoreEmbeddedString graph_path;
     AffectiveCoreEmbeddedString schedule_path;
-    AffectiveCoreEmbeddedString events_path;
     AffectiveCoreEmbeddedString maintenance_state_path;
     AffectiveCoreEmbeddedString face_embeddings_dir;
     AffectiveCoreEmbeddedString host_manifest_json;
@@ -67,6 +66,8 @@ int affective_core_embedded_create(
 
 void affective_core_embedded_destroy(AffectiveCoreEmbedded *handle);
 
+// Each handle allows one in-flight mutating call at a time. Concurrent dispatch,
+// drain, raw_ref_lookup, export, or import on the same handle returns runtime_error.
 void affective_core_embedded_free_global_string(AffectiveCoreEmbeddedString string);
 
 int affective_core_embedded_dispatch_json(
@@ -91,32 +92,24 @@ int affective_core_embedded_raw_ref_lookup_json(
     AffectiveCoreEmbeddedString *out_error
 );
 
-int affective_core_embedded_conversation_turn(
+int affective_core_embedded_export_brain(
     AffectiveCoreEmbedded *handle,
-    const uint8_t *text,
-    size_t text_len,
+    const uint8_t *brain_file_path,
+    size_t brain_file_path_len,
     AffectiveCoreEmbeddedString *out_data,
     AffectiveCoreEmbeddedString *out_error
 );
 
-int affective_core_embedded_call_tool(
+int affective_core_embedded_import_brain(
     AffectiveCoreEmbedded *handle,
-    const uint8_t *name,
-    size_t name_len,
-    const uint8_t *arguments_json,
-    size_t arguments_json_len,
-    AffectiveCoreEmbeddedString *out_data,
-    AffectiveCoreEmbeddedString *out_error
-);
-
-int affective_core_embedded_introspect(
-    AffectiveCoreEmbedded *handle,
-    AffectiveCoreEmbeddedString *out_data,
-    AffectiveCoreEmbeddedString *out_error
-);
-
-int affective_core_embedded_introspect_json(
-    AffectiveCoreEmbedded *handle,
+    const uint8_t *brain_file_path,
+    size_t brain_file_path_len,
+    const uint8_t *brain_id,
+    size_t brain_id_len,
+    const uint8_t *brain_root,
+    size_t brain_root_len,
+    const uint8_t *host_id,
+    size_t host_id_len,
     AffectiveCoreEmbeddedString *out_data,
     AffectiveCoreEmbeddedString *out_error
 );

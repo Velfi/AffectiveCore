@@ -14,7 +14,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "AffectiveCoreApple",
-            path: "Sources/AffectiveCoreApple"
+            path: "Sources/AffectiveCoreApple",
+            resources: [
+                .copy("Resources/new_brain_defaults.json"),
+            ]
         ),
     ]
 )

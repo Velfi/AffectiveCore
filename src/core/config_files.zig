@@ -3,28 +3,46 @@ const ports = @import("ports.zig");
 const files = ports.files;
 const FileSystem = files.FileSystem;
 const Config = @import("config.zig").Config;
+const CapacityConfig = @import("config.zig").CapacityConfig;
+const CapacityConfigPartial = @import("config.zig").CapacityConfigPartial;
+const cognitive_capacity = @import("cognitive_capacity.zig");
+const llm_routing = @import("llm_routing.zig");
+
+const LlmModelEntry = llm_routing.RosterModelEntry;
+
+const llm_providers_template_json = @embedFile("../fixtures/llm_providers.json");
 
 const LlmConfigFile = struct {
     mode: ?[]const u8 = null,
+    llm_quality: ?[]const u8 = null,
     reasoning_effort: ?[]const u8 = null,
     psyche_reasoning_effort: ?[]const u8 = null,
-    models: []const struct {
-        provider: []const u8,
-        model: []const u8,
-    } = &.{},
-    psyche_models: []const struct {
-        provider: []const u8,
-        model: []const u8,
-    } = &.{},
+    models: []const LlmModelEntry = &.{},
+    psyche_models: []const LlmModelEntry = &.{},
 };
 
 pub const LoadedLlmConfig = struct {
     mode: ?[]const u8 = null,
+    llm_quality: ?[]const u8 = null,
     reasoning_effort: ?[]const u8 = null,
     psyche_reasoning_effort: ?[]const u8 = null,
     models: []const u8 = "",
     psyche_models: []const u8 = "",
+    conversation_roster: llm_routing.LlmRoster = .{ .entries = &.{} },
+    psyche_roster: llm_routing.LlmRoster = .{ .entries = &.{} },
     default_model: ?[]const u8 = null,
+
+    pub fn deinit(self: *LoadedLlmConfig, allocator: std.mem.Allocator) void {
+        if (self.mode) |v| allocator.free(v);
+        if (self.llm_quality) |v| allocator.free(v);
+        if (self.reasoning_effort) |v| allocator.free(v);
+        if (self.psyche_reasoning_effort) |v| allocator.free(v);
+        allocator.free(self.models);
+        allocator.free(self.psyche_models);
+        if (self.default_model) |v| allocator.free(v);
+        self.conversation_roster.deinit(allocator);
+        self.psyche_roster.deinit(allocator);
+    }
 };
 
 const EmailConfigFile = struct {
@@ -32,6 +50,19 @@ const EmailConfigFile = struct {
     from: []const u8,
     username: ?[]const u8 = null,
     password: ?[]const u8 = null,
+};
+
+const CapacityConfigFile = struct {
+    activity_stack_max: ?usize = null,
+    focus_slots_max: ?usize = null,
+    memory_selected_max: ?usize = null,
+    memory_prefilter_max: ?usize = null,
+    candidate_actions_max: ?usize = null,
+    open_loops_soft_max: ?usize = null,
+    conversation_summaries_in_context_max: ?usize = null,
+    chat_context_tokens_max: ?usize = null,
+    dispatch_envelope_bytes_max: ?usize = null,
+    dispatch_event_count_max: ?usize = null,
 };
 
 const RuntimeOptionsFile = struct {
@@ -46,23 +77,31 @@ const RuntimeOptionsFile = struct {
     memory_path: ?[]const u8 = null,
     graph_path: ?[]const u8 = null,
     seed_path: ?[]const u8 = null,
-    events_path: ?[]const u8 = null,
     captures_dir: ?[]const u8 = null,
     capture_scratch_dir: ?[]const u8 = null,
     audio_input_dir: ?[]const u8 = null,
     audio_output_dir: ?[]const u8 = null,
     autonomy_mode: ?[]const u8 = null,
     psyche_mode: ?[]const u8 = null,
+    llm_quality: ?[]const u8 = null,
     speech_voice: ?[]const u8 = null,
     button_hold_ms: ?u64 = null,
     conversation_idle_timeout_seconds: ?u64 = null,
     known_threshold: ?f32 = null,
     uncertain_threshold: ?f32 = null,
-    autonomy_interval_seconds: ?u64 = null,
     autonomy_sleep: ?[]const u8 = null,
     autonomy_quiet_hours: ?[]const u8 = null,
-    autonomy_speech_cooldown_minutes: ?u64 = null,
-    autonomy_daily_energy: ?u32 = null,
+    autonomy_limited_max_capacity: ?f32 = null,
+    autonomy_full_max_capacity: ?f32 = null,
+    autonomy_limited_threshold_bias: ?f32 = null,
+    autonomy_full_threshold_bias: ?f32 = null,
+    autonomy_social_engagement_boost: ?f32 = null,
+    autonomy_limited_replenish_actions_per_minute: ?f32 = null,
+    autonomy_full_replenish_actions_per_minute: ?f32 = null,
+    autonomy_planner_min_capacity: ?f32 = null,
+    autonomy_social_reserve: ?f32 = null,
+    autonomy_safety_reserve: ?f32 = null,
+    autonomy_opportunity_reserve: ?f32 = null,
     id_monitors_mode: ?[]const u8 = null,
     id_monitor_interval_seconds: ?u64 = null,
     id_monitor_external_command: ?[]const u8 = null,
@@ -72,6 +111,7 @@ const RuntimeOptionsFile = struct {
     face_embeddings_dir: ?[]const u8 = null,
     maintenance_schedule_path: ?[]const u8 = null,
     maintenance_state_path: ?[]const u8 = null,
+    capacity: ?CapacityConfigFile = null,
 };
 
 pub const LoadedEmailConfig = struct {
@@ -81,32 +121,96 @@ pub const LoadedEmailConfig = struct {
     password: []const u8,
 };
 
-pub fn loadLlmConfig(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io) !LoadedLlmConfig {
-    const bytes = try fs.readFileAllocPath(io, "data/llm_providers.json", allocator, .limited(64 * 1024));
+pub fn loadLlmConfigFromPath(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, path: []const u8) !LoadedLlmConfig {
+    const bytes = try fs.readFileAllocPath(io, path, allocator, .limited(64 * 1024));
     defer allocator.free(bytes);
+    return parseLlmConfig(allocator, bytes);
+}
+
+pub fn loadLlmConfig(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io) !LoadedLlmConfig {
+    return loadLlmConfigFromPath(allocator, fs, io, "data/llm_providers.json");
+}
+
+pub fn seedLlmProvidersDefault(fs: FileSystem, io: std.Io, dest_path: []const u8) !void {
+    try fs.ensureParentDir(io, dest_path);
+    try fs.writeFilePath(io, dest_path, llm_providers_template_json);
+}
+
+pub fn seedLlmProvidersFromTemplate(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, dest_path: []const u8, template_path: []const u8) !void {
+    const bytes = try fs.readFileAllocPath(io, template_path, allocator, .limited(64 * 1024));
+    defer allocator.free(bytes);
+    try fs.ensureParentDir(io, dest_path);
+    try fs.writeFilePath(io, dest_path, bytes);
+}
+
+fn rosterToJsonEntries(allocator: std.mem.Allocator, roster: llm_routing.LlmRoster) ![]LlmModelEntry {
+    var out = try allocator.alloc(LlmModelEntry, roster.entries.len);
+    for (roster.entries, 0..) |entry, i| {
+        out[i] = .{
+            .provider = llm_routing.providerName(entry.provider),
+            .model = entry.model,
+            .tier = @tagName(entry.tier),
+        };
+    }
+    return out;
+}
+
+pub fn saveLlmProviders(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, cfg: Config) !void {
+    if (cfg.llm_providers_path.len == 0) return error.MissingLlmProvidersPath;
+    if (cfg.conversation_roster.entries.len == 0) return error.EmptyConversationRoster;
+    const conversation_models = try rosterToJsonEntries(allocator, cfg.conversation_roster);
+    defer allocator.free(conversation_models);
+    const psyche_models = if (cfg.psyche_roster.entries.len > 0)
+        try rosterToJsonEntries(allocator, cfg.psyche_roster)
+    else
+        @as([]LlmModelEntry, &.{});
+    defer if (psyche_models.len > 0) allocator.free(psyche_models);
+    const body = try std.json.Stringify.valueAlloc(allocator, struct {
+        mode: []const u8,
+        reasoning_effort: []const u8,
+        psyche_reasoning_effort: []const u8,
+        models: []LlmModelEntry,
+        psyche_models: []LlmModelEntry,
+    }{
+        .mode = cfg.ai_mode,
+        .reasoning_effort = cfg.conversation_reasoning_effort,
+        .psyche_reasoning_effort = cfg.psyche_reasoning_effort,
+        .models = conversation_models,
+        .psyche_models = psyche_models,
+    }, .{ .whitespace = .indent_2 });
+    defer allocator.free(body);
+    try fs.ensureParentDir(io, cfg.llm_providers_path);
+    try fs.writeFilePath(io, cfg.llm_providers_path, body);
+}
+
+pub fn parseLlmConfig(allocator: std.mem.Allocator, bytes: []const u8) !LoadedLlmConfig {
     const parsed = try std.json.parseFromSlice(LlmConfigFile, allocator, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
-    var out = std.ArrayList(u8).empty;
-    var default_model: ?[]const u8 = null;
-    for (parsed.value.models, 0..) |entry, i| {
-        const provider = std.mem.trim(u8, entry.provider, " \r\n\t");
-        const model = std.mem.trim(u8, entry.model, " \r\n\t");
-        if (provider.len == 0 or model.len == 0) continue;
-        if (out.items.len > 0) try out.append(allocator, ',');
-        try out.appendSlice(allocator, provider);
-        try out.append(allocator, ':');
-        try out.appendSlice(allocator, model);
-        if (i == 0) default_model = try allocator.dupe(u8, model);
-    }
-    const psyche_models = try formatProviderModels(allocator, parsed.value.psyche_models);
+    const conversation_roster = try llm_routing.parseRosterFromJsonEntries(allocator, parsed.value.models);
+    const psyche_roster: llm_routing.LlmRoster = if (parsed.value.psyche_models.len == 0)
+        .{ .entries = &.{} }
+    else
+        try llm_routing.parseRosterFromJsonEntries(allocator, parsed.value.psyche_models);
+    const models = try conversation_roster.toModelsSpec(allocator);
+    const psyche_models: []const u8 = if (psyche_roster.entries.len == 0)
+        try allocator.dupe(u8, "")
+    else
+        try psyche_roster.toModelsSpec(allocator);
+    const default_model: ?[]const u8 = if (conversation_roster.entries.len > 0)
+        try allocator.dupe(u8, conversation_roster.entries[0].model)
+    else
+        null;
 
     return .{
         .mode = if (parsed.value.mode) |mode| try allocator.dupe(u8, mode) else null,
+        .llm_quality = if (parsed.value.llm_quality) |quality| try allocator.dupe(u8, quality) else null,
         .reasoning_effort = if (parsed.value.reasoning_effort) |effort| try allocator.dupe(u8, effort) else null,
         .psyche_reasoning_effort = if (parsed.value.psyche_reasoning_effort) |effort| try allocator.dupe(u8, effort) else null,
-        .models = try out.toOwnedSlice(allocator),
+        .models = models,
         .psyche_models = psyche_models,
+        .conversation_roster = conversation_roster,
+        .psyche_roster = psyche_roster,
         .default_model = default_model,
     };
 }
@@ -164,23 +268,31 @@ pub fn parseRuntimeOptionsConfig(allocator: std.mem.Allocator, base: Config, byt
     if (value.memory_path) |v| cfg.memory_path = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.graph_path) |v| cfg.graph_path = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.seed_path) |v| cfg.seed_path = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
-    if (value.events_path) |v| cfg.events_path = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.captures_dir) |v| cfg.captures_dir = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.capture_scratch_dir) |v| cfg.capture_scratch_dir = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.audio_input_dir) |v| cfg.audio_input_dir = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.audio_output_dir) |v| cfg.audio_output_dir = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
-    if (value.autonomy_mode) |v| cfg.autonomy_mode = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
+    if (value.autonomy_mode) |v| cfg.autonomy_mode = try allocator.dupe(u8, normalizeAutonomyMode(std.mem.trim(u8, v, " \r\n\t")));
     if (value.psyche_mode) |v| cfg.psyche_mode = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
+    if (value.llm_quality) |v| cfg.llm_quality = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.speech_voice) |v| cfg.speech_voice = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.button_hold_ms) |v| cfg.button_hold_ms = v;
     if (value.conversation_idle_timeout_seconds) |v| cfg.conversation_idle_timeout_seconds = v;
     if (value.known_threshold) |v| cfg.known_threshold = v;
     if (value.uncertain_threshold) |v| cfg.uncertain_threshold = v;
-    if (value.autonomy_interval_seconds) |v| cfg.autonomy_interval_seconds = v;
     if (value.autonomy_sleep) |v| cfg.autonomy_sleep = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.autonomy_quiet_hours) |v| cfg.autonomy_quiet_hours = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
-    if (value.autonomy_speech_cooldown_minutes) |v| cfg.autonomy_speech_cooldown_minutes = v;
-    if (value.autonomy_daily_energy) |v| cfg.autonomy_daily_energy = v;
+    if (value.autonomy_limited_max_capacity) |v| cfg.autonomy_limited_max_capacity = v;
+    if (value.autonomy_full_max_capacity) |v| cfg.autonomy_full_max_capacity = v;
+    if (value.autonomy_limited_threshold_bias) |v| cfg.autonomy_limited_threshold_bias = v;
+    if (value.autonomy_full_threshold_bias) |v| cfg.autonomy_full_threshold_bias = v;
+    if (value.autonomy_social_engagement_boost) |v| cfg.autonomy_social_engagement_boost = v;
+    if (value.autonomy_limited_replenish_actions_per_minute) |v| cfg.autonomy_limited_replenish_actions_per_minute = v;
+    if (value.autonomy_full_replenish_actions_per_minute) |v| cfg.autonomy_full_replenish_actions_per_minute = v;
+    if (value.autonomy_planner_min_capacity) |v| cfg.autonomy_planner_min_capacity = v;
+    if (value.autonomy_social_reserve) |v| cfg.autonomy_social_reserve = v;
+    if (value.autonomy_safety_reserve) |v| cfg.autonomy_safety_reserve = v;
+    if (value.autonomy_opportunity_reserve) |v| cfg.autonomy_opportunity_reserve = v;
     if (value.id_monitors_mode) |v| cfg.id_monitors_mode = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.id_monitor_interval_seconds) |v| cfg.id_monitor_interval_seconds = v;
     if (value.id_monitor_external_command) |v| cfg.id_monitor_external_command = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
@@ -190,13 +302,42 @@ pub fn parseRuntimeOptionsConfig(allocator: std.mem.Allocator, base: Config, byt
     if (value.face_embeddings_dir) |v| cfg.face_embeddings_dir = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.maintenance_schedule_path) |v| cfg.maintenance_schedule_path = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
     if (value.maintenance_state_path) |v| cfg.maintenance_state_path = try allocator.dupe(u8, std.mem.trim(u8, v, " \r\n\t"));
+    if (value.capacity) |cap| {
+        cfg.capacity = cognitive_capacity.mergePartial(cfg.capacity, capacityPartialFromFile(cap));
+        try cognitive_capacity.validate(cfg.capacity);
+    }
     return cfg;
 }
 
-pub fn saveRuntimeOptions(fs: FileSystem, io: std.Io, cfg: Config) !void {
-    var buffer: [4096]u8 = undefined;
-    var stream = std.Io.Writer.fixed(&buffer);
-    try stream.print("{f}\n", .{std.json.fmt(.{
+fn capacityPartialFromFile(file: CapacityConfigFile) CapacityConfigPartial {
+    return .{
+        .activity_stack_max = file.activity_stack_max,
+        .focus_slots_max = file.focus_slots_max,
+        .memory_selected_max = file.memory_selected_max,
+        .memory_prefilter_max = file.memory_prefilter_max,
+        .candidate_actions_max = file.candidate_actions_max,
+        .open_loops_soft_max = file.open_loops_soft_max,
+        .conversation_summaries_in_context_max = file.conversation_summaries_in_context_max,
+        .chat_context_tokens_max = file.chat_context_tokens_max,
+        .dispatch_envelope_bytes_max = file.dispatch_envelope_bytes_max,
+        .dispatch_event_count_max = file.dispatch_event_count_max,
+    };
+}
+
+pub fn provisionBrainConfigFiles(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, cfg: Config) !void {
+    if (cfg.llm_providers_path.len == 0) return error.MissingLlmProvidersPath;
+    const bytes = fs.readFileAllocPath(io, cfg.llm_providers_path, allocator, .limited(64 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => {
+            try seedLlmProvidersDefault(fs, io, cfg.llm_providers_path);
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(bytes);
+}
+
+pub fn saveRuntimeOptions(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, cfg: Config) !void {
+    const body = try std.json.Stringify.valueAlloc(allocator, .{
         .camera_mode = cfg.camera_mode,
         .activation_mode = cfg.activation_mode,
         .ai_mode = cfg.ai_mode,
@@ -207,23 +348,31 @@ pub fn saveRuntimeOptions(fs: FileSystem, io: std.Io, cfg: Config) !void {
         .memory_path = cfg.memory_path,
         .graph_path = cfg.graph_path,
         .seed_path = cfg.seed_path,
-        .events_path = cfg.events_path,
         .captures_dir = cfg.captures_dir,
         .capture_scratch_dir = cfg.capture_scratch_dir,
         .audio_input_dir = cfg.audio_input_dir,
         .audio_output_dir = cfg.audio_output_dir,
         .autonomy_mode = cfg.autonomy_mode,
         .psyche_mode = cfg.psyche_mode,
+        .llm_quality = cfg.llm_quality,
         .speech_voice = cfg.speech_voice,
         .button_hold_ms = cfg.button_hold_ms,
         .conversation_idle_timeout_seconds = cfg.conversation_idle_timeout_seconds,
         .known_threshold = cfg.known_threshold,
         .uncertain_threshold = cfg.uncertain_threshold,
-        .autonomy_interval_seconds = cfg.autonomy_interval_seconds,
         .autonomy_sleep = cfg.autonomy_sleep,
         .autonomy_quiet_hours = cfg.autonomy_quiet_hours,
-        .autonomy_speech_cooldown_minutes = cfg.autonomy_speech_cooldown_minutes,
-        .autonomy_daily_energy = cfg.autonomy_daily_energy,
+        .autonomy_limited_max_capacity = cfg.autonomy_limited_max_capacity,
+        .autonomy_full_max_capacity = cfg.autonomy_full_max_capacity,
+        .autonomy_limited_threshold_bias = cfg.autonomy_limited_threshold_bias,
+        .autonomy_full_threshold_bias = cfg.autonomy_full_threshold_bias,
+        .autonomy_social_engagement_boost = cfg.autonomy_social_engagement_boost,
+        .autonomy_limited_replenish_actions_per_minute = cfg.autonomy_limited_replenish_actions_per_minute,
+        .autonomy_full_replenish_actions_per_minute = cfg.autonomy_full_replenish_actions_per_minute,
+        .autonomy_planner_min_capacity = cfg.autonomy_planner_min_capacity,
+        .autonomy_social_reserve = cfg.autonomy_social_reserve,
+        .autonomy_safety_reserve = cfg.autonomy_safety_reserve,
+        .autonomy_opportunity_reserve = cfg.autonomy_opportunity_reserve,
         .id_monitors_mode = cfg.id_monitors_mode,
         .id_monitor_interval_seconds = cfg.id_monitor_interval_seconds,
         .id_monitor_external_command = cfg.id_monitor_external_command,
@@ -233,22 +382,16 @@ pub fn saveRuntimeOptions(fs: FileSystem, io: std.Io, cfg: Config) !void {
         .face_embeddings_dir = cfg.face_embeddings_dir,
         .maintenance_schedule_path = cfg.maintenance_schedule_path,
         .maintenance_state_path = cfg.maintenance_state_path,
-    }, .{})});
-    try fs.writeFilePath(io, cfg.runtime_options_path, stream.buffered());
+        .capacity = cfg.capacity,
+    }, .{ .whitespace = .indent_2 });
+    defer allocator.free(body);
+    try fs.ensureParentDir(io, cfg.runtime_options_path);
+    try fs.writeFilePath(io, cfg.runtime_options_path, body);
 }
 
-fn formatProviderModels(allocator: std.mem.Allocator, models: anytype) ![]const u8 {
-    var out = std.ArrayList(u8).empty;
-    for (models) |entry| {
-        const provider = std.mem.trim(u8, entry.provider, " \r\n\t");
-        const model = std.mem.trim(u8, entry.model, " \r\n\t");
-        if (provider.len == 0 or model.len == 0) continue;
-        if (out.items.len > 0) try out.append(allocator, ',');
-        try out.appendSlice(allocator, provider);
-        try out.append(allocator, ':');
-        try out.appendSlice(allocator, model);
-    }
-    return out.toOwnedSlice(allocator);
+fn normalizeAutonomyMode(mode: []const u8) []const u8 {
+    if (std.mem.eql(u8, mode, "on")) return "full";
+    return mode;
 }
 
 pub fn brainPath(allocator: std.mem.Allocator, root: []const u8, suffix: []const u8) ![]const u8 {

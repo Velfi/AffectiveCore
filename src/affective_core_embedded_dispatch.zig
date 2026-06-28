@@ -1,210 +1,231 @@
 const std = @import("std");
-const chat = @import("api/chat_client.zig");
-const skills = @import("core/port_skills.zig");
-const brain_container = @import("app/brain_container.zig");
+const chat_client = @import("api/chat_client.zig");
 const app_core = @import("app/app_core.zig");
 const context_gate = @import("app/context_gate.zig");
 const embedded_protocol = @import("app/embedded_protocol.zig");
 const files = @import("platform/common/files.zig");
-const input_mod = @import("platform/common/input.zig");
 const embedded = @import("affective_core_embedded.zig");
+const embedded_ops = @import("affective_core_embedded_ops.zig");
+const error_descriptions = @import("core/error_descriptions.zig");
+const brain_mod = @import("core/brain.zig");
 
 const AffectiveCoreEmbedded = embedded.AffectiveCoreEmbedded;
 
-pub fn dispatchTool(ctx: *AffectiveCoreEmbedded, name: []const u8, args: std.json.Value) ![]u8 {
-    if (std.mem.eql(u8, name, "conversation_turn")) {
-        const result = app_core.conversationResult(try ctx.brain.handleConversationText(try tryTypedSpeech(ctx, try requireString(args, "text"))));
-        return std.json.Stringify.valueAlloc(std.heap.page_allocator, result, .{ .whitespace = .indent_2 });
-    }
-    if (std.mem.eql(u8, name, "short_touch") or std.mem.eql(u8, name, "button_short_touch")) {
-        const result = try shortTouchActivation(ctx);
-        return std.json.Stringify.valueAlloc(std.heap.page_allocator, result, .{ .whitespace = .indent_2 });
-    }
-    if (std.mem.eql(u8, name, "long_touch") or std.mem.eql(u8, name, "button_long_touch")) {
-        const result = try longTouchActivation(ctx);
-        return std.json.Stringify.valueAlloc(std.heap.page_allocator, result, .{ .whitespace = .indent_2 });
-    }
-    if (std.mem.eql(u8, name, "brain_inspect")) {
-        const info = try brain_container.inspectBrain(std.heap.page_allocator, ctx.io(), ctx.brain.cfg);
-        return std.json.Stringify.valueAlloc(std.heap.page_allocator, info, .{ .whitespace = .indent_2 });
-    }
-    if (std.mem.eql(u8, name, "introspect") or std.mem.eql(u8, name, "inner_state")) {
-        return try executeCommand(ctx, .{ .command = .introspect });
-    }
-    if (std.mem.eql(u8, name, "request_orientation")) {
-        return try executeCommand(ctx, .{ .command = .request_orientation });
-    }
-    if (std.mem.eql(u8, name, "memory_index")) return try memoryIndex(ctx);
-    if (std.mem.eql(u8, name, "remember_memory")) {
-        return try executeCommand(ctx, .{
-            .command = .remember_memory,
-            .text = try requireString(args, "text"),
-            .tags = try getStringArray(ctx.allocator(), args, "tags"),
-        });
-    }
-    if (std.mem.eql(u8, name, "recall_memory")) {
-        return try executeCommand(ctx, .{
-            .command = .recall_memory,
-            .query = getString(args, "query") orelse "",
-            .tags = try getStringArray(ctx.allocator(), args, "tags"),
-        });
-    }
-    if (std.mem.eql(u8, name, "choose_attention")) return try executeCommand(ctx, .{ .command = .choose_attention });
-    if (std.mem.eql(u8, name, "consolidate_memory")) return try executeCommand(ctx, .{ .command = .consolidate_memory });
-    if (std.mem.eql(u8, name, "dream")) {
-        return try executeCommand(ctx, .{
-            .command = .dream,
-            .text = getString(args, "text"),
-            .tags = try getStringArray(ctx.allocator(), args, "tags"),
-            .heat_bias = getString(args, "heat_bias"),
-        });
-    }
-    if (std.mem.eql(u8, name, "set_reminder")) {
-        return try executeCommand(ctx, .{
-            .command = .set_reminder,
-            .schedule = try requireString(args, "schedule"),
-            .text = try requireString(args, "text"),
-        });
-    }
-    if (std.mem.eql(u8, name, "list_reminders")) return try listReminders(ctx);
-    if (std.mem.eql(u8, name, "developer_tools")) return try developerTools(ctx);
-    if (skillCommandFromToolCall(ctx, name, args)) |command| {
-        return try executeCommand(ctx, command);
-    }
-    return error.UnknownEmbeddedTool;
-}
+const DispatchRequestMeta = struct {
+    request_id_buf: [96]u8 = undefined,
+    event_type_buf: [96]u8 = undefined,
+    request_id: []const u8 = "",
+    event_type: []const u8 = "invalid",
 
-const DeveloperTool = struct {
-    id: []const u8,
-    title: []const u8,
-    tool_name: []const u8,
-    symbol_name: []const u8,
-    mirror_to_chat: bool = false,
-    requires_camera: bool = false,
+    fn init(request_id_src: []const u8, event_type_src: []const u8) DispatchRequestMeta {
+        var meta: DispatchRequestMeta = .{};
+        meta.request_id = copyLogField(&meta.request_id_buf, request_id_src);
+        meta.event_type = copyLogField(&meta.event_type_buf, event_type_src);
+        return meta;
+    }
 };
 
-pub fn developerTools(ctx: *AffectiveCoreEmbedded) ![]u8 {
-    var tools = std.ArrayList(DeveloperTool).empty;
-    for (skills.registry) |entry| {
-        const title = entry.developer_title orelse continue;
-        try tools.append(ctx.allocator(), .{
-            .id = entry.name,
-            .title = title,
-            .tool_name = entry.name,
-            .symbol_name = entry.developer_symbol_name orelse "hammer",
-            .mirror_to_chat = entry.developer_mirror_to_chat,
-            .requires_camera = entry.developer_requires_camera,
-        });
+fn copyLogField(dest: []u8, src: []const u8) []const u8 {
+    if (src.len == 0) return "";
+    const len = @min(src.len, dest.len);
+    @memcpy(dest[0..len], src[0..len]);
+    return dest[0..len];
+}
+
+const DispatchOutputSummary = struct {
+    status: []const u8,
+    detail: []const u8,
+};
+
+fn parseDispatchRequestMeta(request_json: []const u8) DispatchRequestMeta {
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, request_json, .{}) catch {
+        return DispatchRequestMeta.init("", "invalid");
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return DispatchRequestMeta.init("", "invalid");
+    const root = parsed.value.object;
+    const request_id = getStringFromObject(root, "request_id") orelse "";
+    const event = root.get("event") orelse return DispatchRequestMeta.init(request_id, "missing_event");
+    if (event != .object) return DispatchRequestMeta.init(request_id, "invalid_event");
+    const event_type = getStringFromObject(event.object, "type") orelse "missing_event_type";
+    return DispatchRequestMeta.init(request_id, event_type);
+}
+
+fn summarizeDispatchOutput(output: []const u8) DispatchOutputSummary {
+    const Envelope = struct {
+        ok: bool = true,
+        @"error": ?struct {
+            code: []const u8,
+            message: []const u8,
+        } = null,
+    };
+    const parsed = std.json.parseFromSlice(Envelope, std.heap.page_allocator, output, .{ .ignore_unknown_fields = true }) catch {
+        return .{ .status = "ok", .detail = "response returned" };
+    };
+    defer parsed.deinit();
+    if (!parsed.value.ok) {
+        const err = parsed.value.@"error" orelse return .{ .status = "error", .detail = "dispatch returned ok=false without an error object" };
+        return .{ .status = "error", .detail = err.message };
     }
-    return std.json.Stringify.valueAlloc(std.heap.page_allocator, struct { tools: []const DeveloperTool }{ .tools = tools.items }, .{ .whitespace = .indent_2 });
+    return .{ .status = "ok", .detail = "dispatch completed" };
 }
 
-fn skillCommandFromToolCall(ctx: *AffectiveCoreEmbedded, name: []const u8, args: std.json.Value) ?chat.ChatCommand {
-    const id = skillIdFromName(name) orelse return null;
+fn logDispatchStart(operation: []const u8, dispatch_id: []const u8, request_bytes: usize) void {
+    std.debug.print(
+        "Dispatch operation start operation={s} dispatch_id={s} requestBytes={d}\n",
+        .{ operation, if (dispatch_id.len > 0) dispatch_id else "(none)", request_bytes },
+    );
+}
+
+fn logDispatchResult(operation: []const u8, dispatch_id: []const u8, status: []const u8, data_bytes: usize, detail: []const u8) void {
+    std.debug.print(
+        "Dispatch operation result operation={s} dispatch_id={s} status={s} dataBytes={d} detail=\"{s}\"\n",
+        .{ operation, if (dispatch_id.len > 0) dispatch_id else "(none)", status, data_bytes, detail },
+    );
+}
+
+pub fn emptyBudget(ctx: *AffectiveCoreEmbedded) context_gate.BudgetReport {
     return .{
-        .command = id,
-        .text = getString(args, "text"),
-        .query = getString(args, "query"),
-        .memory_id = getString(args, "memory_id"),
-        .person_id = getString(args, "person_id"),
-        .name = getString(args, "name"),
-        .image_path = getString(args, "image_path"),
-        .schedule = getString(args, "schedule"),
-        .to = getString(args, "to"),
-        .subject = getString(args, "subject"),
-        .heat_bias = getString(args, "heat_bias"),
-        .eyes = getString(args, "eyes"),
-        .mouth = getString(args, "mouth"),
-        .duration_ms = getU32(args, "duration_ms"),
-        .keep_existing = getBool(args, "keep_existing") orelse false,
-        .tags = getStringArray(ctx.allocator(), args, "tags") catch &.{},
+        .max_bytes = ctx.context_budget.max_envelope_bytes,
+        .used_bytes = 0,
+        .compacted = false,
+        .dropped_event_count = 0,
+        .raw_refs = &.{},
     };
-}
-
-fn skillIdFromName(name: []const u8) ?skills.SkillId {
-    inline for (@typeInfo(skills.SkillId).@"enum".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @field(skills.SkillId, field.name);
-    }
-    return null;
-}
-
-pub fn shortTouchActivation(ctx: *AffectiveCoreEmbedded) !app_core.CommandResult {
-    var observations = std.ArrayList(u8).empty;
-    ctx.brain.handleFaceMemoryActivation() catch |err| {
-        if (try ctx.brain.handleTouchStimulusError(err)) {
-            return .{
-                .command = .unknown,
-                .observation = try observations.toOwnedSlice(ctx.allocator()),
-                .spoken_text = null,
-                .ended_with_speech = false,
-                .interrupted_by = null,
-            };
-        }
-        return err;
-    };
-    return .{
-        .command = .unknown,
-        .observation = try observations.toOwnedSlice(ctx.allocator()),
-        .spoken_text = null,
-        .ended_with_speech = false,
-        .interrupted_by = null,
-    };
-}
-
-pub fn longTouchActivation(ctx: *AffectiveCoreEmbedded) !app_core.CommandResult {
-    try ctx.brain.handleLongTouchActivation();
-    return .{
-        .command = .unknown,
-        .observation = try ctx.allocator().dupe(u8, ""),
-        .spoken_text = null,
-        .ended_with_speech = false,
-        .interrupted_by = null,
-    };
-}
-
-pub fn runStimulusAutonomy(ctx: *AffectiveCoreEmbedded) !void {
-    const io = ctx.brain.deps.io orelse return error.LocalDateUnavailable;
-    try ctx.brain.runStimulusAutonomy(io);
 }
 
 pub fn dispatchJson(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8 {
+    ctx.http_transport.last_error = null;
+    ctx.brain.clearChatParseFailure();
+    const meta = parseDispatchRequestMeta(request_json);
+    logDispatchStart(meta.event_type, meta.request_id, request_json.len);
+    const output = dispatchJsonImpl(ctx, request_json) catch |err| {
+        const detail_owned = error_descriptions.formatFailureDetail(std.heap.page_allocator, err, ctx.brain.chatParseFailureBody()) catch null;
+        const detail: []const u8 = detail_owned orelse error_descriptions.name(err);
+        defer if (detail_owned != null) std.heap.page_allocator.free(detail);
+        logDispatchResult(meta.event_type, meta.request_id, "failed", 0, detail);
+        return err;
+    };
+    const summary = summarizeDispatchOutput(output);
+    logDispatchResult(meta.event_type, meta.request_id, summary.status, output.len, summary.detail);
+    return output;
+}
+
+fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8 {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, request_json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) {
-        return embedded_protocol.legacyErrorEnvelopeAlloc(std.heap.page_allocator, "", "invalid_request", "dispatch request must be a JSON object", false);
+        return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, "", "invalid_request", "dispatch request must be a JSON object", false, emptyBudget(ctx));
     }
     const root = parsed.value.object;
     const request_id = getStringFromObject(root, "request_id") orelse "";
     const event = root.get("event") orelse {
-        return embedded_protocol.legacyErrorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "missing event", false);
+        return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "missing event", false, emptyBudget(ctx));
     };
     if (event != .object) {
-        return embedded_protocol.legacyErrorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "event must be a JSON object", false);
+        return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "event must be a JSON object", false, emptyBudget(ctx));
     }
     const event_object = event.object;
     const event_type = getStringFromObject(event_object, "type") orelse {
-        return embedded_protocol.legacyErrorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "missing event.type", false);
+        return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "missing event.type", false, emptyBudget(ctx));
     };
 
     embedded.clearHostEffects(ctx);
-    const output = if (std.mem.eql(u8, event_type, "speech_transcript") or std.mem.eql(u8, event_type, "typed_text")) blk: {
-        const text = getStringFromObject(event_object, "text") orelse "";
-        const result = app_core.conversationResult(ctx.brain.handleConversationText(try tryTypedSpeech(ctx, text)) catch |err| switch (err) {
-            error.FrontendCaptureRequested => break :blk try encodeDispatchResult(ctx, request_id, event_type, .{
-                .kind = "sense_request",
-                .message = "",
-            }),
-            else => return err,
+    if (std.mem.eql(u8, event_type, "connect")) {
+        const snapshot = try embedded_ops.connect(ctx);
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "connect",
+            .read_models = snapshot,
         });
-        break :blk try encodeDispatchResult(ctx, request_id, event_type, .{ .kind = "conversation_turn", .conversation_turn = result });
-    } else if (std.mem.eql(u8, event_type, "short_touch")) blk: {
-        const result = try shortTouchActivation(ctx);
-        break :blk try encodeDispatchResult(ctx, request_id, event_type, .{ .kind = "activation", .activation = "short_touch", .command_result = result });
-    } else if (std.mem.eql(u8, event_type, "long_touch")) blk: {
-        const result = try longTouchActivation(ctx);
-        break :blk try encodeDispatchResult(ctx, request_id, event_type, .{ .kind = "activation", .activation = "long_touch", .command_result = result });
-    } else if (std.mem.eql(u8, event_type, "poke_sequence")) blk: {
+    }
+    if (std.mem.eql(u8, event_type, "host_attach")) {
+        const binding = try embedded_ops.hostAttach(ctx, event);
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "host_attach",
+            .host_binding = binding,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "host_capability_manifest")) {
+        const capability_count = try embedded_ops.hostCapabilityManifest(ctx, event);
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "host_capability_manifest",
+            .capability_count = capability_count,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "send_experience_event")) {
+        const recorded = try embedded_ops.sendExperienceEvent(ctx, event);
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "send_experience_event",
+            .event = recorded,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "user_text")) {
+        const text = getStringFromObject(event_object, "text") orelse {
+            return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "missing text", false, emptyBudget(ctx));
+        };
+        const result = app_core.userTextOutcome(try ctx.brain.handleConversationText(try embedded_ops.tryTypedSpeech(ctx, text), .{ .request_id = request_id }));
+        return try encodeUserTextOutcome(ctx, request_id, event_type, result);
+    }
+    if (std.mem.eql(u8, event_type, "interrupt")) {
+        const text = getStringFromObject(event_object, "text") orelse "";
+        const reason = getStringFromObject(event_object, "reason") orelse "user_interrupt";
+        const interrupted_action = getStringFromObject(event_object, "interrupted_action") orelse "unknown";
+        const canceled_count = getIntegerFromObject(event_object, "canceled_queued_action_count") orelse 0;
+        const metadata = try std.fmt.allocPrint(ctx.allocator(), "reason={s} interrupted_action={s} canceled_queued_action_count={d} text={s}", .{
+            reason,
+            interrupted_action,
+            canceled_count,
+            text,
+        });
+        _ = try ctx.brain.observeSenseStimulus(.{
+            .kind = .interrupt,
+            .source = "affective_host",
+            .signature = reason,
+            .raw_magnitude = 0.70,
+            .threat = 0,
+            .curiosity = 0.35,
+            .metadata = metadata,
+        });
+        const detail = try std.fmt.allocPrint(ctx.allocator(), "interrupt: {s}", .{metadata});
+        return try encodeDetailResult(ctx, request_id, event_type, detail);
+    }
+    if (std.mem.eql(u8, event_type, "short_touch")) {
+        const result = embedded_ops.shortTouchActivation(ctx) catch |err| {
+            if (err == error.FrontendCaptureRequested or err == error.FrontendOrientationRequested) {
+                return try encodeDetailResult(ctx, request_id, event_type, "");
+            }
+            return try encodeErrorResult(ctx, request_id, event_type, "short_touch_failed", err);
+        };
+        embedded_ops.runStimulusAutonomy(ctx) catch |err| switch (err) {
+            error.MissingAutonomyPlanner, error.MissingPsycheService, error.LocalDateUnavailable, error.ContextBudgetExceeded => {},
+            else => return try encodeErrorResult(ctx, request_id, event_type, "stimulus_autonomy_failed", err),
+        };
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "activation",
+            .activation = "short_touch",
+            .action_result = result,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "long_touch")) {
+        const result = embedded_ops.longTouchActivation(ctx) catch |err| {
+            if (err == error.FrontendCaptureRequested or err == error.FrontendOrientationRequested) {
+                return try encodeDetailResult(ctx, request_id, event_type, "");
+            }
+            return try encodeErrorResult(ctx, request_id, event_type, "long_touch_failed", err);
+        };
+        embedded_ops.runStimulusAutonomy(ctx) catch |err| switch (err) {
+            error.MissingAutonomyPlanner, error.MissingPsycheService, error.LocalDateUnavailable, error.ContextBudgetExceeded => {},
+            else => return try encodeErrorResult(ctx, request_id, event_type, "stimulus_autonomy_failed", err),
+        };
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "activation",
+            .activation = "long_touch",
+            .action_result = result,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "poke_sequence")) {
         const pulse_summary = try pokeSequencePulseSummary(ctx.allocator(), event_object);
+        embedded.clearHostEffects(ctx);
         _ = try ctx.brain.observeSenseStimulus(.{
             .kind = .poke_sequence,
             .source = "affective_core_embedded",
@@ -214,54 +235,172 @@ pub fn dispatchJson(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
             .curiosity = 0.40,
             .metadata = pulse_summary,
         });
-        break :blk try encodeDispatchResult(ctx, request_id, event_type, .{
-            .kind = "stimulus",
-            .stimulus = "poke_sequence",
-            .conversation_turn = .{
-                .user_text = "",
-                .spoken_text = "Poke received.",
-                .user_summary = pulse_summary,
-                .brain_summary = "Acknowledged a local poke stimulus without calling a provider.",
-                .interrupted_by = null,
-            },
+        embedded_ops.runStimulusAutonomy(ctx) catch |err| switch (err) {
+            error.MissingAutonomyPlanner, error.MissingPsycheService, error.LocalDateUnavailable, error.ContextBudgetExceeded => {},
+            else => return try encodeErrorResult(ctx, request_id, event_type, "stimulus_autonomy_failed", err),
+        };
+        return try encodeDetailResult(ctx, request_id, event_type, pulse_summary);
+    }
+    if (std.mem.eql(u8, event_type, "sense_catalog")) {
+        return try encodeDetailResult(ctx, request_id, event_type, try senseCatalogSummary(ctx, event_object));
+    }
+    if (std.mem.eql(u8, event_type, "sense_status")) {
+        return try encodeDetailResult(ctx, request_id, event_type, try senseStatusSummary(ctx, event_object));
+    }
+    if (std.mem.eql(u8, event_type, "sense_observation")) {
+        const sense = getStringFromObject(event_object, "sense") orelse "";
+        const observation_value = event_object.get("observation") orelse {
+            return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "missing sense observation", false, emptyBudget(ctx));
+        };
+        if (observation_value != .object) {
+            return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "sense observation must be an object", false, emptyBudget(ctx));
+        }
+        const observation = observation_value.object;
+        if (std.mem.eql(u8, sense, "orientation")) {
+            const posture = getStringFromObject(observation, "posture") orelse "unknown";
+            const summary = getStringFromObject(observation, "summary") orelse "Orientation observed.";
+            const confidence = getNumberFromObject(observation, "confidence") orelse 0;
+            const metadata = try std.fmt.allocPrint(ctx.allocator(), "posture={s} confidence={d:.2} summary={s}", .{ posture, confidence, summary });
+            const packet = try ctx.brain.observeSenseStimulus(.{
+                .kind = .orientation,
+                .source = "affective_orientation",
+                .signature = posture,
+                .raw_magnitude = @floatCast(@min(@max(confidence, 0), 1)),
+                .threat = 0,
+                .curiosity = 0.12,
+                .metadata = metadata,
+            });
+            if (try ctx.brain.reactToSalientSense(packet)) |conversation| {
+                return try encodeSenseObservationOutcome(ctx, request_id, event_type, app_core.userTextOutcome(conversation));
+            }
+            const detail = try std.fmt.allocPrint(ctx.allocator(), "orientation: {s}", .{summary});
+            return try encodeDetailResult(ctx, request_id, event_type, detail);
+        }
+        if (std.mem.eql(u8, sense, "motion_gesture")) {
+            const gesture = getStringFromObject(observation, "gesture") orelse "unknown";
+            const summary = getStringFromObject(observation, "summary") orelse "Motion gesture observed.";
+            const confidence = getNumberFromObject(observation, "confidence") orelse 0;
+            const metadata = try std.fmt.allocPrint(ctx.allocator(), "gesture={s} confidence={d:.2} summary={s}", .{ gesture, confidence, summary });
+            const packet = try ctx.brain.observeSenseStimulus(.{
+                .kind = .touch,
+                .source = "affective_motion_gesture",
+                .signature = gesture,
+                .raw_magnitude = @floatCast(@min(@max(confidence, 0), 1)),
+                .threat = 0,
+                .curiosity = 0.25,
+                .metadata = metadata,
+            });
+            if (try ctx.brain.reactToSalientSense(packet)) |conversation| {
+                return try encodeSenseObservationOutcome(ctx, request_id, event_type, app_core.userTextOutcome(conversation));
+            }
+            const detail = try std.fmt.allocPrint(ctx.allocator(), "motion_gesture: {s}", .{summary});
+            return try encodeDetailResult(ctx, request_id, event_type, detail);
+        }
+        if (std.mem.eql(u8, sense, "autonomy_replenish")) {
+            const actions = getU32FromObject(observation, "actions") orelse {
+                return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "autonomy_replenish requires observation.actions as a positive integer", false, emptyBudget(ctx));
+            };
+            if (actions == 0) {
+                return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "autonomy_replenish observation.actions must be at least 1", false, emptyBudget(ctx));
+            }
+            const applied_actions = try ctx.brain.runAutonomyReplenishFromPush(ctx.io(), actions);
+            const detail = try std.fmt.allocPrint(ctx.allocator(), "autonomy_replenish: requested={d} applied={d}", .{ actions, applied_actions });
+            return try encodeDetailResult(ctx, request_id, event_type, detail);
+        }
+        if (std.mem.eql(u8, sense, "camera")) {
+            const path = getStringFromObject(observation, "path") orelse "";
+            const mime_type = getStringFromObject(observation, "mime_type") orelse "image/jpeg";
+            const source = getStringFromObject(observation, "source") orelse "affective_camera";
+            const visual_result = try ctx.brain.handleHostVisualObservation(path, source, mime_type);
+            return try encodeHostVisualObservationResult(ctx, request_id, event_type, visual_result);
+        }
+        return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "unknown_sense", "unknown sense observation", false, emptyBudget(ctx));
+    }
+    if (std.mem.eql(u8, event_type, "capability_status")) {
+        try applyHostCapabilityStatus(ctx, request_id, event_object);
+        return try encodeDetailResult(ctx, request_id, event_type, try hostCapabilityStatusSummary(ctx, event_object));
+    }
+    if (std.mem.eql(u8, event_type, "brain_mode")) {
+        const mode = try embedded_ops.brainMode(ctx);
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "brain_mode",
+            .brain_mode = mode,
         });
-    } else if (std.mem.eql(u8, event_type, "tool_call")) blk: {
-        const name = getStringFromObject(event_object, "name") orelse {
-            return embedded_protocol.legacyErrorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "missing tool_call name", false);
+    }
+    if (std.mem.eql(u8, event_type, "read_models_snapshot")) {
+        const snapshot = try embedded_ops.readModelsSnapshot(ctx);
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "read_models_snapshot",
+            .read_models = snapshot,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "request_dream_time")) {
+        const item = try embedded_ops.requestDreamTime(ctx, getStringFromObject(event_object, "text"));
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "request_dream_time",
+            .mailbox_item = item,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "mailbox_list")) {
+        const items = try embedded_ops.mailboxList(ctx);
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "mailbox_list",
+            .items = items,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "mailbox_mark_read")) {
+        const items = try embedded_ops.mailboxMarkRead(ctx, event);
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "mailbox_mark_read",
+            .items = items,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "raw_ref_lookup")) {
+        const raw_ref = getStringFromObject(event_object, "raw_ref") orelse {
+            return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "missing raw_ref", false, emptyBudget(ctx));
         };
-        var empty_args = try std.json.ObjectMap.init(std.heap.page_allocator, &.{}, &.{});
-        defer empty_args.deinit(std.heap.page_allocator);
-        const empty_args_value = std.json.Value{ .object = empty_args };
-        const args = event_object.get("arguments") orelse empty_args_value;
-        const tool_output = dispatchTool(ctx, name, args) catch |err| switch (err) {
-            error.FrontendCaptureRequested => break :blk try encodeDispatchResult(ctx, request_id, event_type, .{
-                .kind = "sense_request",
-                .tool_name = name,
-                .message = "",
-            }),
-            else => return err,
-        };
-        defer std.heap.page_allocator.free(tool_output);
-        break :blk try encodeDispatchResult(ctx, request_id, event_type, .{ .kind = "tool_call", .tool_name = name, .output_json = tool_output });
-    } else if (std.mem.eql(u8, event_type, "maintenance_tick")) blk: {
-        try ctx.brain.runMaintenance(ctx.io());
-        break :blk try encodeDispatchResult(ctx, request_id, event_type, .{ .kind = "maintenance_tick" });
-    } else if (std.mem.eql(u8, event_type, "autonomy_tick")) blk: {
-        try ctx.brain.runAutonomyTick(ctx.io());
-        break :blk try encodeDispatchResult(ctx, request_id, event_type, .{ .kind = "autonomy_tick" });
-    } else {
-        return embedded_protocol.legacyErrorEnvelopeAlloc(std.heap.page_allocator, request_id, "unknown_event_type", "unknown embedded event type", false);
-    };
-    return output;
+        const bytes = lookupRawRef(ctx, raw_ref) catch |err| return try encodeErrorResult(ctx, request_id, event_type, "raw_ref_not_found", err);
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "raw_ref_lookup",
+            .raw_ref = raw_ref,
+            .content = bytes,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "export_brain")) {
+        const manifest = try embedded_ops.exportBrain(ctx, event);
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "export_brain",
+            .manifest = manifest,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "import_brain")) {
+        const manifest = try embedded_ops.importBrain(ctx, event);
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "import_brain",
+            .manifest = manifest,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "maintenance_tick")) {
+        ctx.brain.runMaintenance(ctx.io()) catch |err| return try encodeErrorResult(ctx, request_id, event_type, "maintenance_failed", err);
+        return try encodeDetailResult(ctx, request_id, event_type, "maintenance_tick");
+    }
+    if (std.mem.eql(u8, event_type, "autonomy_tick")) {
+        ctx.brain.runAutonomyReplenish(ctx.io()) catch |err| return try encodeErrorResult(ctx, request_id, event_type, "autonomy_replenish_failed", err);
+        ctx.brain.runAutonomyTick(ctx.io()) catch |err| return try encodeErrorResult(ctx, request_id, event_type, "autonomy_failed", err);
+        return try encodeDetailResult(ctx, request_id, event_type, "autonomy_tick");
+    }
+    return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "unknown_event_type", "unknown embedded event type", false, emptyBudget(ctx));
 }
 
-pub fn encodeDispatchResult(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_type: []const u8, result: anytype) ![]u8 {
-    const events = embedded.hostEvents(ctx);
-    const correlated_events = try correlateEvents(ctx, request_id, events);
-    try appendQueuedEvents(ctx, correlated_events);
-    return embedded_protocol.legacySuccessEnvelopeAlloc(std.heap.page_allocator, request_id, correlated_events, .{
-        .event_type = event_type,
-        .value = result,
+fn encodeDetailResult(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    event_type: []const u8,
+    detail: []const u8,
+) ![]u8 {
+    return encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+        .kind = event_type,
+        .detail = detail,
     });
 }
 
@@ -307,95 +446,209 @@ fn pokeSequenceMagnitude(event_object: std.json.ObjectMap) f32 {
     return @floatCast(@min(1.0, 0.20 + total_press_ms / 2400.0 + max_press_ms / 1800.0));
 }
 
-fn appendQueuedEvents(ctx: *AffectiveCoreEmbedded, events: []const embedded_protocol.HostEvent) !void {
-    for (events) |event| try ctx.event_queue.append(ctx.allocator(), event);
-}
-
-fn correlateEvents(ctx: *AffectiveCoreEmbedded, request_id: []const u8, events: []const embedded_protocol.HostEvent) ![]embedded_protocol.HostEvent {
-    const out = try ctx.allocator().alloc(embedded_protocol.HostEvent, events.len);
-    for (events, 0..) |event, i| {
-        out[i] = event;
-        out[i].request_id = if (request_id.len == 0) null else try ctx.allocator().dupe(u8, request_id);
+fn senseCatalogSummary(ctx: *AffectiveCoreEmbedded, event_object: std.json.ObjectMap) ![]const u8 {
+    const senses = event_object.get("senses") orelse {
+        return try ctx.allocator().dupe(u8, "sense_catalog: count=0");
+    };
+    if (senses != .array) {
+        return try ctx.allocator().dupe(u8, "sense_catalog: count=0");
     }
-    return out;
+    return try std.fmt.allocPrint(ctx.allocator(), "sense_catalog: count={d}", .{senses.array.items.len});
 }
 
-pub fn tryTypedSpeech(ctx: *AffectiveCoreEmbedded, text: []const u8) !input_mod.HeardSpeech {
-    return input_mod.HeardSpeech.typed(ctx.allocator(), text);
+fn senseStatusSummary(ctx: *AffectiveCoreEmbedded, event_object: std.json.ObjectMap) ![]const u8 {
+    const sense = getStringFromObject(event_object, "sense") orelse getStringFromObject(event_object, "sense_id") orelse "unknown";
+    const status = getStringFromObject(event_object, "status") orelse "unknown";
+    const reason = getStringFromObject(event_object, "reason") orelse "";
+    return try std.fmt.allocPrint(ctx.allocator(), "sense_status: {s}={s} reason={s}", .{ sense, status, reason });
 }
 
-pub fn executeCommand(ctx: *AffectiveCoreEmbedded, command: chat.ChatCommand) ![]u8 {
-    const result = try app_core.executeBrainCommand(ctx.allocator(), &ctx.brain, command);
-    return std.json.Stringify.valueAlloc(std.heap.page_allocator, result, .{ .whitespace = .indent_2 });
-}
+fn applyHostCapabilityStatus(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_object: std.json.ObjectMap) !void {
+    const capability = getStringFromObject(event_object, "capability_id") orelse "";
+    if (capability.len == 0) return;
+    const availability = getStringFromObject(event_object, "availability") orelse "unavailable";
+    try ctx.brain.recordCapabilityStatus(.{
+        .capability_id = capability,
+        .host_id = getStringFromObject(event_object, "host_id") orelse try ctx.allocator().dupe(u8, ctx.brain.currentHostId()),
+        .permission = embedded_ops.permissionFromString(getStringFromObject(event_object, "permission") orelse "unknown"),
+        .availability = embedded_ops.availabilityFromString(availability),
+        .quality = getF32FromObject(event_object, "quality") orelse 0.0,
+        .reliability = getF32FromObject(event_object, "reliability") orelse 0.0,
+        .cost = getF32FromObject(event_object, "cost") orelse 0.0,
+        .latency_ms = getU32FromObject(event_object, "latency_ms") orelse 0,
+        .risk = getF32FromObject(event_object, "risk") orelse 0.0,
+        .unavailable_reason = getStringFromObject(event_object, "unavailable_reason") orelse "",
+        .updated_at_ms = ctx.brain.now_seconds * 1000,
+    });
+    if (!std.mem.eql(u8, capability, "camera")) return;
 
-pub fn memoryIndex(ctx: *AffectiveCoreEmbedded) ![]u8 {
-    const allocator = ctx.allocator();
-    const memories = try ctx.brain.deps.store.loadMemoryRecords(allocator);
-    const summaries = try ctx.brain.deps.store.loadConversationSummaries(allocator);
-    var long_term: usize = 0;
-    var short_term: usize = 0;
-    var tags = std.ArrayList([]const u8).empty;
-    for (memories) |memory| {
-        switch (memory.scope) {
-            .long_term => long_term += 1,
-            .short_term => short_term += 1,
-        }
-        for (memory.tags) |tag| {
-            if (tags.items.len >= 32) break;
-            if (!tagInSlice(tags.items, tag)) try tags.append(allocator, tag);
-        }
+    if (std.mem.eql(u8, availability, "pending") or std.mem.eql(u8, availability, "degraded")) {
+        const pending_request_id = getStringFromObject(event_object, "request_id") orelse request_id;
+        const reason = getStringFromObject(event_object, "unavailable_reason") orelse "host capability pending";
+        ctx.pending_camera_permission = .{
+            .request_id = try ctx.allocator().dupe(u8, pending_request_id),
+            .pending_since_unix_ms = getIntegerFromObject(event_object, "pending_since_unix_ms") orelse 0,
+            .reason = try ctx.allocator().dupe(u8, reason),
+        };
+        return;
     }
-    return std.json.Stringify.valueAlloc(std.heap.page_allocator, struct {
-        long_term: usize,
-        short_term: usize,
-        tags: []const []const u8,
-        conversation_summaries: usize,
-    }{
-        .long_term = long_term,
-        .short_term = short_term,
-        .tags = tags.items,
-        .conversation_summaries = summaries.len,
-    }, .{ .whitespace = .indent_2 });
+
+    if (std.mem.eql(u8, availability, "available") or std.mem.eql(u8, availability, "refused") or std.mem.eql(u8, availability, "unavailable")) {
+        ctx.pending_camera_permission = null;
+    }
 }
 
-pub fn listReminders(ctx: *AffectiveCoreEmbedded) ![]u8 {
-    const markdown = readFileAllocPath(ctx.io(), ctx.brain.cfg.maintenance_schedule_path, ctx.allocator(), .limited(1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => "",
-        else => return err,
+fn hostCapabilityStatusSummary(ctx: *AffectiveCoreEmbedded, event_object: std.json.ObjectMap) ![]const u8 {
+    const capability = getStringFromObject(event_object, "capability_id") orelse "unknown";
+    const status = getStringFromObject(event_object, "availability") orelse "unknown";
+    const elapsed = getIntegerFromObject(event_object, "pending_elapsed_ms") orelse 0;
+    const reason = getStringFromObject(event_object, "unavailable_reason") orelse "";
+    return try std.fmt.allocPrint(ctx.allocator(), "capability_status: {s}={s} pending_elapsed_ms={d} reason={s}", .{ capability, status, elapsed, reason });
+}
+
+pub fn encodeUserTextOutcome(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    event_type: []const u8,
+    result: app_core.UserTextOutcome,
+) ![]u8 {
+    return encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+        .kind = "user_text",
+        .outcome = result,
+    });
+}
+
+pub fn encodeSenseObservationOutcome(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    event_type: []const u8,
+    result: app_core.UserTextOutcome,
+) ![]u8 {
+    return encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+        .kind = event_type,
+        .outcome = result,
+    });
+}
+
+fn encodeHostVisualObservationResult(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    event_type: []const u8,
+    result: brain_mod.HostVisualObservationResult,
+) ![]u8 {
+    switch (result) {
+        .conversation_resume => |conversation| {
+            return try encodeSenseObservationOutcome(ctx, request_id, event_type, app_core.userTextOutcome(conversation));
+        },
+        .salient_reaction => |conversation| {
+            return try encodeSenseObservationOutcome(ctx, request_id, event_type, app_core.userTextOutcome(conversation));
+        },
+        .recognition_only => |detail| {
+            return try encodeDetailResult(ctx, request_id, event_type, detail);
+        },
+        .detail_only => |detail| {
+            return try encodeDetailResult(ctx, request_id, event_type, detail);
+        },
+    }
+}
+
+pub fn encodeStructuredDispatchResult(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    event_type: []const u8,
+    value: anytype,
+) ![]u8 {
+    const activity_id = ctx.brain.activeActivityId() orelse "";
+    const compacted_events = try context_gate.compactEvents(ctx.allocator(), ctx.brain.now_seconds, request_id, activity_id, embedded.hostEvents(ctx), ctx.context_budget);
+    try persistRawRefs(ctx, compacted_events.raw_refs);
+    const envelope_events = try filterSuppressedEvents(ctx, compacted_events.events);
+
+    const value_json = try std.json.Stringify.valueAlloc(ctx.allocator(), value, .{});
+    defer ctx.allocator().free(value_json);
+    const budget = try context_gate.budgetWithResult(ctx.allocator(), compacted_events.budget, value_json.len, &.{}, false);
+    const output = try embedded_protocol.successEnvelopeAlloc(std.heap.page_allocator, request_id, envelope_events, .{
+        .event_type = event_type,
+        .value = value,
+    }, budget);
+    if (output.len > ctx.context_budget.max_envelope_bytes) {
+        std.heap.page_allocator.free(output);
+        return try minimalEnvelope(ctx, request_id, event_type, "compacted envelope exceeded max_bytes");
+    }
+    return output;
+}
+
+pub fn filterSuppressedEvents(ctx: *AffectiveCoreEmbedded, events: []const embedded_protocol.HostEvent) ![]const embedded_protocol.HostEvent {
+    if (ctx.pending_camera_permission == null) return events;
+    const awaiting_camera = ctx.brain.awaitedHostRequestMatches("camera", "recognize");
+    var filtered = std.ArrayList(embedded_protocol.HostEvent).empty;
+    for (events) |event| {
+        if (!awaiting_camera and std.mem.eql(u8, event.type, "sense_request") and event.sense != null and std.mem.eql(u8, event.sense.?, "camera")) continue;
+        try filtered.append(ctx.allocator(), event);
+    }
+    return try filtered.toOwnedSlice(ctx.allocator());
+}
+
+fn encodeErrorResult(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_type: []const u8, code: []const u8, err: anyerror) ![]u8 {
+    _ = event_type;
+    const detail = try error_descriptions.formatFailureDetail(ctx.allocator(), err, ctx.brain.chatParseFailureBody());
+    defer ctx.allocator().free(detail);
+    const message = try std.fmt.allocPrint(ctx.allocator(), "{s}: {s}", .{ error_descriptions.name(err), detail });
+    defer ctx.allocator().free(message);
+    return embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, code, message, false, emptyBudget(ctx));
+}
+
+fn minimalEnvelope(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_type: []const u8, detail: []const u8) ![]u8 {
+    const budget = context_gate.BudgetReport{
+        .max_bytes = ctx.context_budget.max_envelope_bytes,
+        .used_bytes = detail.len,
+        .compacted = true,
+        .dropped_event_count = embedded.hostEvents(ctx).len,
+        .raw_refs = &.{},
     };
-    return std.json.Stringify.valueAlloc(std.heap.page_allocator, struct { markdown: []const u8 }{ .markdown = markdown }, .{ .whitespace = .indent_2 });
+    return embedded_protocol.successEnvelopeAlloc(std.heap.page_allocator, request_id, &[_]embedded_protocol.HostEvent{}, .{
+        .event_type = event_type,
+        .value = .{
+            .kind = event_type,
+            .detail = detail,
+        },
+    }, budget);
 }
 
-fn requireString(args: std.json.Value, key: []const u8) ![]const u8 {
-    return getString(args, key) orelse error.MissingRequiredString;
+pub fn persistRawRefs(ctx: *AffectiveCoreEmbedded, raw_refs: []const context_gate.RawRef) !void {
+    for (raw_refs) |raw_ref| {
+        const path = try rawRefPath(ctx.allocator(), ctx.brain.cfg.brain_root, raw_ref.id);
+        try writeFilePath(ctx.io(), path, raw_ref.bytes);
+    }
 }
 
-fn getString(args: std.json.Value, key: []const u8) ?[]const u8 {
-    if (args != .object) return null;
-    const value = args.object.get(key) orelse return null;
-    if (value != .string) return null;
-    return value.string;
+pub fn lookupRawRef(ctx: *AffectiveCoreEmbedded, raw_ref: []const u8) ![]const u8 {
+    if (!validRawRef(raw_ref)) return error.InvalidRawRef;
+    if (rawRefExpired(ctx, raw_ref)) return error.RawRefExpired;
+    const path = try rawRefPath(ctx.allocator(), ctx.brain.cfg.brain_root, raw_ref);
+    return readFileAllocPath(ctx.io(), path, ctx.allocator(), .limited(8 * 1024 * 1024));
 }
 
-fn getBool(args: std.json.Value, key: []const u8) ?bool {
-    if (args != .object) return null;
-    const value = args.object.get(key) orelse return null;
-    return switch (value) {
-        .bool => |boolean| boolean,
-        else => null,
-    };
+fn rawRefPath(allocator: std.mem.Allocator, brain_root: []const u8, raw_ref: []const u8) ![]const u8 {
+    const filename = try std.fmt.allocPrint(allocator, "{s}.txt", .{raw_ref});
+    return std.fs.path.join(allocator, &.{ brain_root, "raw_refs", filename });
 }
 
-fn getU32(args: std.json.Value, key: []const u8) ?u32 {
-    if (args != .object) return null;
-    const value = args.object.get(key) orelse return null;
-    const integer = switch (value) {
-        .integer => |n| n,
-        else => return null,
-    };
-    if (integer < 0 or integer > std.math.maxInt(u32)) return null;
-    return @intCast(integer);
+fn validRawRef(raw_ref: []const u8) bool {
+    if (!std.mem.startsWith(u8, raw_ref, "raw_event_")) return false;
+    for (raw_ref) |ch| {
+        if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_') continue;
+        return false;
+    }
+    return true;
+}
+
+fn rawRefExpired(ctx: *AffectiveCoreEmbedded, raw_ref: []const u8) bool {
+    const prefix = "raw_event_";
+    if (!std.mem.startsWith(u8, raw_ref, prefix)) return true;
+    const rest = raw_ref[prefix.len..];
+    const split = std.mem.indexOfScalar(u8, rest, '_') orelse return true;
+    const created_at = std.fmt.parseInt(i64, rest[0..split], 10) catch return true;
+    return ctx.brain.now_seconds - created_at > ctx.raw_ref_ttl_seconds;
 }
 
 fn getStringFromObject(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -421,29 +674,21 @@ fn getNumberFromObject(object: std.json.ObjectMap, key: []const u8) ?f64 {
     };
 }
 
-fn getStringArray(allocator: std.mem.Allocator, args: std.json.Value, key: []const u8) ![]const []const u8 {
-    if (args != .object) return &.{};
-    const value = args.object.get(key) orelse return &.{};
-    if (value != .array) return error.ExpectedStringArray;
-    const out = try allocator.alloc([]const u8, value.array.items.len);
-    for (value.array.items, 0..) |item, i| {
-        if (item != .string) return error.ExpectedStringArray;
-        out[i] = item.string;
-    }
-    return out;
+fn getF32FromObject(object: std.json.ObjectMap, key: []const u8) ?f32 {
+    const value = getNumberFromObject(object, key) orelse return null;
+    return @floatCast(value);
 }
 
-fn tagInSlice(values: []const []const u8, needle: []const u8) bool {
-    for (values) |value| {
-        if (std.mem.eql(u8, value, needle)) return true;
-    }
-    return false;
+fn getU32FromObject(object: std.json.ObjectMap, key: []const u8) ?u32 {
+    const value = getIntegerFromObject(object, key) orelse return null;
+    if (value < 0) return null;
+    return @intCast(value);
 }
 
-pub fn readFileAllocPath(io: std.Io, path: []const u8, allocator: std.mem.Allocator, limit: std.Io.Limit) ![]u8 {
+fn readFileAllocPath(io: std.Io, path: []const u8, allocator: std.mem.Allocator, limit: std.Io.Limit) ![]u8 {
     return files.readFileAllocPath(io, path, allocator, limit);
 }
 
-pub fn writeFilePath(io: std.Io, path: []const u8, data: []const u8) !void {
+fn writeFilePath(io: std.Io, path: []const u8, data: []const u8) !void {
     return files.writeFilePath(io, path, data);
 }

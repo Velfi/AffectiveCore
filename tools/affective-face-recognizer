@@ -107,18 +107,14 @@ def load_people(memory_path):
 def load_memory(memory_path):
     with sqlite3.connect(memory_path) as db:
         ensure_schema(db)
-        row = db.execute("SELECT schema_version, data_json FROM cognitive_memory WHERE id = 1").fetchone()
+        row = db.execute("SELECT data_json FROM cognitive_memory WHERE id = 1").fetchone()
     if row is None:
-        data = {"schema_version": 2, "traces": [], "beliefs": [], "subjects": [], "artifacts": [], "dreams": []}
+        data = {"subjects": []}
     else:
-        schema_version, data_json = row
-        if schema_version != 2:
-            raise RuntimeError(f"unsupported cognitive schema version {schema_version}: {memory_path}")
+        (data_json,) = row
         data = json.loads(data_json)
     if not isinstance(data, dict):
         raise RuntimeError(f"memory root must be an object: {memory_path}")
-    if data.get("schema_version") != 2:
-        raise RuntimeError(f"memory schema_version must be 2: {memory_path}")
     subjects = data.get("subjects")
     if not isinstance(subjects, list):
         raise RuntimeError(f"memory subjects field must be a list: {memory_path}")
@@ -127,17 +123,18 @@ def load_memory(memory_path):
 
 def write_memory(memory_path, data):
     memory_path.parent.mkdir(parents=True, exist_ok=True)
-    if data.get("schema_version") != 2:
-        raise RuntimeError(f"memory schema_version must be 2: {memory_path}")
+    subjects = data.get("subjects")
+    if not isinstance(subjects, list):
+        raise RuntimeError(f"memory subjects field must be a list: {memory_path}")
     with sqlite3.connect(memory_path) as db:
         ensure_schema(db)
         db.execute(
             """
-            INSERT INTO cognitive_memory (id, schema_version, data_json)
-            VALUES (1, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET schema_version=excluded.schema_version, data_json=excluded.data_json
+            INSERT INTO cognitive_memory (id, data_json)
+            VALUES (1, ?)
+            ON CONFLICT(id) DO UPDATE SET data_json=excluded.data_json
             """,
-            (2, json.dumps(data, indent=2)),
+            (json.dumps(data, indent=2),),
         )
 
 
@@ -145,10 +142,9 @@ def ensure_schema(db):
     db.executescript(
         """
         PRAGMA foreign_keys = ON;
-        PRAGMA user_version = 2;
+        PRAGMA user_version = 1;
         CREATE TABLE IF NOT EXISTS cognitive_memory (
           id INTEGER PRIMARY KEY CHECK(id = 1),
-          schema_version INTEGER NOT NULL,
           data_json TEXT NOT NULL
         );
         """

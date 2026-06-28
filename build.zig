@@ -25,8 +25,35 @@ pub fn build(b: *std.Build) void {
         }),
     });
     embedded.bundle_compiler_rt = true;
+    const android_ndk_usr = b.option([]const u8, "android-ndk-usr", "Path to the Android NDK sysroot/usr directory");
+    const sqlite_include = b.option([]const u8, "sqlite-include", "Directory containing sqlite3.h for embedded targets with vendored SQLite");
+    const sqlite_obj = b.option([]const u8, "sqlite-obj", "Path to a compiled sqlite3.o object file for embedded targets with vendored SQLite");
+    if (target.result.abi == .android or target.result.os.tag == .ios) {
+        embedded.root_module.link_libc = true;
+    }
+    if (target.result.abi == .android) {
+        embedded.root_module.single_threaded = true;
+    }
+    if (android_ndk_usr) |usr| {
+        embedded.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ usr, "include" }) });
+        const android_arch_include = switch (target.result.cpu.arch) {
+            .aarch64 => "aarch64-linux-android",
+            .x86_64 => "x86_64-linux-android",
+            else => null,
+        };
+        if (android_arch_include) |subdir| {
+            embedded.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ usr, "include", subdir }) });
+        }
+    }
     if (target.result.os.tag != .ios) {
-        embedded.root_module.linkSystemLibrary("sqlite3", .{});
+        if (sqlite_include) |dir| {
+            embedded.root_module.addIncludePath(.{ .cwd_relative = dir });
+        }
+        if (sqlite_obj) |path| {
+            embedded.root_module.addObjectFile(.{ .cwd_relative = path });
+        } else {
+            embedded.root_module.linkSystemLibrary("sqlite3", .{});
+        }
     }
     b.installArtifact(embedded);
 
@@ -49,6 +76,40 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(api_e2e);
+
+    const llm_tester_manifest = b.addExecutable(.{
+        .name = "affective-core-llm-tester-manifest",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main_llm_tester_manifest.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(llm_tester_manifest);
+
+    const install_llm_tester_manifest = b.addInstallArtifact(llm_tester_manifest, .{});
+    const run_llm_tester_manifest_cmd = b.addRunArtifact(llm_tester_manifest);
+    run_llm_tester_manifest_cmd.step.dependOn(&install_llm_tester_manifest.step);
+    if (b.args) |args| run_llm_tester_manifest_cmd.addArgs(args);
+
+    const llm_tester_manifest_step = b.step("llm-tester-manifest", "Generate LLM tester scenario manifest JSON");
+    llm_tester_manifest_step.dependOn(&run_llm_tester_manifest_cmd.step);
+
+    const mcp_host = b.addExecutable(.{
+        .name = "mcp-host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main_mcp_host.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    mcp_host.root_module.addIncludePath(b.path("include"));
+    mcp_host.root_module.linkSystemLibrary("sqlite3", .{});
+    b.installArtifact(mcp_host);
+
+    const install_mcp_host = b.addInstallArtifact(mcp_host, .{});
+    const mcp_host_step = b.step("mcp-host", "Build and install the embedded brain CLI harness");
+    mcp_host_step.dependOn(&install_mcp_host.step);
 
     const install_mcp = b.addInstallArtifact(mcp, .{});
     const mcp_step = b.step("mcp", "Build and install the stdio MCP server");

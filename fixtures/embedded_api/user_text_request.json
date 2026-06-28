@@ -1,0 +1,8 @@
+{
+  "api_version": 1,
+  "request_id": "fixture-user-text-001",
+  "event": {
+    "type": "user_text",
+    "text": "hello from host"
+  }
+}

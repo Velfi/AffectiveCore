@@ -11,23 +11,23 @@ pub const SkillId = enum {
     get_power,
     get_storage,
     get_database_stats,
-    remember_memory,
-    recall_memory,
     forget_memory,
+    forget_person,
     set_fact,
     recall_fact,
     invalidate_fact,
     sweep_memory,
-    set_reminder,
+    schedule_reminder,
     introspect,
-    dream,
     appraise_event,
     feel_about,
     think_about,
     define_need,
     define_want,
+    define_goal,
     edit_need,
     edit_want,
+    edit_goal,
     imagine_image,
     remember_person,
     update_face_picture,
@@ -35,8 +35,11 @@ pub const SkillId = enum {
     choose_attention,
     set_focus,
     clear_focus,
-    ask_human,
+    begin_subtask,
+    resume_parent,
     consolidate_memory,
+    sleep_autonomy,
+    wake_autonomy,
     facial_expression,
     unknown,
 };
@@ -143,7 +146,6 @@ pub const SenseSet = struct {
             .stored_memory_read = true,
             .stored_memory_write = true,
             .stored_image_read = true,
-            .introspection = true,
             .time_lookup = true,
             .orientation_query = true,
             .power_status = true,
@@ -186,49 +188,52 @@ pub const SkillSpec = struct {
     developer_requires_camera: bool = false,
 };
 
-pub const CommandSpec = struct {
-    command: SkillId,
+pub const ActionSpec = struct {
+    action: SkillId,
     description: []const u8,
     requires: []const Sense,
 };
 
 pub const registry = [_]SkillSpec{
-    .{ .id = .say, .name = "say", .description = "speak in your own voice. Include text.", .requires_senses = &.{.speech_output}, .autonomy_policy = .allowed, .energy_cost = 5, .failure_hint = "Check speech output and speaker configuration." },
+    .{ .id = .say, .name = "say", .description = "speak aloud. Include text—the words to say, not a promise to say them later.", .requires_senses = &.{.speech_output}, .autonomy_policy = .allowed, .energy_cost = 5, .failure_hint = "Check speech output and speaker configuration." },
     .{ .id = .take_picture, .name = "take_picture", .description = "gather a fresh visual observation of the room.", .requires_senses = &.{ .live_camera, .visual_description }, .autonomy_policy = .forbidden, .failure_hint = "Check camera and visual description configuration." },
     .{ .id = .describe_image, .name = "describe_image", .description = "describe visible content from a fresh camera image, or from the latest uploaded image when no live camera is available. Optional text/query narrows what to describe.", .requires_senses = &.{.visual_description}, .autonomy_policy = .forbidden, .failure_hint = "Provide a live camera or upload an image, and configure visual description." },
     .{ .id = .compare_images, .name = "compare_images", .description = "compare the latest stored visual observation with a fresh image. Optional text/query narrows what differences to look for.", .requires_senses = &.{ .live_camera, .visual_comparison, .stored_image_read }, .autonomy_policy = .forbidden, .failure_hint = "Capture or upload an image first, then ensure camera and visual comparison are configured." },
-    .{ .id = .recognize, .name = "recognize", .description = "use your identity-recognition skill to see who you are talking to, returning match status, name, confidence, and people count.", .requires_senses = &.{ .live_camera, .identity_recognition }, .requires_skills = &.{ .recall_memory, .remember_memory }, .autonomy_policy = .forbidden, .failure_hint = "Check camera, recognizer, and memory configuration.", .developer_title = "Recognize", .developer_symbol_name = "person.crop.square", .developer_mirror_to_chat = true, .developer_requires_camera = true },
+    .{ .id = .recognize, .name = "recognize", .description = "use your identity-recognition skill to see who you are talking to, returning match status, name, confidence, and people count.", .requires_senses = &.{ .live_camera, .identity_recognition, .stored_memory_read, .stored_memory_write }, .autonomy_policy = .forbidden, .failure_hint = "Check camera, recognizer, and memory configuration.", .developer_title = "Recognize", .developer_symbol_name = "person.crop.square", .developer_mirror_to_chat = true, .developer_requires_camera = true },
     .{ .id = .get_time, .name = "get_time", .description = "observe the current date/time only.", .requires_senses = &.{.time_lookup}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check time lookup configuration." },
     .{ .id = .request_orientation, .name = "request_orientation", .description = "ask the Apple host for a one-shot device orientation observation.", .requires_senses = &.{.orientation_query}, .autonomy_policy = .forbidden, .failure_hint = "Ask for host orientation only when the user has allowed orientation sensing." },
     .{ .id = .get_power, .name = "get_power", .description = "observe battery levels and whether external power is plugged in.", .requires_senses = &.{.power_status}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check power status sensing configuration." },
     .{ .id = .get_storage, .name = "get_storage", .description = "observe storage fullness for mounted local filesystems.", .requires_senses = &.{.storage_fullness}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check storage fullness sensing configuration." },
     .{ .id = .get_database_stats, .name = "get_database_stats", .description = "observe SQLite database size, page, freelist, and table counts for memory stores.", .requires_senses = &.{.database_stats}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check database statistics sensing configuration." },
-    .{ .id = .remember_memory, .name = "remember_memory", .description = "keep a short-term memory. Include text and optional tags.", .requires_senses = &.{.stored_memory_write}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory write configuration." },
-    .{ .id = .recall_memory, .name = "recall_memory", .description = "search remembered experience. Include query and/or tags when memory would matter.", .requires_senses = &.{.stored_memory_read}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory read configuration." },
-    .{ .id = .forget_memory, .name = "forget_memory", .description = "release a memory by memory_id.", .requires_skills = &.{ .recall_memory, .remember_memory }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory read/write configuration." },
-    .{ .id = .set_fact, .name = "set_fact", .description = "create or revise a durable self fact. Include name as the fact key, text as the value, and optional tags.", .requires_skills = &.{ .recall_memory, .remember_memory }, .failure_hint = "Check memory read/write configuration." },
-    .{ .id = .recall_fact, .name = "recall_fact", .description = "list durable self facts. Optional query matches fact key/value; optional tags narrow results.", .requires_skills = &.{.recall_memory}, .failure_hint = "Check memory read configuration." },
-    .{ .id = .invalidate_fact, .name = "invalidate_fact", .description = "mark a durable self fact inactive by memory_id/fact_id, or by unique name/key.", .requires_skills = &.{ .recall_memory, .remember_memory }, .failure_hint = "Check memory read/write configuration." },
-    .{ .id = .sweep_memory, .name = "sweep_memory", .description = "let weak short-term memories fade.", .requires_skills = &.{ .recall_memory, .remember_memory }, .autonomy_policy = .allowed, .energy_cost = 2, .failure_hint = "Check memory read/write configuration." },
-    .{ .id = .set_reminder, .name = "set_reminder", .description = "add a future intention or wait timer to the Markdown maintenance schedule. Include schedule and text. For wait timers use schedules like `in 10 seconds`, `in 5 minutes`, `after 2 hours`, or `in 1 day`; recurring schedules like `every 6 hours` and `every day at 09:00` also work.", .requires_senses = &.{.reminder_io}, .autonomy_policy = .allowed, .energy_cost = 2, .failure_hint = "Check local reminder I/O and maintenance schedule path." },
-    .{ .id = .introspect, .name = "introspect", .description = "observe current senses, memory state, and available skills.", .requires_senses = &.{.introspection}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check introspection configuration." },
-    .{ .id = .dream, .name = "dream", .description = "connect memories and recent conversation, then generate a picture of the dream. heat is always random; optional heat_bias can be low, mixed, or high. Optionally include text to save as a provisional dream memory.", .requires_skills = &.{ .recall_memory, .remember_memory, .imagine_image }, .autonomy_policy = .allowed, .energy_cost = 6, .failure_hint = "Check memory and image generation configuration.", .developer_title = "Dream", .developer_symbol_name = "moon.stars", .developer_mirror_to_chat = true },
-    .{ .id = .appraise_event, .name = "appraise_event", .description = "register how an event lands internally. Include text and optional tags.", .requires_skills = &.{.remember_memory}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory write configuration." },
-    .{ .id = .feel_about, .name = "feel_about", .description = "form an appraisal of a topic, including self-directed questions. Include query and optional tags.", .requires_skills = &.{ .recall_memory, .remember_memory, .introspect }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory and introspection configuration." },
-    .{ .id = .think_about, .name = "think_about", .description = "reflect on a topic before answering. Include query or text and optional tags; this may recall relevant memory, use model judgment, and save a short-term thought.", .requires_skills = &.{ .recall_memory, .remember_memory, .introspect }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory and introspection configuration." },
-    .{ .id = .define_need, .name = "define_need", .description = "define one of your own ongoing needs. Include text. This stores a self_need memory and appraises it.", .requires_skills = &.{ .remember_memory, .introspect }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory write and introspection configuration." },
-    .{ .id = .define_want, .name = "define_want", .description = "define one of your own ongoing wants. Include text. This stores a self_want memory and appraises it.", .requires_skills = &.{ .remember_memory, .introspect }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory write and introspection configuration." },
-    .{ .id = .edit_need, .name = "edit_need", .description = "edit one stored self_need memory. Include memory_id and replacement text.", .requires_skills = &.{ .recall_memory, .remember_memory, .introspect }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory read/write and introspection configuration." },
-    .{ .id = .edit_want, .name = "edit_want", .description = "edit one stored self_want memory. Include memory_id and replacement text.", .requires_skills = &.{ .recall_memory, .remember_memory, .introspect }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory read/write and introspection configuration." },
-    .{ .id = .imagine_image, .name = "imagine_image", .description = "create a new imagined image with Nano Banana. Include text as the generation prompt.", .requires_senses = &.{.image_generation}, .autonomy_policy = .allowed, .energy_cost = 4, .failure_hint = "Check image generation service configuration." },
-    .{ .id = .remember_person, .name = "remember_person", .description = "create or refresh a person's face memory from the latest observed image. Use this when an unrecognized person becomes salient and naturally offers a name or identity, or when updating an existing person. Include name, or person_id/name for an existing person.", .requires_senses = &.{ .face_picture_update, .stored_image_read }, .requires_skills = &.{ .recall_memory, .remember_memory }, .autonomy_policy = .invalid, .failure_hint = "Capture or upload an image first, then check face picture update and memory configuration." },
-    .{ .id = .update_face_picture, .name = "update_face_picture", .description = "update an existing person's face recognition reference picture. Include person_id or unique name, and image_path; if image_path is omitted, the latest uploaded or observed image is used. Optional keep_existing keeps older cached embeddings.", .requires_senses = &.{.face_picture_update}, .requires_skills = &.{ .recall_memory, .remember_memory }, .autonomy_policy = .invalid, .failure_hint = "Check host face picture update and memory configuration." },
+    .{ .id = .forget_memory, .name = "forget_memory", .description = "release a memory by memory_id.", .requires_senses = &.{ .stored_memory_read, .stored_memory_write }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory read/write configuration." },
+    .{ .id = .forget_person, .name = "forget_person", .description = "mark a person's profile forgotten and clear their face embeddings. Include person_id or unique name; if omitted, use the current speaker when known.", .requires_senses = &.{ .stored_memory_read, .stored_memory_write }, .autonomy_policy = .invalid, .failure_hint = "Provide person_id or name, or establish who is speaking first." },
+    .{ .id = .set_fact, .name = "set_fact", .description = "create or revise a durable self fact. Include name as the fact key, text as the value, and optional tags.", .requires_senses = &.{ .stored_memory_read, .stored_memory_write }, .failure_hint = "Check memory read/write configuration." },
+    .{ .id = .recall_fact, .name = "recall_fact", .description = "list durable self facts. Optional query matches fact key/value; optional tags narrow results.", .requires_senses = &.{.stored_memory_read}, .failure_hint = "Check memory read configuration." },
+    .{ .id = .invalidate_fact, .name = "invalidate_fact", .description = "mark a durable self fact inactive by memory_id/fact_id, or by unique name/key.", .requires_senses = &.{ .stored_memory_read, .stored_memory_write }, .failure_hint = "Check memory read/write configuration." },
+    .{ .id = .sweep_memory, .name = "sweep_memory", .description = "let weak short-term memories fade.", .requires_senses = &.{ .stored_memory_read, .stored_memory_write }, .autonomy_policy = .allowed, .energy_cost = 2, .failure_hint = "Check memory read/write configuration." },
+    .{ .id = .schedule_reminder, .name = "schedule_reminder", .description = "add a future intention or wait timer to the Markdown maintenance schedule. Include schedule and text. For wait timers use schedules like `in 10 seconds`, `in 5 minutes`, `after 2 hours`, or `in 1 day`; recurring schedules like `every 6 hours` and `every day at 09:00` also work.", .requires_senses = &.{.reminder_io}, .autonomy_policy = .allowed, .energy_cost = 2, .failure_hint = "Check local reminder I/O and maintenance schedule path." },
+    .{ .id = .introspect, .name = "introspect", .description = "observe internal state. Optional query drills down: overview (default), skills, skills/<group>, skill/<name>, memory, facts, needs, capabilities, senses, autonomy, focus, identity.", .requires_senses = &.{.introspection}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check introspection configuration." },
+    .{ .id = .appraise_event, .name = "appraise_event", .description = "register how an event lands internally. Include text and optional tags.", .requires_senses = &.{.stored_memory_write}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory write configuration." },
+    .{ .id = .feel_about, .name = "feel_about", .description = "form an appraisal of a topic, including self-directed questions. Include query and optional tags.", .requires_senses = &.{ .stored_memory_read, .stored_memory_write }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory read/write configuration." },
+    .{ .id = .think_about, .name = "think_about", .description = "reflect on a topic before answering. Include query or text and optional tags; this may recall relevant memory, use model judgment, and save a short-term thought.", .requires_senses = &.{ .stored_memory_read, .stored_memory_write }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory read/write configuration." },
+    .{ .id = .define_need, .name = "define_need", .description = "define one of your own ongoing needs. Include text. This stores a self_need memory and appraises it.", .requires_senses = &.{.stored_memory_write}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory write configuration." },
+    .{ .id = .define_want, .name = "define_want", .description = "define one of your own ongoing wants. Include text. This stores a self_want memory and appraises it.", .requires_senses = &.{.stored_memory_write}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory write configuration." },
+    .{ .id = .define_goal, .name = "define_goal", .description = "define one of your own ongoing goals. Include text. This stores a self_goal memory and appraises it.", .requires_senses = &.{.stored_memory_write}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory write configuration." },
+    .{ .id = .edit_need, .name = "edit_need", .description = "edit one stored self_need memory. Include memory_id and replacement text.", .requires_senses = &.{ .stored_memory_read, .stored_memory_write }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory read/write configuration." },
+    .{ .id = .edit_want, .name = "edit_want", .description = "edit one stored self_want memory. Include memory_id and replacement text.", .requires_senses = &.{ .stored_memory_read, .stored_memory_write }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory read/write configuration." },
+    .{ .id = .edit_goal, .name = "edit_goal", .description = "edit one stored self_goal memory. Include memory_id and replacement text.", .requires_senses = &.{ .stored_memory_read, .stored_memory_write }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory read/write configuration." },
+    .{ .id = .imagine_image, .name = "imagine_image", .description = "create a new standalone imagined image with Nano Banana. Include text as the generation prompt. Do not use this when the user asks you to dream or enter dream time; use consolidate_memory instead.", .requires_senses = &.{.image_generation}, .autonomy_policy = .allowed, .energy_cost = 4, .failure_hint = "Check image generation service configuration." },
+    .{ .id = .remember_person, .name = "remember_person", .description = "create or refresh a person's face memory from the latest observed image. Use this when an unrecognized person becomes salient and naturally offers a name or identity, or when updating an existing person. Include name, or person_id/name for an existing person.", .requires_senses = &.{ .face_picture_update, .stored_image_read, .stored_memory_read, .stored_memory_write }, .autonomy_policy = .invalid, .failure_hint = "Capture or upload an image first, then check face picture update and memory configuration." },
+    .{ .id = .update_face_picture, .name = "update_face_picture", .description = "update an existing person's face recognition reference picture. Include person_id or unique name, and image_path; if image_path is omitted, the latest uploaded or observed image is used. Optional keep_existing keeps older cached embeddings.", .requires_senses = &.{ .face_picture_update, .stored_memory_read, .stored_memory_write }, .autonomy_policy = .invalid, .failure_hint = "Check host face picture update and memory configuration." },
     .{ .id = .send_email, .name = "send_email", .description = "send a plain-text email. Include to, subject, and text. Use only when the user clearly asks for email or explicitly consents to sending one.", .requires_senses = &.{.email_delivery}, .autonomy_policy = .invalid, .failure_hint = "Configure data/email.json and email delivery service." },
-    .{ .id = .choose_attention, .name = "choose_attention", .description = "notice what currently seems worth attention.", .requires_skills = &.{ .recall_memory, .introspect }, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory read and introspection configuration.", .developer_title = "Attention", .developer_symbol_name = "scope", .developer_mirror_to_chat = true },
-    .{ .id = .set_focus, .name = "set_focus", .description = "set a short plan as your current focus (working memory). Include text. Your focus leads your context while it stays fresh, then fades.", .requires_skills = &.{.introspect}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Provide non-empty focus text." },
-    .{ .id = .clear_focus, .name = "clear_focus", .description = "drop your current focus and return to deriving attention from what is happening now.", .requires_skills = &.{.introspect}, .autonomy_policy = .allowed, .energy_cost = 0, .failure_hint = "Check introspection configuration." },
-    .{ .id = .ask_human, .name = "ask_human", .description = "ask the human for help, clarification, or permission. Include text.", .requires_skills = &.{.remember_memory}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory write configuration." },
-    .{ .id = .consolidate_memory, .name = "consolidate_memory", .description = "integrate memory offline.", .requires_skills = &.{ .recall_memory, .remember_memory }, .autonomy_policy = .allowed, .energy_cost = 2, .failure_hint = "Check memory read/write configuration.", .developer_title = "Consolidate", .developer_symbol_name = "square.stack.3d.up" },
+    .{ .id = .choose_attention, .name = "choose_attention", .description = "notice what currently seems worth attention.", .requires_senses = &.{.stored_memory_read}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory read configuration.", .developer_title = "Attention", .developer_symbol_name = "scope", .developer_mirror_to_chat = true },
+    .{ .id = .set_focus, .name = "set_focus", .description = "set a short plan as your current focus (working memory). Include text. Your focus leads your context while it stays fresh, then fades.", .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Provide non-empty focus text." },
+    .{ .id = .clear_focus, .name = "clear_focus", .description = "drop your current focus and return to deriving attention from what is happening now.", .autonomy_policy = .allowed, .energy_cost = 0, .failure_hint = "Focus can be cleared without extra host capability." },
+    .{ .id = .begin_subtask, .name = "begin_subtask", .description = "pause the current activity and open a child subtask without losing the main goal. Include text as the subtask goal. Run other skills after this in the same turn when needed; call resume_parent when the subtask is done.", .autonomy_policy = .allowed, .energy_cost = 0, .failure_hint = "Requires an active parent activity and non-empty subtask text." },
+    .{ .id = .resume_parent, .name = "resume_parent", .description = "mark the current child subtask complete and resume the paused parent activity from the activity stack.", .autonomy_policy = .allowed, .energy_cost = 0, .failure_hint = "Requires an open child subtask with a paused parent on the activity stack." },
+    .{ .id = .consolidate_memory, .name = "consolidate_memory", .description = "enter internal dream time to consolidate memory and integrate the day's traces. Use when the user asks to dream, nap internally, or enter dream time now.", .requires_senses = &.{ .stored_memory_read, .stored_memory_write }, .autonomy_policy = .allowed, .energy_cost = 2, .failure_hint = "Check memory read/write configuration.", .developer_title = "Consolidate", .developer_symbol_name = "square.stack.3d.up" },
+    .{ .id = .sleep_autonomy, .name = "sleep_autonomy", .description = "pause self-directed autonomy actions until wake_autonomy is chosen. Optional text records why.", .autonomy_policy = .allowed, .energy_cost = 0, .failure_hint = "Autonomy sleep can be set without extra host capability." },
+    .{ .id = .wake_autonomy, .name = "wake_autonomy", .description = "resume self-directed autonomy actions after sleep_autonomy. Optional text records why.", .autonomy_policy = .allowed, .energy_cost = 0, .failure_hint = "Autonomy wake can be set without extra host capability." },
     .{ .id = .facial_expression, .name = "facial_expression", .description = "silently show a WebView facial expression. Include eyes and mouth sprite names; optional duration_ms defaults to 3000 and may not exceed 5000. Eye sprites: neutral, stern, narrow, surprised, upward, concerned, unfocused, focused. Mouth sprites: smile_closed, smile_teeth, frown, kiss, grimace, open, disgust, smirk, uneasy_right, flat, parted, neutral_closed.", .requires_senses = &.{.facial_expression_output}, .autonomy_policy = .allowed, .energy_cost = 0, .failure_hint = "Use the macOS WebView activation mode and provide valid eyes and mouth sprite names." },
 };
 
@@ -239,9 +244,9 @@ pub fn spec(id: SkillId) ?SkillSpec {
     return null;
 }
 
-pub fn commandSpec(id: SkillId) ?CommandSpec {
+pub fn actionSpec(id: SkillId) ?ActionSpec {
     const entry = spec(id) orelse return null;
-    return .{ .command = entry.id, .description = entry.description, .requires = entry.requires_senses };
+    return .{ .action = entry.id, .description = entry.description, .requires = entry.requires_senses };
 }
 
 pub fn name(id: SkillId) []const u8 {
@@ -347,7 +352,7 @@ pub fn autonomySkillNames(allocator: std.mem.Allocator) ![]const u8 {
     return out.toOwnedSlice(allocator);
 }
 
-pub fn autonomyCommandEnumJson(allocator: std.mem.Allocator) ![]const u8 {
+pub fn autonomyActionEnumJson(allocator: std.mem.Allocator) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     try out.append(allocator, '[');
     var first = true;
@@ -361,11 +366,37 @@ pub fn autonomyCommandEnumJson(allocator: std.mem.Allocator) ![]const u8 {
     return out.toOwnedSlice(allocator);
 }
 
+pub fn interactionSkillNames(allocator: std.mem.Allocator) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    var first = true;
+    for (registry) |entry| {
+        if (entry.autonomy_policy == .invalid) continue;
+        if (!first) try out.appendSlice(allocator, ", ");
+        first = false;
+        try out.appendSlice(allocator, entry.name);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn interactionActionEnumJson(allocator: std.mem.Allocator) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    try out.append(allocator, '[');
+    var first = true;
+    for (registry) |entry| {
+        if (entry.autonomy_policy == .invalid) continue;
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try out.appendSlice(allocator, try std.json.Stringify.valueAlloc(allocator, entry.name, .{}));
+    }
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn autonomyEnergyCost(id: SkillId) !u8 {
     const entry = spec(id) orelse return error.UnknownSkill;
     if (entry.autonomy_policy != .allowed) return switch (entry.autonomy_policy) {
         .forbidden => error.ProactiveCameraCaptureForbidden,
-        .invalid => error.InvalidAutonomyCommand,
+        .invalid => error.InvalidAutonomyAction,
         .allowed => unreachable,
     };
     return entry.energy_cost orelse return error.MissingAutonomyEnergyCost;
@@ -404,15 +435,15 @@ test "skill registry rejects duplicate skill names" {
 
 test "skill registry rejects unknown skill dependencies" {
     const entries = [_]SkillSpec{
-        .{ .id = .say, .name = "say", .description = "one", .requires_skills = &.{.recall_memory} },
+        .{ .id = .say, .name = "say", .description = "one", .requires_skills = &.{.unknown} },
     };
     try std.testing.expectError(error.UnknownSkillDependency, validateSpecs(&entries));
 }
 
 test "skill registry rejects cyclic skill dependencies" {
     const entries = [_]SkillSpec{
-        .{ .id = .say, .name = "say", .description = "one", .requires_skills = &.{.recall_memory} },
-        .{ .id = .recall_memory, .name = "recall_memory", .description = "two", .requires_skills = &.{.say} },
+        .{ .id = .say, .name = "say", .description = "one", .requires_skills = &.{.get_time} },
+        .{ .id = .get_time, .name = "get_time", .description = "two", .requires_skills = &.{.say} },
     };
     try std.testing.expectError(error.CyclicSkillDependency, validateSpecs(&entries));
 }

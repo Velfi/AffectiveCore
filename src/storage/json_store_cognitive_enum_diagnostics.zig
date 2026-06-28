@@ -15,10 +15,10 @@ pub const CognitiveEnumDiagnostic = struct {
 const relationship_status_tags = [_][]const u8{ "unknown", "visitor", "friend", "creator", "forgotten" };
 const greeting_style_tags = [_][]const u8{ "formal", "warm", "playful", "quiet" };
 const embedding_source_tags = [_][]const u8{ "enrollment", "confirmed_sighting", "manual_merge", "local_reference" };
-const trace_source_tags = [_][]const u8{ "human", "brain", "environment", "model", "maintenance", "autonomy", "memory", "visual", "dream", "command" };
-const trace_kind_tags = [_][]const u8{ "perception", "utterance", "action", "command_result", "failure", "memory_update", "appraisal", "dream", "self_definition", "reminder", "summary", "thought", "belief_evidence" };
+const trace_source_tags = [_][]const u8{ "human", "brain", "environment", "model", "maintenance", "autonomy", "memory", "visual", "dream", "capability" };
+const trace_kind_tags = [_][]const u8{ "perception", "utterance", "action", "capability_result", "failure", "memory_update", "appraisal", "dream", "self_definition", "reminder", "summary", "thought", "belief_evidence" };
 const trace_scope_tags = [_][]const u8{ "short_term", "long_term" };
-const cognitive_status_tags = [_][]const u8{ "active", "doubted", "superseded", "invalidated", "pending_deletion" };
+const cognitive_status_tags = [_][]const u8{ "active", "doubted", "invalidated", "pending_deletion" };
 const artifact_kind_tags = [_][]const u8{ "image", "audio", "video", "text", "embedding", "other" };
 const cognitive_retention_tags = [_][]const u8{ "ephemeral", "episode", "durable", "disposition", "discard" };
 

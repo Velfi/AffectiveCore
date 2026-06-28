@@ -13,9 +13,9 @@ pub const Source = struct {
     enabled: bool = true,
     interval_seconds: u64 = 5,
     ctx: *anyopaque,
-    pollFn: *const fn (*anyopaque, std.mem.Allocator, PollContext) anyerror![]schema.RuntimeEvent,
+    pollFn: *const fn (*anyopaque, std.mem.Allocator, PollContext) anyerror![]schema.ExperienceLogEvent,
 
-    pub fn poll(self: Source, allocator: std.mem.Allocator, context: PollContext) ![]schema.RuntimeEvent {
+    pub fn poll(self: Source, allocator: std.mem.Allocator, context: PollContext) ![]schema.ExperienceLogEvent {
         if (!self.enabled) return &.{};
         return self.pollFn(self.ctx, allocator, context);
     }
@@ -60,7 +60,7 @@ pub const Manager = struct {
         self.last_external_crash_at = now_seconds;
     }
 
-    pub fn shouldEmit(self: *Manager, allocator: std.mem.Allocator, now_seconds: i64, event: schema.RuntimeEvent, cooldown_seconds: i64) !bool {
+    pub fn shouldEmit(self: *Manager, allocator: std.mem.Allocator, now_seconds: i64, event: schema.ExperienceLogEvent, cooldown_seconds: i64) !bool {
         const key = event.dedupe_key orelse return true;
         if (self.last_dedupe_key) |last_key| {
             if (std.mem.eql(u8, last_key, key) and self.last_dedupe_at != null and now_seconds - self.last_dedupe_at.? < cooldown_seconds) {
@@ -73,7 +73,7 @@ pub const Manager = struct {
     }
 };
 
-pub fn runExternalMonitor(allocator: std.mem.Allocator, io: std.Io, runner: process.ProcessRunner, monitor_id: []const u8, command: []const u8) ![]schema.RuntimeEvent {
+pub fn runExternalMonitor(allocator: std.mem.Allocator, io: std.Io, runner: process.ProcessRunner, monitor_id: []const u8, command: []const u8) ![]schema.ExperienceLogEvent {
     const argv = try parseCommandArgv(allocator, command);
     if (argv.len == 0) return error.EmptyExternalMonitorCommand;
     const stdout = try runner.runCapture(allocator, io, argv);
@@ -88,13 +88,13 @@ fn parseCommandArgv(allocator: std.mem.Allocator, command: []const u8) ![]const 
     return argv.toOwnedSlice(allocator);
 }
 
-pub fn parseExternalEvents(allocator: std.mem.Allocator, monitor_id: []const u8, stdout: []const u8) ![]schema.RuntimeEvent {
-    var out = std.ArrayList(schema.RuntimeEvent).empty;
+pub fn parseExternalEvents(allocator: std.mem.Allocator, monitor_id: []const u8, stdout: []const u8) ![]schema.ExperienceLogEvent {
+    var out = std.ArrayList(schema.ExperienceLogEvent).empty;
     var lines = std.mem.splitScalar(u8, stdout, '\n');
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \r\t");
         if (line.len == 0) continue;
-        const parsed = std.json.parseFromSlice(schema.RuntimeEvent, allocator, line, .{ .ignore_unknown_fields = false }) catch continue;
+        const parsed = std.json.parseFromSlice(schema.ExperienceLogEvent, allocator, line, .{ .ignore_unknown_fields = false }) catch continue;
         defer parsed.deinit();
         const event = parsed.value;
         if (!validExternalEvent(event)) continue;
@@ -103,7 +103,7 @@ pub fn parseExternalEvents(allocator: std.mem.Allocator, monitor_id: []const u8,
             .source = if (event.source.len > 0) event.source else "id_monitor",
             .title = try allocator.dupe(u8, event.title),
             .body = try allocator.dupe(u8, event.body),
-            .command = if (event.command) |value| try allocator.dupe(u8, value) else null,
+            .action = if (event.action) |value| try allocator.dupe(u8, value) else null,
             .subject = try allocator.dupe(u8, event.subject),
             .raw = try allocator.dupe(u8, event.raw),
             .interpretation = try allocator.dupe(u8, event.interpretation),
@@ -131,7 +131,7 @@ pub fn parseExternalEvents(allocator: std.mem.Allocator, monitor_id: []const u8,
     return out.toOwnedSlice(allocator);
 }
 
-fn validExternalEvent(event: schema.RuntimeEvent) bool {
+fn validExternalEvent(event: schema.ExperienceLogEvent) bool {
     if (event.title.len == 0 or event.body.len == 0) return false;
     if (event.monitor_id == null and event.source.len == 0) return false;
     return true;
@@ -143,7 +143,7 @@ fn cloneStringSlice(allocator: std.mem.Allocator, values: []const []const u8) ![
     return out;
 }
 
-pub fn severityRank(severity: schema.RuntimeEventSeverity) u8 {
+pub fn severityRank(severity: schema.ExperienceLogSeverity) u8 {
     return switch (severity) {
         .debug => 0,
         .info => 1,
@@ -170,7 +170,7 @@ test "external id monitor parser accepts valid jsonl and rejects malformed lines
     const events = try parseExternalEvents(allocator, "external_test", stdout);
 
     try std.testing.expectEqual(@as(usize, 1), events.len);
-    try std.testing.expectEqual(schema.RuntimeEventKind.system, events[0].kind);
-    try std.testing.expectEqual(schema.RuntimeEventSeverity.warning, events[0].severity.?);
+    try std.testing.expectEqual(schema.ExperienceLogKind.system, events[0].kind);
+    try std.testing.expectEqual(schema.ExperienceLogSeverity.warning, events[0].severity.?);
     try std.testing.expectEqualStrings("external_test", events[0].monitor_id.?);
 }

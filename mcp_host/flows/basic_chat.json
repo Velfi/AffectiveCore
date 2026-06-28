@@ -1,0 +1,8 @@
+{
+  "setup": true,
+  "steps": [
+    { "request_id": "basic-hello", "event": { "type": "user_text", "text": "hello from mcp host" } },
+    { "op": "drain" },
+    { "request_id": "basic-mode", "event": { "type": "brain_mode" } }
+  ]
+}

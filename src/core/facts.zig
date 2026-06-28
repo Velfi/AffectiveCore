@@ -3,9 +3,11 @@ const ports = @import("ports.zig");
 const schema = ports.schema;
 
 pub const test_first_turned_on_at_unix_seconds: i64 = 1_781_222_400;
+pub const conversation_self_facts_max_bytes: usize = 8192;
 
-pub fn formatSummary(allocator: std.mem.Allocator, records: []const schema.FactRecord, now_seconds: i64) ![]const u8 {
+pub fn formatSummary(allocator: std.mem.Allocator, records: []const schema.FactRecord, now_seconds: i64, max_bytes: ?usize) ![]const u8 {
     var inactive_count: usize = 0;
+    var active_count: usize = 0;
     var runtime_seconds: ?i64 = null;
     for (records) |record| {
         try validateRecord(record);
@@ -13,6 +15,7 @@ pub fn formatSummary(allocator: std.mem.Allocator, records: []const schema.FactR
             inactive_count += 1;
             continue;
         }
+        active_count += 1;
         if (std.ascii.eqlIgnoreCase(record.key, "first_turned_on_at_unix_seconds")) {
             const first_on = try std.fmt.parseInt(i64, record.value, 10);
             if (first_on <= 0) return error.InvalidFirstTurnedOnAt;
@@ -21,23 +24,61 @@ pub fn formatSummary(allocator: std.mem.Allocator, records: []const schema.FactR
         }
     }
 
+    var footer = std.ArrayList(u8).empty;
+    defer footer.deinit(allocator);
+    if (runtime_seconds) |seconds| {
+        try footer.print(allocator, "- total_run_time_seconds: {d}\n- total_run_time: ", .{seconds});
+        try appendDuration(allocator, &footer, seconds);
+        try footer.append(allocator, '\n');
+    }
+    try footer.print(allocator, "- inactive_fact_count: {d}\n", .{inactive_count});
+
+    const header = "Self facts:\n";
+    const none_active = "- none active\n";
+    const truncation_prefix = "- conversation_self_facts_truncated: ";
+    var truncation_buf: [128]u8 = undefined;
+    const truncation_suffix = " active facts; use introspect query=facts for the full list\n";
+    const truncation_reserve = truncation_prefix.len + truncation_buf.len + truncation_suffix.len;
+
     var out = std.ArrayList(u8).empty;
-    try out.appendSlice(allocator, "Self facts:\n");
-    var active_count: usize = 0;
+    try out.appendSlice(allocator, header);
+    var shown_active: usize = 0;
+    var truncated = false;
     for (records) |record| {
         if (!record.active) continue;
-        active_count += 1;
-        try out.print(allocator, "- {s}: {s} [fact_id={s} confidence={d:.3} updated_at={s} tags=", .{ record.key, record.value, record.fact_id, record.confidence, record.updated_at });
-        try appendTags(allocator, &out, record.tags);
-        try out.appendSlice(allocator, "]\n");
+        var line = std.ArrayList(u8).empty;
+        defer line.deinit(allocator);
+        try line.print(allocator, "- {s}: {s} [fact_id={s} confidence={d:.3} updated_at={s} tags=", .{ record.key, record.value, record.fact_id, record.confidence, record.updated_at });
+        try appendTags(allocator, &line, record.tags);
+        try line.appendSlice(allocator, "]\n");
+
+        if (max_bytes) |limit| {
+            const projected = out.items.len + line.items.len + footer.items.len;
+            if (active_count > shown_active and projected + truncation_reserve > limit) {
+                truncated = true;
+                break;
+            }
+            if (projected > limit) {
+                truncated = true;
+                break;
+            }
+        }
+        try out.appendSlice(allocator, line.items);
+        shown_active += 1;
     }
-    if (active_count == 0) try out.appendSlice(allocator, "- none active\n");
-    if (runtime_seconds) |seconds| {
-        try out.print(allocator, "- total_run_time_seconds: {d}\n- total_run_time: ", .{seconds});
-        try appendDuration(allocator, &out, seconds);
-        try out.append(allocator, '\n');
+    if (active_count == 0) try out.appendSlice(allocator, none_active);
+    if (truncated) {
+        const truncation = try std.fmt.bufPrint(
+            &truncation_buf,
+            "{d}/{d}",
+            .{ shown_active, active_count },
+        );
+        try out.appendSlice(allocator, truncation_prefix);
+        try out.appendSlice(allocator, truncation);
+        try out.appendSlice(allocator, truncation_suffix);
     }
-    try out.print(allocator, "- inactive_fact_count: {d}\n", .{inactive_count});
+    try out.appendSlice(allocator, footer.items);
+    if (max_bytes) |limit| std.debug.assert(out.items.len <= limit);
     return out.toOwnedSlice(allocator);
 }
 
@@ -110,10 +151,9 @@ test "formats active and inactive managed facts with runtime" {
             .active = false,
             .created_at = "1781222400",
             .updated_at = "1781222500",
-            .invalidated_at = "1781222500",
         },
     };
-    const text = try formatSummary(std.testing.allocator, &records, test_first_turned_on_at_unix_seconds + 90_061);
+    const text = try formatSummary(std.testing.allocator, &records, test_first_turned_on_at_unix_seconds + 90_061, null);
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "name: Otto") != null);
@@ -131,7 +171,7 @@ test "rejects invalid managed facts and impossible clocks" {
         .created_at = "1",
         .updated_at = "1",
     }};
-    try std.testing.expectError(error.EmptyFactKey, formatSummary(std.testing.allocator, &bad_name, 1));
+    try std.testing.expectError(error.EmptyFactKey, formatSummary(std.testing.allocator, &bad_name, 1, null));
 
     const future_first_on = [_]schema.FactRecord{.{
         .fact_id = "fact_first_on",
@@ -140,5 +180,31 @@ test "rejects invalid managed facts and impossible clocks" {
         .created_at = "1",
         .updated_at = "1",
     }};
-    try std.testing.expectError(error.ClockBeforeFirstTurnOn, formatSummary(std.testing.allocator, &future_first_on, 1));
+    try std.testing.expectError(error.ClockBeforeFirstTurnOn, formatSummary(std.testing.allocator, &future_first_on, 1, null));
+}
+
+test "conversation self facts summary caps rendered bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var records = std.ArrayList(schema.FactRecord).empty;
+    for (0..80) |i| {
+        const value = try allocator.alloc(u8, 180);
+        @memset(value, 'x');
+        try records.append(allocator, .{
+            .fact_id = try std.fmt.allocPrint(allocator, "fact_{d}", .{i}),
+            .key = try std.fmt.allocPrint(allocator, "note_{d}", .{i}),
+            .value = value,
+            .created_at = "1781222400",
+            .updated_at = "1781222400",
+        });
+    }
+
+    const full = try formatSummary(allocator, records.items, test_first_turned_on_at_unix_seconds + 90_061, null);
+    try std.testing.expect(full.len > conversation_self_facts_max_bytes);
+
+    const capped = try formatSummary(allocator, records.items, test_first_turned_on_at_unix_seconds + 90_061, conversation_self_facts_max_bytes);
+    try std.testing.expect(capped.len <= conversation_self_facts_max_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "conversation_self_facts_truncated:") != null);
 }

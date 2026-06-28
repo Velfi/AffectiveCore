@@ -1,23 +1,42 @@
 const std = @import("std");
 const chat = @import("chat_client.zig");
-const ChatCommandType = chat.ChatCommandType;
+const context_tokens = @import("../core/context_tokens.zig");
+const greeting = @import("greeting_client.zig");
+const want_achievement = @import("want_achievement_client.zig");
+const ActionProposalType = chat.ActionProposalType;
 const ReasoningEffort = chat.ReasoningEffort;
-const max_chat_user_prompt_bytes = chat.max_chat_user_prompt_bytes;
-const commandSpec = chat.commandSpec;
+const max_chat_context_tokens = chat.max_chat_context_tokens;
+const actionSpec = chat.actionSpec;
 const parseChatTurn = chat.parseChatTurn;
 const buildChatPrompt = chat.buildChatPrompt;
 const chatUserPrompt = chat.chatUserPrompt;
+const chatPromptWithinBudget = chat.chatPromptWithinBudget;
 const auditChatPrompt = chat.auditChatPrompt;
 const chatSystemPrompt = chat.chatSystemPrompt;
+
+test "provider API surface does not expose alternate services" {
+    try std.testing.expect(!@hasDecl(chat, "UnconfiguredChatService"));
+    try std.testing.expect(!@hasDecl(greeting, "TestGreetingService"));
+    try std.testing.expect(!@hasDecl(want_achievement, "ScriptedWantAchievementDetector"));
+}
+
+test "parseChatTurn rejects empty host envelope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectError(error.LocalServiceResponseInvalid, parseChatTurn(allocator, "{}", "hello"));
+    try std.testing.expectError(error.LocalServiceResponseInvalid, parseChatTurn(allocator, "   ", "hello"));
+}
 
 test "parseChatTurn accepts next reasoning effort" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const turn = try parseChatTurn(allocator,
-        \\{"commands":[{"command":"introspect"}],"user_summary":"Asked something hard.","brain_summary":"Chose to inspect context.","reasoning_effort":"high"}
-    );
+        \\{"action_pressures":[{"action":"introspect"}],"user_summary":"Asked something hard.","brain_summary":"Chose to inspect context.","reasoning_effort":"high","effort_tier":"complex"}
+    , "");
     try std.testing.expectEqual(ReasoningEffort.high, turn.reasoning_effort.?);
+    try std.testing.expectEqual(chat.EffortTier.complex, turn.effort_tier.?);
 }
 
 test "parseChatTurn accepts unfinished conversation" {
@@ -25,11 +44,11 @@ test "parseChatTurn accepts unfinished conversation" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const turn = try parseChatTurn(allocator,
-        \\{"commands":[{"command":"remember_person","name":"Ari"}],"user_summary":"Ari introduced themself.","brain_summary":"Chose to register Ari.","conversation_done":false}
-    );
-    try std.testing.expect(!turn.conversation_done);
-    try std.testing.expectEqual(ChatCommandType.remember_person, turn.commands[0].command);
-    try std.testing.expectEqualStrings("Ari", turn.commands[0].name.?);
+        \\{"action_pressures":[{"action":"remember_person","name":"Ari"}],"user_summary":"Ari introduced themself.","brain_summary":"Chose to register Ari.","turn_complete":false}
+    , "");
+    try std.testing.expect(!turn.turn_complete);
+    try std.testing.expectEqual(ActionProposalType.remember_person, turn.action_pressures[0].action);
+    try std.testing.expectEqualStrings("Ari", turn.action_pressures[0].name.?);
 }
 
 test "parseChatTurn accepts provider parameter wrapper" {
@@ -37,103 +56,180 @@ test "parseChatTurn accepts provider parameter wrapper" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const turn = try parseChatTurn(allocator,
-        \\{"parameter":{"commands":[{"command":"say","text":"I dreamed that through."}],"user_summary":"Asked for dream skill.","brain_summary":"Used dream skill.","reasoning_effort":"medium","conversation_done":false}}
-    );
-    try std.testing.expectEqual(ChatCommandType.say, turn.commands[0].command);
-    try std.testing.expectEqualStrings("I dreamed that through.", turn.commands[0].text.?);
+        \\{"parameter":{"action_pressures":[{"action":"say","text":"I dreamed that through."}],"user_summary":"Asked for reflection.","brain_summary":"Answered with speech.","reasoning_effort":"medium","turn_complete":false}}
+    , "");
+    try std.testing.expectEqual(ActionProposalType.say, turn.action_pressures[0].action);
+    try std.testing.expectEqualStrings("I dreamed that through.", turn.action_pressures[0].text.?);
     try std.testing.expectEqual(ReasoningEffort.medium, turn.reasoning_effort.?);
-    try std.testing.expect(!turn.conversation_done);
+    try std.testing.expect(!turn.turn_complete);
 }
 
-test "parseChatTurn rejects wrapper without chat envelope" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    try std.testing.expectError(error.MissingField, parseChatTurn(allocator,
-        \\{"parameter":{"commands":[{"command":"say","text":"missing summaries"}]}}
-    ));
-}
-
-test "parseChatTurn accepts think_about command" {
+test "parseChatTurn derives summaries for wrapped action_pressures-only envelope" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const turn = try parseChatTurn(allocator,
-        \\{"commands":[{"command":"think_about","query":"whether to recall memory","tags":["reflection"]}],"user_summary":"Asked for thought.","brain_summary":"Chose reflection."}
-    );
-    try std.testing.expectEqual(ChatCommandType.think_about, turn.commands[0].command);
-    try std.testing.expectEqualStrings("whether to recall memory", turn.commands[0].query.?);
-    try std.testing.expectEqualStrings("reflection", turn.commands[0].tags[0]);
+        \\{"parameter":{"action_pressures":[{"action":"say","text":"missing summaries"}]}}
+    , "hello there");
+    try std.testing.expectEqualStrings("hello there", turn.user_summary);
+    try std.testing.expectEqualStrings("missing summaries", turn.brain_summary);
 }
 
-test "parseChatTurn accepts fact management commands" {
+test "parseChatTurn derives summaries for action_pressures-only host envelope" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const turn = try parseChatTurn(allocator,
-        \\{"commands":[{"command":"set_fact","name":"name","text":"Otto Prime","tags":["identity"]},{"command":"recall_fact","query":"name"},{"command":"invalidate_fact","memory_id":"fact_name"}],"user_summary":"Changed facts.","brain_summary":"Managed facts."}
-    );
-    try std.testing.expectEqual(ChatCommandType.set_fact, turn.commands[0].command);
-    try std.testing.expectEqualStrings("name", turn.commands[0].name.?);
-    try std.testing.expectEqualStrings("Otto Prime", turn.commands[0].text.?);
-    try std.testing.expectEqual(ChatCommandType.recall_fact, turn.commands[1].command);
-    try std.testing.expectEqualStrings("name", turn.commands[1].query.?);
-    try std.testing.expectEqual(ChatCommandType.invalidate_fact, turn.commands[2].command);
-    try std.testing.expectEqualStrings("fact_name", turn.commands[2].memory_id.?);
+        \\{"action_pressures":[{"action":"appraise_event","text":"technical frustration","tags":["social_context"]},{"action":"say","text":"Yeah, that is frustrating."}]}
+    , "something is broken");
+    try std.testing.expectEqualStrings("something is broken", turn.user_summary);
+    try std.testing.expectEqualStrings("Yeah, that is frustrating.", turn.brain_summary);
+    try std.testing.expectEqual(ActionProposalType.say, turn.action_pressures[1].action);
 }
 
-test "parseChatTurn accepts imagine_image command" {
+test "parseChatTurn accepts think_about action" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const turn = try parseChatTurn(allocator,
-        \\{"commands":[{"command":"imagine_image","text":"a brass automaton tending moonflowers"}],"user_summary":"Asked for an image.","brain_summary":"Chose image generation."}
-    );
-    try std.testing.expectEqual(ChatCommandType.imagine_image, turn.commands[0].command);
-    try std.testing.expectEqualStrings("a brass automaton tending moonflowers", turn.commands[0].text.?);
+        \\{"action_pressures":[{"action":"think_about","query":"whether to recall memory","tags":["reflection"]}],"user_summary":"Asked for thought.","brain_summary":"Chose reflection."}
+    , "");
+    try std.testing.expectEqual(ActionProposalType.think_about, turn.action_pressures[0].action);
+    try std.testing.expectEqualStrings("whether to recall memory", turn.action_pressures[0].query.?);
+    try std.testing.expectEqualStrings("reflection", turn.action_pressures[0].tags[0]);
 }
 
-test "parseChatTurn accepts send_email command fields" {
+test "parseChatTurn accepts fact management actions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const turn = try parseChatTurn(allocator,
-        \\{"commands":[{"command":"send_email","to":"mara@example.com","subject":"Garden","text":"The moonflowers opened."}],"user_summary":"Asked for email.","brain_summary":"Sent email."}
-    );
-    try std.testing.expectEqual(ChatCommandType.send_email, turn.commands[0].command);
-    try std.testing.expectEqualStrings("mara@example.com", turn.commands[0].to.?);
-    try std.testing.expectEqualStrings("Garden", turn.commands[0].subject.?);
-    try std.testing.expectEqualStrings("The moonflowers opened.", turn.commands[0].text.?);
+        \\{"action_pressures":[{"action":"set_fact","name":"name","text":"Otto Prime","tags":["identity"]},{"action":"recall_fact","query":"name"},{"action":"invalidate_fact","memory_id":"fact_name"}],"user_summary":"Changed facts.","brain_summary":"Managed facts."}
+    , "");
+    try std.testing.expectEqual(ActionProposalType.set_fact, turn.action_pressures[0].action);
+    try std.testing.expectEqualStrings("name", turn.action_pressures[0].name.?);
+    try std.testing.expectEqualStrings("Otto Prime", turn.action_pressures[0].text.?);
+    try std.testing.expectEqual(ActionProposalType.recall_fact, turn.action_pressures[1].action);
+    try std.testing.expectEqualStrings("name", turn.action_pressures[1].query.?);
+    try std.testing.expectEqual(ActionProposalType.invalidate_fact, turn.action_pressures[2].action);
+    try std.testing.expectEqualStrings("fact_name", turn.action_pressures[2].memory_id.?);
 }
 
-test "parseChatTurn accepts visual description commands" {
+test "parseChatTurn accepts imagine_image action" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const turn = try parseChatTurn(allocator,
-        \\{"commands":[{"command":"describe_image","query":"what changed on the desk"},{"command":"compare_images","text":"compare object placement"}],"user_summary":"Asked about images.","brain_summary":"Chose visual understanding."}
-    );
-    try std.testing.expectEqual(ChatCommandType.describe_image, turn.commands[0].command);
-    try std.testing.expectEqualStrings("what changed on the desk", turn.commands[0].query.?);
-    try std.testing.expectEqual(ChatCommandType.compare_images, turn.commands[1].command);
-    try std.testing.expectEqualStrings("compare object placement", turn.commands[1].text.?);
+        \\{"action_pressures":[{"action":"imagine_image","text":"a brass automaton tending moonflowers"}],"user_summary":"Asked for an image.","brain_summary":"Chose image generation."}
+    , "");
+    try std.testing.expectEqual(ActionProposalType.imagine_image, turn.action_pressures[0].action);
+    try std.testing.expectEqualStrings("a brass automaton tending moonflowers", turn.action_pressures[0].text.?);
 }
 
-test "parseChatTurn accepts facial expression command fields" {
+test "parseChatTurn accepts send_email action fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const turn = try parseChatTurn(allocator,
-        \\{"commands":[{"command":"facial_expression","eyes":"unfocused","mouth":"smirk","duration_ms":4500}],"user_summary":"Asked for a visible reaction.","brain_summary":"Chose an expression."}
-    );
-    try std.testing.expectEqual(ChatCommandType.facial_expression, turn.commands[0].command);
-    try std.testing.expectEqualStrings("unfocused", turn.commands[0].eyes.?);
-    try std.testing.expectEqualStrings("smirk", turn.commands[0].mouth.?);
-    try std.testing.expectEqual(@as(?u32, 4500), turn.commands[0].duration_ms);
+        \\{"action_pressures":[{"action":"send_email","to":"mara@example.com","subject":"Garden","text":"The moonflowers opened."}],"user_summary":"Asked for email.","brain_summary":"Sent email."}
+    , "");
+    try std.testing.expectEqual(ActionProposalType.send_email, turn.action_pressures[0].action);
+    try std.testing.expectEqualStrings("mara@example.com", turn.action_pressures[0].to.?);
+    try std.testing.expectEqualStrings("Garden", turn.action_pressures[0].subject.?);
+    try std.testing.expectEqualStrings("The moonflowers opened.", turn.action_pressures[0].text.?);
+}
+
+test "parseChatTurn accepts visual description actions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const turn = try parseChatTurn(allocator,
+        \\{"action_pressures":[{"action":"describe_image","query":"what changed on the desk"},{"action":"compare_images","text":"compare object placement"}],"user_summary":"Asked about images.","brain_summary":"Chose visual understanding."}
+    , "");
+    try std.testing.expectEqual(ActionProposalType.describe_image, turn.action_pressures[0].action);
+    try std.testing.expectEqualStrings("what changed on the desk", turn.action_pressures[0].query.?);
+    try std.testing.expectEqual(ActionProposalType.compare_images, turn.action_pressures[1].action);
+    try std.testing.expectEqualStrings("compare object placement", turn.action_pressures[1].text.?);
+}
+
+test "parseChatTurn accepts facial expression action fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const turn = try parseChatTurn(allocator,
+        \\{"action_pressures":[{"action":"facial_expression","eyes":"unfocused","mouth":"smirk","duration_ms":4500}],"user_summary":"Asked for a visible reaction.","brain_summary":"Chose an expression."}
+    , "");
+    try std.testing.expectEqual(ActionProposalType.facial_expression, turn.action_pressures[0].action);
+    try std.testing.expectEqualStrings("unfocused", turn.action_pressures[0].eyes.?);
+    try std.testing.expectEqualStrings("smirk", turn.action_pressures[0].mouth.?);
+    try std.testing.expectEqual(@as(?u32, 4500), turn.action_pressures[0].duration_ms);
+}
+
+test "parseChatTurn accepts null keep_existing on actions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const turn = try parseChatTurn(allocator,
+        \\{"brain_summary":"I'll generate an image of myself now.","action_pressures":[{"action":"take_picture","duration_ms":null,"eyes":null,"heat_bias":null,"image_path":null,"keep_existing":null,"memory_id":null,"mouth":null,"name":null,"person_id":null,"query":null,"schedule":null,"subject":null,"tags":["visual"],"text":null,"to":null},{"action":"say","text":"I'll generate an image of myself now."}],"turn_complete":false,"reasoning_effort":"medium","user_summary":"You asked me to generate an image of myself."}
+    , "generate an image of yourself");
+    try std.testing.expectEqual(@as(usize, 2), turn.action_pressures.len);
+    try std.testing.expectEqual(ActionProposalType.take_picture, turn.action_pressures[0].action);
+    try std.testing.expectEqual(false, turn.action_pressures[0].keep_existing);
+    try std.testing.expectEqual(ActionProposalType.say, turn.action_pressures[1].action);
+    try std.testing.expectEqual(false, turn.turn_complete);
+}
+
+test "parseChatTurn accepts null turn_complete" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const turn = try parseChatTurn(allocator,
+        \\{"action_pressures":[{"action":"say","text":"hi","query":null,"memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"to":null,"subject":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]}],"user_summary":"hello","brain_summary":"reply","reasoning_effort":null,"turn_complete":null}
+    , "hello");
+    try std.testing.expectEqual(true, turn.turn_complete);
+}
+
+test "parseChatTurn accepts compact say action without null placeholders" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const turn = try parseChatTurn(allocator,
+        \\{"action_pressures":[{"action":"say","text":"Hello! How can I assist you today?","query":"Greet the user warmly and ask how I can assist today.","scale":"medium"}],"user_summary":"User greeted and asked how I am.","brain_summary":"Respond with a friendly greeting and offer assistance.","effort_tier":"basic","reasoning_effort":"low","turn_complete":true}
+    , "hello");
+    try std.testing.expectEqual(ActionProposalType.say, turn.action_pressures[0].action);
+    try std.testing.expectEqual(chat.ActionScale.medium, turn.action_pressures[0].scale);
+    try std.testing.expectEqual(chat.ActionOrigin.interaction, turn.action_pressures[0].origin);
+    try std.testing.expect(turn.action_pressures[0].delay_ms == null);
+    try std.testing.expect(turn.action_pressures[0].memory_id == null);
+}
+
+test "parseChatTurn accepts minimal say action objects" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const turn = try parseChatTurn(allocator,
+        \\{"action_pressures":[{"action":"say","text":"hi"}],"user_summary":"hello","brain_summary":"reply","reasoning_effort":null,"turn_complete":false}
+    , "hello");
+    try std.testing.expectEqualStrings("hi", turn.action_pressures[0].text.?);
+}
+
+test "parseChatTurn maps common action aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const recognize_turn = try parseChatTurn(allocator,
+        \\{"action_pressures":[{"action":"RecognizeSubject"}],"user_summary":"look","brain_summary":"look"}
+    , "");
+    try std.testing.expectEqual(ActionProposalType.recognize, recognize_turn.action_pressures[0].action);
+
+    const say_turn = try parseChatTurn(allocator,
+        \\{"action_pressures":[{"action":"speak","text":"hi"}],"user_summary":"hello","brain_summary":"reply"}
+    , "hello");
+    try std.testing.expectEqual(ActionProposalType.say, say_turn.action_pressures[0].action);
 }
 
 test "recognize is described as an identity skill for the current speaker" {
-    const spec = commandSpec(.recognize).?;
+    const spec = actionSpec(.recognize).?;
     try std.testing.expect(std.mem.indexOf(u8, spec.description, "identity-recognition skill") != null);
     try std.testing.expect(std.mem.indexOf(u8, spec.description, "who you are talking to") != null);
 }
@@ -142,12 +238,22 @@ test "chat prompt frames the current utterance as heard speech" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const prompt = try chatUserPrompt(allocator, "memory", "hey here's my message", "none");
+    const prompt = try chatUserPrompt(allocator, "memory", "hey here's my message", "none", max_chat_context_tokens);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "# Compact Memory\nmemory") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "# User Input\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "# Observations\nnone") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "You just heard USER say \"hey here's my message\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Stimulus: \"hey here's my message\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "User said:") == null);
+}
+
+test "chat prompt uses unified stimulus framing for host resume context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const observations =
+        "host_sense_delivered:\n- note: you have what you were waiting for; pick up where you left off.\n";
+    const prompt = try chatUserPrompt(allocator, "memory", "self-defined want: Continue existing.", observations, max_chat_context_tokens);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Stimulus: \"self-defined want: Continue existing.\"") != null);
 }
 
 test "chat prompt budget fails loudly" {
@@ -155,10 +261,25 @@ test "chat prompt budget fails loudly" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const oversized = try allocator.alloc(u8, max_chat_user_prompt_bytes + 1);
+    const oversized = try allocator.alloc(u8, context_tokens.minBytesExceedingTokenBudget(max_chat_context_tokens));
     @memset(oversized, 'x');
 
-    try std.testing.expectError(error.ContextBudgetExceeded, buildChatPrompt(allocator, oversized, "hello", ""));
+    try std.testing.expectError(error.ContextBudgetExceeded, buildChatPrompt(allocator, oversized, "hello", "", max_chat_context_tokens));
+    try std.testing.expect(!try chatPromptWithinBudget(allocator, oversized, "hello", "", max_chat_context_tokens));
+    try std.testing.expect(try chatPromptWithinBudget(allocator, "memory", "hello", "observations", max_chat_context_tokens));
+}
+
+test "chat prompt audit succeeds when prompt exceeds budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const oversized = try allocator.alloc(u8, context_tokens.minBytesExceedingTokenBudget(max_chat_context_tokens));
+    @memset(oversized, 'x');
+
+    const audit = try auditChatPrompt(allocator, oversized, "hello", "");
+    try std.testing.expect(audit.user_prompt_tokens > max_chat_context_tokens);
+    try std.testing.expectError(error.ContextBudgetExceeded, buildChatPrompt(allocator, oversized, "hello", "", max_chat_context_tokens));
 }
 
 test "chat prompt audit reports rendered byte counts" {
@@ -169,11 +290,23 @@ test "chat prompt audit reports rendered byte counts" {
     const memory = "memory index";
     const user_text = "hello";
     const observations = "observations";
-    const prompt = try buildChatPrompt(allocator, memory, user_text, observations);
+    const prompt = try buildChatPrompt(allocator, memory, user_text, observations, max_chat_context_tokens);
     const audit = try auditChatPrompt(allocator, memory, user_text, observations);
 
     try std.testing.expectEqual(chatSystemPrompt().len, audit.system_prompt_bytes);
     try std.testing.expectEqual(memory.len, audit.compact_memory_bytes);
     try std.testing.expectEqual(observations.len, audit.observations_bytes);
     try std.testing.expectEqual(prompt.user_prompt.len, audit.user_prompt_bytes);
+    try std.testing.expectEqual(context_tokens.estimateTokens(prompt.user_prompt), audit.user_prompt_tokens);
+}
+
+test "32KB chat prompt stays within 120K token budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const memory = try allocator.alloc(u8, 32 * 1024);
+    @memset(memory, 'm');
+    try std.testing.expect(try chatPromptWithinBudget(allocator, memory, "hello", "observations", max_chat_context_tokens));
+    _ = try buildChatPrompt(allocator, memory, "hello", "observations", max_chat_context_tokens);
 }

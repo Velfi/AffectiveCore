@@ -41,6 +41,8 @@ struct ToolCallRecord: Identifiable, Equatable {
 @MainActor
 @Observable
 final class BrainDashboardModel {
+    private static let maxRecords = 200
+
     var serverPath = "/Users/zelda/Documents/AffectiveCore/zig-out/bin/affective-core-mcp"
     var status = "Disconnected"
     var isConnected = false
@@ -49,18 +51,27 @@ final class BrainDashboardModel {
     var memoryTags = ""
     var reminderSchedule = "in 10 minutes"
     var reminderText = ""
-    var selectedTool = "introspect"
-    var rawArguments = "{}"
+    var userTextInput = ""
+    var selectedTool = "user_text"
+    var rawArguments = "{\"text\": \"hello\"}"
     var records: [ToolCallRecord] = []
+    var recordsListGeneration = UUID()
     var lastError: String?
     var newBrainName = "Garden"
     var seedCoreValues = "Grow patient knowledge.\nStrengthen local care."
     var seedOperatingTendencies = "Ask before interrupting.\nFail plainly when uncertain."
-    var seedWants = "Maintain a living map of the garden."
+    var seedWants = NewBrainDefaults.wants
+    var seedGoals = NewBrainDefaults.goals
     var seedPrinciples = "Do not pretend a failed action worked.\nAsk before acting in shared spaces."
     var seedDraftPath: String?
+    var llmQuality = "auto"
+    var seedDraftPreview = ""
+
+    @ObservationIgnored private var seedPreviewTask: Task<Void, Never>?
+    @ObservationIgnored private var totalAppendedRecords = 0
 
     private var client: MCPClient?
+    private var isConnecting = false
 
     static func snapshotDefaultBrain() -> BrainDashboardModel {
         let model = BrainDashboardModel()
@@ -69,9 +80,29 @@ final class BrainDashboardModel {
         model.seedDraftPath = "/Users/zelda/Documents/AffectiveCore/data/seeds/garden.md"
         model.records = [
             .init(
-                toolName: "introspect",
+                toolName: "read_models_snapshot",
                 title: "Default Brain",
                 body: "self_needs_and_wants:\n- seed_default_seed_core_value_1: Facilitate human contact.\n- seed_default_seed_superego_principle_1: Do not pretend a failed action worked.\n\npsyche:\n- Id, Ego, and Superego are active.\n- Superego principles are available as seeded self-model material."
+            ),
+            .init(
+                toolName: "user_text",
+                title: "User Text Outcome",
+                body: ToolResultFormatting.displayBody(toolName: "user_text", rawJSON: """
+                {
+                  "text": "hello",
+                  "spoken_text": "Hi — I'm here.",
+                  "user_summary": "User greeted the brain.",
+                  "brain_summary": "Responded with a short greeting.",
+                  "awaiting_host_sense": false,
+                  "interrupted_by": null,
+                  "activity_id": "act-001",
+                  "activity_kind": "converse",
+                  "activity_kind_label": "Conversation",
+                  "activity_state": "completed",
+                  "activity_goal": "Respond to hello",
+                  "activity_awaiting": null
+                }
+                """)
             ),
             .init(
                 toolName: "seed_draft",
@@ -79,28 +110,50 @@ final class BrainDashboardModel {
                 body: "/Users/zelda/Documents/AffectiveCore/data/seeds/garden.md"
             ),
         ]
+        model.seedDraftPreview = model.seedDraftMarkdown
         return model
     }
 
     let quickTools = [
-        "introspect",
-        "memory_index",
-        "choose_attention",
-        "consolidate_memory",
-        "dream",
-        "graph_summary",
-        "list_reminders",
+        "connect",
+        "brain_mode",
+        "read_models_snapshot",
+        "set_runtime_option",
+        "mailbox_list",
+        "request_dream_time",
+        "user_text",
+    ]
+
+    let allTools = [
+        "connect",
+        "host_attach",
+        "host_capability_manifest",
+        "send_experience_event",
+        "user_text",
+        "request_dream_time",
+        "brain_mode",
+        "read_models_snapshot",
+        "set_runtime_option",
+        "mailbox_list",
+        "mailbox_mark_read",
+        "capability_status",
+        "export_brain",
+        "import_brain",
     ]
 
     func connect() async {
+        guard !isConnected, !isConnecting else { return }
+        isConnecting = true
+        defer { isConnecting = false }
         await runReportingErrors {
             let client = MCPClient(serverPath: serverPath)
             try await client.connect()
             self.client = client
             self.isConnected = true
             self.status = "Connected"
-            self.records.append(.init(toolName: "initialize", title: "Connected", body: "AffectiveCore MCP server is ready."))
-            try await self.callTool("introspect", arguments: [:], title: "Initial State")
+            appendRecord(.init(toolName: "initialize", title: "Connected", body: "AffectiveCore MCP server is ready."))
+            try await self.callTool("connect", arguments: [:], title: "Connection")
+            try await self.callTool("read_models_snapshot", arguments: [:], title: "Initial Read Models")
         }
     }
 
@@ -113,18 +166,41 @@ final class BrainDashboardModel {
 
     func refresh() async {
         await runReportingErrors {
-            try await callTool("introspect", arguments: [:], title: "Inner State")
+            try await callTool("read_models_snapshot", arguments: [:], title: "Read Models")
+            syncLlmQualityFromLatestSnapshot()
         }
+    }
+
+    func applyLlmQuality() async {
+        await runReportingErrors {
+            try await callTool(
+                "set_runtime_option",
+                arguments: ["llm_quality": .string(llmQuality)],
+                title: "LLM Quality"
+            )
+        }
+    }
+
+    private func syncLlmQualityFromLatestSnapshot() {
+        guard let latest = records.last(where: { $0.toolName == "read_models_snapshot" }) else { return }
+        guard let data = latest.body.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let readModels = json["read_models"] as? [String: Any],
+              let policy = readModels["llm_policy_model"] as? [String: Any],
+              let quality = policy["user_quality"] as? String else { return }
+        llmQuality = quality
     }
 
     func recallMemory() async {
         await runReportingErrors {
-            var arguments: [String: JSONValue] = ["query": .string(query)]
-            let tags = parsedTags()
-            if !tags.isEmpty {
-                arguments["tags"] = .array(tags.map(JSONValue.string))
+            let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedQuery.isEmpty else {
+                throw BrainClientError.invalidToolArguments("Recall query is required.")
             }
-            try await callTool("recall_memory", arguments: arguments, title: "Recall")
+            let tags = parsedTags()
+            let suffix = tags.isEmpty ? "" : " Tags: \(tags.joined(separator: ", "))."
+            let text = "Recall memories related to: \(trimmedQuery).\(suffix)"
+            try await callTool("user_text", arguments: ["text": .string(text)], title: "Recall")
         }
     }
 
@@ -133,12 +209,20 @@ final class BrainDashboardModel {
             guard !memoryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw BrainClientError.invalidToolArguments("Memory text is required.")
             }
-            var arguments: [String: JSONValue] = ["text": .string(memoryText)]
+            var arguments: [String: JSONValue] = [
+                "source": .string("host"),
+                "kind": .string("Memory.MemoryWritten"),
+                "payload": .string(memoryText),
+                "salience": .number(0.72),
+                "confidence": .number(0.85),
+                "retention": .string("durable"),
+                "visibility": .string("internal"),
+            ]
             let tags = parsedTags()
             if !tags.isEmpty {
-                arguments["tags"] = .array(tags.map(JSONValue.string))
+                arguments["causal_parent_ids"] = .array(tags.map { .string("tag:\($0)") })
             }
-            try await callTool("remember_memory", arguments: arguments, title: "Remember")
+            try await callTool("send_experience_event", arguments: arguments, title: "Remember")
             memoryText = ""
         }
     }
@@ -151,15 +235,80 @@ final class BrainDashboardModel {
             guard !reminderText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw BrainClientError.invalidToolArguments("Reminder text is required.")
             }
-            try await callTool(
-                "set_reminder",
-                arguments: [
-                    "schedule": .string(reminderSchedule),
-                    "text": .string(reminderText),
-                ],
-                title: "Set Reminder"
-            )
+            let text = "Schedule a reminder \(reminderSchedule): \(reminderText)"
+            try await callTool("user_text", arguments: ["text": .string(text)], title: "Set Reminder")
             reminderText = ""
+        }
+    }
+
+    func sendUserText() async {
+        await runReportingErrors {
+            let text = userTextInput.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else {
+                throw BrainClientError.invalidToolArguments("User text is required.")
+            }
+            let dispatchId = UUID().uuidString
+            try await callTool(
+                "user_text",
+                arguments: [
+                    "text": .string(text),
+                    "request_id": .string(dispatchId),
+                ],
+                title: "User Text"
+            )
+            userTextInput = ""
+        }
+    }
+
+    func applyDefaultArguments(for tool: String) {
+        selectedTool = tool
+        rawArguments = Self.defaultArguments(for: tool)
+    }
+
+    static func defaultArguments(for tool: String) -> String {
+        switch tool {
+        case "user_text":
+            return """
+            {"text": "hello"}
+            """
+        case "send_experience_event":
+            return """
+            {"kind": "User.TextReceived", "payload": "typed text logged for experience", "retention": "episode", "visibility": "host"}
+            """
+        case "request_dream_time":
+            return """
+            {"text": "reflect on today"}
+            """
+        case "host_attach":
+            return """
+            {"host_id": "mac-studio", "platform": "macos", "app_version": "0.1.0", "permissions": ["camera", "microphone"]}
+            """
+        case "host_capability_manifest":
+            return """
+            {"host_id": "mac-studio", "capability_ids": ["camera_capture", "identity_recognition"]}
+            """
+        case "mailbox_mark_read":
+            return """
+            {"mailbox_id": "mailbox-001"}
+            """
+        case "capability_status":
+            return """
+            {"capability_id": "camera_capture", "availability": "available", "quality": 0.9}
+            """
+        case "set_runtime_option":
+            return """
+            {"llm_quality": "auto"}
+            """
+        case "export_brain":
+            return """
+            {"brain_file_path": "data/export/default.brain"}
+            """
+        case "import_brain":
+            return """
+            {"brain_file_path": "data/export/default.brain", "brain_root": "data/brains/imported", "host_id": "mac-studio"}
+            """
+        default:
+            return "{}"
         }
     }
 
@@ -183,8 +332,18 @@ final class BrainDashboardModel {
         ]
         appendSeedSection(title: "Operating Tendencies", text: seedOperatingTendencies, to: &sections)
         appendSeedSection(title: "Wants", text: seedWants, to: &sections)
+        appendSeedSection(title: "Goals", text: seedGoals, to: &sections)
         appendSeedSection(title: "Superego Principles", text: seedPrinciples, to: &sections)
         return sections.joined(separator: "\n\n")
+    }
+
+    func scheduleSeedPreviewUpdate() {
+        seedPreviewTask?.cancel()
+        seedPreviewTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(200))
+            guard !Task.isCancelled else { return }
+            seedDraftPreview = seedDraftMarkdown
+        }
     }
 
     func createSeedDraft() async {
@@ -202,7 +361,7 @@ final class BrainDashboardModel {
             let fileURL = seedsDirectory.appendingPathComponent("\(seedSlug(seedName)).md")
             try seedDraftMarkdown.write(to: fileURL, atomically: true, encoding: .utf8)
             seedDraftPath = fileURL.path
-            records.insert(.init(toolName: "seed_draft", title: "Seed Draft Created", body: fileURL.path), at: 0)
+            appendRecord(.init(toolName: "seed_draft", title: "Seed Draft Created", body: fileURL.path))
             status = "Seed draft ready"
         }
     }
@@ -265,14 +424,24 @@ final class BrainDashboardModel {
         return trimmed.isEmpty ? "new-brain" : trimmed
     }
 
+    private func appendRecord(_ record: ToolCallRecord) {
+        records.append(record)
+        totalAppendedRecords += 1
+        if records.count > Self.maxRecords {
+            records.removeFirst(records.count - Self.maxRecords)
+        }
+        if totalAppendedRecords.isMultiple(of: Self.maxRecords) {
+            recordsListGeneration = UUID()
+        }
+    }
+
     private func callTool(_ name: String, arguments: [String: JSONValue], title: String) async throws {
         guard let client else {
             throw BrainClientError.serverDisconnected
         }
-        status = "Calling \(name)"
         let output = try await client.callTool(name: name, arguments: arguments)
-        records.insert(.init(toolName: name, title: title, body: output), at: 0)
-        status = "Connected"
+        let body = ToolResultFormatting.displayBody(toolName: name, rawJSON: output)
+        appendRecord(.init(toolName: name, title: title, body: body))
     }
 
     private func runReportingErrors(_ operation: () async throws -> Void) async {
@@ -406,6 +575,94 @@ actor MCPClient {
 
     private func data(_ data: Data, hasSuffix suffix: Data) -> Bool {
         data.count >= suffix.count && data.suffix(suffix.count).elementsEqual(suffix)
+    }
+}
+
+enum ToolResultFormatting {
+    static func displayBody(toolName: String, rawJSON: String) -> String {
+        if toolName == "user_text" {
+            return formatUserTextOutcome(rawJSON)
+        }
+        return rawJSON
+    }
+
+    static func formatUserTextOutcome(_ rawJSON: String) -> String {
+        guard let data = rawJSON.data(using: .utf8),
+              let root = try? JSONDecoder().decode(JSONValue.self, from: data) else {
+            return rawJSON
+        }
+
+        let outcome = extractOutcome(from: root)
+        var lines: [String] = ["user_text outcome"]
+        appendField("dispatch_id", from: outcome, to: &lines)
+        appendField("text", from: outcome, to: &lines)
+        appendField("spoken_text", from: outcome, to: &lines)
+        appendField("user_summary", from: outcome, to: &lines)
+        appendField("brain_summary", from: outcome, to: &lines)
+        appendField("awaiting_host_sense", from: outcome, to: &lines)
+        appendField("interrupted_by", from: outcome, to: &lines)
+        appendField("activity_id", from: outcome, to: &lines)
+        appendField("activity_kind", from: outcome, to: &lines)
+        appendField("activity_kind_label", from: outcome, to: &lines)
+        appendField("activity_state", from: outcome, to: &lines)
+        appendField("activity_goal", from: outcome, to: &lines)
+        appendField("activity_awaiting", from: outcome, to: &lines)
+
+        lines.append("")
+        lines.append("embedded envelope (host dispatch):")
+        lines.append("{")
+        lines.append("  \"kind\": \"user_text\",")
+        lines.append("  \"outcome\": { ...fields above... }")
+        lines.append("}")
+        lines.append("")
+        lines.append("raw json:")
+        lines.append(prettyJSON(rawJSON) ?? rawJSON)
+        return lines.joined(separator: "\n")
+    }
+
+    private static func extractOutcome(from root: JSONValue) -> [String: JSONValue] {
+        if let envelope = root.objectValue,
+           let value = envelope["value"]?.objectValue,
+           let outcome = value["outcome"]?.objectValue {
+            return outcome
+        }
+        if let envelope = root.objectValue,
+           let outcome = envelope["outcome"]?.objectValue {
+            return outcome
+        }
+        return root.objectValue ?? [:]
+    }
+
+    private static func appendField(_ key: String, from outcome: [String: JSONValue], to lines: inout [String]) {
+        guard let value = outcome[key] else { return }
+        lines.append("\(key): \(renderValue(value))")
+    }
+
+    private static func renderValue(_ value: JSONValue) -> String {
+        switch value {
+        case .null:
+            "null"
+        case .bool(let flag):
+            flag ? "true" : "false"
+        case .number(let number):
+            number.truncatingRemainder(dividingBy: 1) == 0 ? String(Int(number)) : String(number)
+        case .string(let text):
+            text.isEmpty ? "(empty)" : text
+        case .array(let items):
+            "[\(items.count) items]"
+        case .object(let object):
+            "{\(object.count) keys}"
+        }
+    }
+
+    private static func prettyJSON(_ rawJSON: String) -> String? {
+        guard let data = rawJSON.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let pretty = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]),
+              let text = String(data: pretty, encoding: .utf8) else {
+            return nil
+        }
+        return text
     }
 }
 

@@ -1,0 +1,44 @@
+{
+  "api_version": 1,
+  "request_id": "",
+  "ok": true,
+  "events": [
+    {
+      "id": "fixture-event-001",
+      "brain_id": "fixture-brain",
+      "host_id": "macos-host",
+      "timestamp_ms": 1782515600000,
+      "source": "memory",
+      "kind": "Memory.MemoryStored",
+      "payload": "{\"summary\":\"memory_saved\"}",
+      "salience": 0.55,
+      "confidence": 0.8,
+      "valence": 0.1,
+      "arousal": 0.2,
+      "uncertainty": 0.1,
+      "causal_parent_ids": ["fixture-event-user-text"],
+      "retention": "durable",
+      "visibility": "host"
+    },
+    {
+      "id": "fixture-event-002",
+      "brain_id": "fixture-brain",
+      "host_id": "macos-host",
+      "timestamp_ms": 1782515600100,
+      "source": "subsystem",
+      "kind": "Brain.ModeChanged",
+      "payload": "{\"mode\":\"waking\"}",
+      "salience": 0.2,
+      "confidence": 1.0,
+      "valence": 0.0,
+      "arousal": 0.0,
+      "uncertainty": 0.0,
+      "causal_parent_ids": ["fixture-event-001"],
+      "retention": "episode",
+      "visibility": "developer"
+    }
+  ],
+  "result": {
+    "kind": "event_batch"
+  }
+}

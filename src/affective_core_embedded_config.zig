@@ -16,12 +16,12 @@ pub fn makeConfig(allocator: std.mem.Allocator, raw: AffectiveCoreEmbeddedConfig
         .image_generation_output_dir = try stringOrDefault(allocator, raw.image_generation_output_dir, ""),
         .memory_path = try requiredString(allocator, raw.memory_path),
         .graph_path = try requiredString(allocator, raw.graph_path),
-        .events_path = try requiredString(allocator, raw.events_path),
         .maintenance_schedule_path = try requiredString(allocator, raw.schedule_path),
         .maintenance_state_path = try requiredString(allocator, raw.maintenance_state_path),
         .face_embeddings_dir = try stringOrDefault(allocator, raw.face_embeddings_dir, ""),
     };
     cfg.runtime_options_path = try std.fs.path.join(allocator, &.{ cfg.brain_root, "runtime_options.json" });
+    cfg.llm_providers_path = try std.fs.path.join(allocator, &.{ cfg.brain_root, "llm_providers.json" });
     if (cfg.image_generation_output_dir.len == 0) {
         cfg.image_generation_output_dir = try std.fs.path.join(allocator, &.{ cfg.brain_root, "generated", "images" });
     }
@@ -29,7 +29,16 @@ pub fn makeConfig(allocator: std.mem.Allocator, raw: AffectiveCoreEmbeddedConfig
     cfg.intent_mode = "random";
     cfg.speech_mode = "speak-n-spell";
     cfg.autonomy_mode = "off";
+    try inheritPsycheModelsFromConversation(allocator, &cfg);
+    try cfg.ensureRostersFromModelSpecs(allocator);
     return cfg;
+}
+
+fn inheritPsycheModelsFromConversation(allocator: std.mem.Allocator, cfg: *config_mod.Config) !void {
+    if (std.mem.trim(u8, cfg.psyche_models, " \r\n\t").len > 0) return;
+    const conversation_models = std.mem.trim(u8, cfg.conversation_models, " \r\n\t");
+    if (conversation_models.len == 0) return;
+    cfg.psyche_models = try allocator.dupe(u8, conversation_models);
 }
 
 pub fn restoreHostControlledPaths(
@@ -42,16 +51,50 @@ pub fn restoreHostControlledPaths(
     cfg.brain_root = try requiredString(allocator, raw.brain_root);
     cfg.memory_path = try requiredString(allocator, raw.memory_path);
     cfg.graph_path = try requiredString(allocator, raw.graph_path);
-    cfg.events_path = try requiredString(allocator, raw.events_path);
     cfg.maintenance_schedule_path = try requiredString(allocator, raw.schedule_path);
     cfg.maintenance_state_path = try requiredString(allocator, raw.maintenance_state_path);
     cfg.runtime_options_path = try std.fs.path.join(allocator, &.{ cfg.brain_root, "runtime_options.json" });
+    cfg.llm_providers_path = try std.fs.path.join(allocator, &.{ cfg.brain_root, "llm_providers.json" });
     cfg.face_embeddings_dir = try stringOrDefault(allocator, raw.face_embeddings_dir, "");
     cfg.image_generation_output_dir = try stringOrDefault(allocator, raw.image_generation_output_dir, "");
     if (cfg.image_generation_output_dir.len == 0) {
         cfg.image_generation_output_dir = try std.fs.path.join(allocator, &.{ cfg.brain_root, "generated", "images" });
     }
     return cfg;
+}
+
+fn replacePathPrefix(allocator: std.mem.Allocator, path: []const u8, old_prefix: []const u8, new_prefix: []const u8) ![]const u8 {
+    if (path.len == 0) return allocator.dupe(u8, "");
+    if (old_prefix.len > 0 and std.mem.startsWith(u8, path, old_prefix)) {
+        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ new_prefix, path[old_prefix.len..] });
+    }
+    return allocator.dupe(u8, path);
+}
+
+pub fn rebindConfigBrainRoot(
+    allocator: std.mem.Allocator,
+    cfg: config_mod.Config,
+    new_brain_id: []const u8,
+    new_brain_root: []const u8,
+) !config_mod.Config {
+    const old_root = cfg.brain_root;
+    var next = cfg;
+    next.brain_id = try allocator.dupe(u8, new_brain_id);
+    next.brain_root = try allocator.dupe(u8, new_brain_root);
+    next.memory_path = try replacePathPrefix(allocator, cfg.memory_path, old_root, new_brain_root);
+    next.graph_path = try replacePathPrefix(allocator, cfg.graph_path, old_root, new_brain_root);
+    next.seed_path = try replacePathPrefix(allocator, cfg.seed_path, old_root, new_brain_root);
+    next.maintenance_schedule_path = try replacePathPrefix(allocator, cfg.maintenance_schedule_path, old_root, new_brain_root);
+    next.maintenance_state_path = try replacePathPrefix(allocator, cfg.maintenance_state_path, old_root, new_brain_root);
+    next.runtime_options_path = try replacePathPrefix(allocator, cfg.runtime_options_path, old_root, new_brain_root);
+    next.llm_providers_path = try replacePathPrefix(allocator, cfg.llm_providers_path, old_root, new_brain_root);
+    next.captures_dir = try replacePathPrefix(allocator, cfg.captures_dir, old_root, new_brain_root);
+    next.capture_scratch_dir = try replacePathPrefix(allocator, cfg.capture_scratch_dir, old_root, new_brain_root);
+    next.audio_input_dir = try replacePathPrefix(allocator, cfg.audio_input_dir, old_root, new_brain_root);
+    next.audio_output_dir = try replacePathPrefix(allocator, cfg.audio_output_dir, old_root, new_brain_root);
+    next.face_embeddings_dir = try replacePathPrefix(allocator, cfg.face_embeddings_dir, old_root, new_brain_root);
+    next.image_generation_output_dir = try replacePathPrefix(allocator, cfg.image_generation_output_dir, old_root, new_brain_root);
+    return next;
 }
 
 pub fn configureHostProviderRouting(allocator: std.mem.Allocator, env: *std.process.Environ.Map, raw: AffectiveCoreEmbeddedConfig) !void {
@@ -98,7 +141,6 @@ pub fn ensureParentDirs(io: std.Io, cfg: config_mod.Config) !void {
     inline for (.{
         cfg.memory_path,
         cfg.graph_path,
-        cfg.events_path,
         cfg.maintenance_schedule_path,
         cfg.maintenance_state_path,
     }) |path| {
@@ -143,6 +185,24 @@ pub fn stringSlice(string: AffectiveCoreEmbeddedString) ?[]const u8 {
     if (string.len == 0) return "";
     const ptr = string.ptr orelse return null;
     return ptr[0..string.len];
+}
+
+test "embedded makeConfig inherits psyche_models from conversation_models" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var raw = AffectiveCoreEmbeddedConfig{};
+    raw.brain_root = .{ .ptr = "data/test/embedded_psyche_models".ptr, .len = "data/test/embedded_psyche_models".len };
+    raw.memory_path = .{ .ptr = "data/test/embedded_psyche_models/memory/people.sqlite".ptr, .len = "data/test/embedded_psyche_models/memory/people.sqlite".len };
+    raw.graph_path = .{ .ptr = "data/test/embedded_psyche_models/memory/relationships.sqlite".ptr, .len = "data/test/embedded_psyche_models/memory/relationships.sqlite".len };
+    raw.schedule_path = .{ .ptr = "data/test/embedded_psyche_models/maintenance.md".ptr, .len = "data/test/embedded_psyche_models/maintenance.md".len };
+    raw.maintenance_state_path = .{ .ptr = "data/test/embedded_psyche_models/maintenance_state.json".ptr, .len = "data/test/embedded_psyche_models/maintenance_state.json".len };
+    raw.conversation_models = .{ .ptr = "openai:gpt-4.1-nano".ptr, .len = "openai:gpt-4.1-nano".len };
+
+    const cfg = try makeConfig(allocator, raw);
+
+    try std.testing.expectEqualStrings("openai:gpt-4.1-nano", cfg.conversation_models);
+    try std.testing.expectEqualStrings("openai:gpt-4.1-nano", cfg.psyche_models);
 }
 
 test "embedded provider routing is configured from host manifest without credentials" {

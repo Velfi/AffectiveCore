@@ -3,11 +3,16 @@ const files = @import("../platform/common/files.zig");
 const service_errors = @import("../api/service_errors.zig");
 const chat = @import("../api/chat_client.zig");
 const http_transport = @import("../api/http_transport.zig");
+const http_log = @import("../api/http_log.zig");
+const llm_routing = @import("../core/llm_routing.zig");
+const random_provider_client = @import("../api/random_provider_client.zig");
+const brain_context_stats = @import("../core/brain_context_stats.zig");
 
 pub const Provider = enum {
     openai,
     anthropic,
     google,
+    deepseek,
 };
 
 pub const ResponseFormat = enum {
@@ -28,6 +33,7 @@ pub const TextRequest = struct {
     temperature: f32 = 0.2,
     response_format: ResponseFormat = .json_object,
     response_size: ResponseSize = .medium,
+    effort_tier: ?llm_routing.EffortTier = null,
     reasoning_effort: ?chat.ReasoningEffort = null,
     json_schema: []const u8 = default_json_schema,
     response_validator: ?*const fn (std.mem.Allocator, []const u8) anyerror!void = null,
@@ -41,6 +47,7 @@ pub const VisionRequest = struct {
     temperature: f32 = 0.2,
     response_format: ResponseFormat = .text,
     response_size: ResponseSize = .medium,
+    effort_tier: ?llm_routing.EffortTier = null,
     json_schema: []const u8 = default_json_schema,
 };
 
@@ -63,11 +70,14 @@ pub const DirectRandomProviderClient = struct {
     io: std.Io,
     http: http_transport.Client,
     models_spec: []const u8,
+    llm_quality: llm_routing.LlmQuality,
     openai_api_key: ?[]const u8,
     anthropic_api_key: ?[]const u8,
     google_api_key: ?[]const u8,
+    deepseek_api_key: ?[]const u8,
     host_provider_routing: bool,
     rng: std.Random.DefaultPrng,
+    stats_recorder: ?random_provider_client.LlmStatsRecorder = null,
 
     pub fn init(io: std.Io, http: http_transport.Client, env: *const std.process.Environ.Map, models_spec: []const u8) DirectRandomProviderClient {
         _ = env;
@@ -75,88 +85,240 @@ pub const DirectRandomProviderClient = struct {
     }
 
     pub fn initHostManaged(io: std.Io, http: http_transport.Client, models_spec: []const u8) DirectRandomProviderClient {
+        return initHostManagedWithQuality(io, http, models_spec, .auto);
+    }
+
+    pub fn initHostManagedWithQuality(io: std.Io, http: http_transport.Client, models_spec: []const u8, quality: llm_routing.LlmQuality) DirectRandomProviderClient {
         return .{
             .io = io,
             .http = http,
             .models_spec = models_spec,
+            .llm_quality = quality,
             .openai_api_key = null,
             .anthropic_api_key = null,
             .google_api_key = null,
+            .deepseek_api_key = null,
             .host_provider_routing = true,
             .rng = std.Random.DefaultPrng.init(randomSeed(io)),
         };
     }
 
     pub fn initDirectFromEnv(io: std.Io, http: http_transport.Client, env: *const std.process.Environ.Map, models_spec: []const u8) DirectRandomProviderClient {
+        return initDirectFromEnvWithQuality(io, http, env, models_spec, .auto);
+    }
+
+    pub fn initDirectFromEnvWithQuality(io: std.Io, http: http_transport.Client, env: *const std.process.Environ.Map, models_spec: []const u8, quality: llm_routing.LlmQuality) DirectRandomProviderClient {
         return .{
             .io = io,
             .http = http,
             .models_spec = models_spec,
+            .llm_quality = quality,
             .openai_api_key = env.get("OPENAI_API_KEY"),
             .anthropic_api_key = env.get("ANTHROPIC_API_KEY"),
             .google_api_key = env.get("GEMINI_API_KEY") orelse env.get("GOOGLE_API_KEY") orelse env.get("GOOGLE_AI_API_KEY"),
+            .deepseek_api_key = env.get("DEEPSEEK_API_KEY"),
             .host_provider_routing = env.get("AFFECTIVE_HOST_PROVIDER_ROUTING") != null,
             .rng = std.Random.DefaultPrng.init(randomSeed(io)),
         };
     }
 
+    fn resolvedModelsSpec(self: *DirectRandomProviderClient, allocator: std.mem.Allocator, subsystem: []const u8, effort_tier: ?llm_routing.EffortTier) ![]const u8 {
+        const roster = try llm_routing.parseRosterFromModelsSpec(allocator, self.models_spec);
+        defer roster.deinit(allocator);
+        const tier = effort_tier orelse llm_routing.defaultEffortTierForSubsystem(subsystem);
+        return llm_routing.resolveModelsSpec(allocator, roster, self.llm_quality, tier);
+    }
+
     pub fn completeText(self: *DirectRandomProviderClient, allocator: std.mem.Allocator, request: TextRequest) ![]const u8 {
+        // Each route attempt and validation failure records separately (see brain_context_stats).
+        const models_spec = try self.resolvedModelsSpec(allocator, request.subsystem, request.effort_tier);
+        defer allocator.free(models_spec);
+        const tier = request.effort_tier orelse llm_routing.defaultEffortTierForSubsystem(request.subsystem);
+        const primary = try primaryResolvedModel(allocator, models_spec);
+        defer allocator.free(primary.model);
+        var routed = request;
+        routed.reasoning_effort = llm_routing.clampReasoningEffort(self.llm_quality, request.reasoning_effort);
+        const request_bytes = request.system_prompt.len + request.user_prompt.len;
+        const reasoning_effort = routed.reasoning_effort;
         if (self.usesHostManagedRouting()) {
-            const content = try callHostLLMComplete(allocator, self.http, self.models_spec, request);
+            const content = callHostLLMComplete(allocator, self.http, models_spec, routed) catch |err| {
+                self.recordLlmCompletion(.{
+                    .subsystem = request.subsystem,
+                    .provider = primary.provider,
+                    .model = primary.model,
+                    .effort_tier = @tagName(tier),
+                    .reasoning_effort = if (reasoning_effort) |effort| @tagName(effort) else null,
+                    .request_bytes = request_bytes,
+                    .response_bytes = 0,
+                    .outcome = .provider_error,
+                });
+                return err;
+            };
             if (request.response_validator) |validate| {
                 validate(allocator, content) catch |err| {
                     if (request.bad_response_logger) |logBadResponse| logBadResponse(request.subsystem, "host", "host_llm_complete", err, content);
+                    self.recordLlmCompletion(.{
+                        .subsystem = request.subsystem,
+                        .provider = primary.provider,
+                        .model = primary.model,
+                        .effort_tier = @tagName(tier),
+                        .reasoning_effort = if (reasoning_effort) |effort| @tagName(effort) else null,
+                        .request_bytes = request_bytes,
+                        .response_bytes = content.len,
+                        .outcome = .validation_error,
+                    });
                     allocator.free(content);
                     return err;
                 };
             }
+            self.recordLlmCompletion(.{
+                .subsystem = request.subsystem,
+                .provider = primary.provider,
+                .model = primary.model,
+                .effort_tier = @tagName(tier),
+                .reasoning_effort = if (reasoning_effort) |effort| @tagName(effort) else null,
+                .request_bytes = request_bytes,
+                .response_bytes = content.len,
+                .outcome = .success,
+            });
             return content;
         }
 
-        const available = try self.availableModels(allocator);
+        const available = try self.availableModels(allocator, models_spec);
         const start = self.rng.random().intRangeLessThan(usize, 0, available.len);
         var failures = std.ArrayList(RouteFailure).empty;
         for (0..available.len) |offset| {
             const selected = available[(start + offset) % available.len];
-            const content = self.completeTextWithModel(allocator, selected, request) catch |err| {
+            const content = self.completeTextWithModel(allocator, selected, routed) catch |err| {
                 try failures.append(allocator, .{ .provider = selected.provider, .model = selected.model, .err = err });
                 continue;
             };
             if (request.response_validator) |validate| {
                 validate(allocator, content) catch |err| {
                     if (request.bad_response_logger) |logBadResponse| logBadResponse(request.subsystem, providerName(selected.provider), selected.model, err, content);
+                    self.recordLlmCompletion(.{
+                        .subsystem = request.subsystem,
+                        .provider = providerName(selected.provider),
+                        .model = selected.model,
+                        .effort_tier = @tagName(tier),
+                        .reasoning_effort = if (reasoning_effort) |effort| @tagName(effort) else null,
+                        .request_bytes = request_bytes,
+                        .response_bytes = content.len,
+                        .outcome = .validation_error,
+                    });
                     allocator.free(content);
                     try failures.append(allocator, .{ .provider = selected.provider, .model = selected.model, .err = err });
                     continue;
                 };
             }
+            self.recordLlmCompletion(.{
+                .subsystem = request.subsystem,
+                .provider = providerName(selected.provider),
+                .model = selected.model,
+                .effort_tier = @tagName(tier),
+                .reasoning_effort = if (reasoning_effort) |effort| @tagName(effort) else null,
+                .request_bytes = request_bytes,
+                .response_bytes = content.len,
+                .outcome = .success,
+            });
             return content;
         }
         logRouteFailures(request.subsystem, failures.items);
-        if (failures.items.len > 0) return failures.items[failures.items.len - 1].err;
+        if (failures.items.len > 0) {
+            const last = failures.items[failures.items.len - 1];
+            self.recordLlmCompletion(.{
+                .subsystem = request.subsystem,
+                .provider = providerName(last.provider),
+                .model = last.model,
+                .effort_tier = @tagName(tier),
+                .reasoning_effort = if (reasoning_effort) |effort| @tagName(effort) else null,
+                .request_bytes = request_bytes,
+                .response_bytes = 0,
+                .outcome = .provider_error,
+            });
+            return last.err;
+        }
         return error.RemoteServiceFailed;
     }
 
     pub fn completeVision(self: *DirectRandomProviderClient, allocator: std.mem.Allocator, request: VisionRequest) ![]const u8 {
         if (request.image_paths.len == 0) return error.NoImagesProvided;
+        const models_spec = try self.resolvedModelsSpec(allocator, request.subsystem, request.effort_tier);
+        defer allocator.free(models_spec);
+        const tier = request.effort_tier orelse llm_routing.defaultEffortTierForSubsystem(request.subsystem);
+        const primary = try primaryResolvedModel(allocator, models_spec);
+        defer allocator.free(primary.model);
+        var request_bytes: usize = request.prompt.len;
+        for (request.image_paths) |path| request_bytes += path.len;
         if (self.usesHostManagedRouting()) {
-            return try callHostVisionComplete(allocator, self.http, self.models_spec, request);
+            const content = callHostVisionComplete(allocator, self.http, models_spec, request) catch |err| {
+                self.recordLlmCompletion(.{
+                    .subsystem = request.subsystem,
+                    .provider = primary.provider,
+                    .model = primary.model,
+                    .effort_tier = @tagName(tier),
+                    .reasoning_effort = null,
+                    .request_bytes = request_bytes,
+                    .response_bytes = 0,
+                    .outcome = .provider_error,
+                });
+                return err;
+            };
+            self.recordLlmCompletion(.{
+                .subsystem = request.subsystem,
+                .provider = primary.provider,
+                .model = primary.model,
+                .effort_tier = @tagName(tier),
+                .reasoning_effort = null,
+                .request_bytes = request_bytes,
+                .response_bytes = content.len,
+                .outcome = .success,
+            });
+            return content;
         }
-        const selected = try self.selectAvailable(allocator);
-        return switch (selected.provider) {
-            .openai => try callOpenAIVision(allocator, self.io, self.http, self.openai_api_key.?, selected.model, request),
-            .anthropic => try callAnthropicVision(allocator, self.io, self.http, self.anthropic_api_key.?, selected.model, request),
-            .google => try callGoogleVision(allocator, self.io, self.http, self.google_api_key.?, selected.model, request),
+        const selected = try self.selectAvailable(allocator, models_spec);
+        const content = switch (selected.provider) {
+            .openai => callOpenAIVision(allocator, self.io, self.http, self.openai_api_key.?, selected.model, request),
+            .anthropic => callAnthropicVision(allocator, self.io, self.http, self.anthropic_api_key.?, selected.model, request),
+            .google => callGoogleVision(allocator, self.io, self.http, self.google_api_key.?, selected.model, request),
+            .deepseek => callDeepSeekVision(allocator, self.io, self.http, self.deepseek_api_key.?, selected.model, request),
+        } catch |err| {
+            self.recordLlmCompletion(.{
+                .subsystem = request.subsystem,
+                .provider = providerName(selected.provider),
+                .model = selected.model,
+                .effort_tier = @tagName(tier),
+                .reasoning_effort = null,
+                .request_bytes = request_bytes,
+                .response_bytes = 0,
+                .outcome = .provider_error,
+            });
+            return err;
         };
+        self.recordLlmCompletion(.{
+            .subsystem = request.subsystem,
+            .provider = providerName(selected.provider),
+            .model = selected.model,
+            .effort_tier = @tagName(tier),
+            .reasoning_effort = null,
+            .request_bytes = request_bytes,
+            .response_bytes = content.len,
+            .outcome = .success,
+        });
+        return content;
     }
 
-    fn selectAvailable(self: *DirectRandomProviderClient, allocator: std.mem.Allocator) !ProviderModel {
-        const available = try self.availableModels(allocator);
+    fn recordLlmCompletion(self: *DirectRandomProviderClient, record: brain_context_stats.LlmCompletionRecord) void {
+        if (self.stats_recorder) |recorder| recorder.record(record);
+    }
+
+    fn selectAvailable(self: *DirectRandomProviderClient, allocator: std.mem.Allocator, models_spec: []const u8) !ProviderModel {
+        const available = try self.availableModels(allocator, models_spec);
         return available[self.rng.random().intRangeLessThan(usize, 0, available.len)];
     }
 
-    pub fn availableModels(self: *DirectRandomProviderClient, allocator: std.mem.Allocator) ![]ProviderModel {
-        const models = try parseProviderModels(allocator, self.models_spec);
+    pub fn availableModels(self: *DirectRandomProviderClient, allocator: std.mem.Allocator, models_spec: []const u8) ![]ProviderModel {
+        const models = try parseProviderModels(allocator, models_spec);
         if (self.host_provider_routing) return models;
         var available = std.ArrayList(ProviderModel).empty;
         for (models) |model| {
@@ -171,6 +333,7 @@ pub const DirectRandomProviderClient = struct {
             .openai => try callOpenAIText(allocator, self.http, self.openai_api_key.?, selected.model, request),
             .anthropic => try callAnthropicText(allocator, self.http, self.anthropic_api_key.?, selected.model, request),
             .google => try callGoogleText(allocator, self.http, self.google_api_key.?, selected.model, request),
+            .deepseek => try callDeepSeekText(allocator, self.http, self.deepseek_api_key.?, selected.model, request),
         };
     }
 
@@ -179,12 +342,13 @@ pub const DirectRandomProviderClient = struct {
             .openai => self.openai_api_key,
             .anthropic => self.anthropic_api_key,
             .google => self.google_api_key,
+            .deepseek => self.deepseek_api_key,
         };
     }
 
     fn usesHostManagedRouting(self: *DirectRandomProviderClient) bool {
         if (self.host_provider_routing) return true;
-        for ([_]?[]const u8{ self.openai_api_key, self.anthropic_api_key, self.google_api_key }) |maybe_key| {
+        for ([_]?[]const u8{ self.openai_api_key, self.anthropic_api_key, self.google_api_key, self.deepseek_api_key }) |maybe_key| {
             if (maybe_key) |key| {
                 if (std.mem.startsWith(u8, key, "host-managed:")) return true;
             }
@@ -219,6 +383,7 @@ pub const DirectRandomProviderClient = struct {
             .openai => try callOpenAIText(allocator, self.http, self.openai_api_key orelse return error.MissingOpenAIAPIKey, model.model, request),
             .anthropic => try callAnthropicText(allocator, self.http, self.anthropic_api_key orelse return error.MissingAnthropicAPIKey, model.model, request),
             .google => try callGoogleText(allocator, self.http, self.google_api_key orelse return error.MissingGoogleAPIKey, model.model, request),
+            .deepseek => try callDeepSeekText(allocator, self.http, self.deepseek_api_key orelse return error.MissingDeepSeekAPIKey, model.model, request),
         };
     }
 };
@@ -249,6 +414,7 @@ fn parseProvider(text: []const u8) ?Provider {
     if (std.ascii.eqlIgnoreCase(text, "openai")) return .openai;
     if (std.ascii.eqlIgnoreCase(text, "anthropic")) return .anthropic;
     if (std.ascii.eqlIgnoreCase(text, "google") or std.ascii.eqlIgnoreCase(text, "gemini")) return .google;
+    if (std.ascii.eqlIgnoreCase(text, "deepseek")) return .deepseek;
     return null;
 }
 
@@ -257,6 +423,17 @@ fn providerName(provider: Provider) []const u8 {
         .openai => "openai",
         .anthropic => "anthropic",
         .google => "google",
+        .deepseek => "deepseek",
+    };
+}
+
+fn primaryResolvedModel(allocator: std.mem.Allocator, models_spec: []const u8) !struct { provider: []const u8, model: []const u8 } {
+    const models = try parseProviderModels(allocator, models_spec);
+    defer allocator.free(models);
+    if (models.len == 0) return error.NoRandomProviderModels;
+    return .{
+        .provider = providerName(models[0].provider),
+        .model = try allocator.dupe(u8, models[0].model),
     };
 }
 
@@ -275,10 +452,19 @@ pub fn routeName(allocator: std.mem.Allocator, provider: Provider, model: []cons
         .openai => "https://api.openai.com/v1/chat/completions",
         .anthropic => "https://api.anthropic.com/v1/messages",
         .google => try std.fmt.allocPrint(allocator, "https://generativelanguage.googleapis.com/v1beta/models/{s}:generateContent", .{model}),
+        .deepseek => "https://api.deepseek.com/v1/chat/completions",
     };
 }
 
 fn callOpenAIText(allocator: std.mem.Allocator, http: http_transport.Client, api_key: []const u8, model: []const u8, request: TextRequest) ![]const u8 {
+    return callOpenAICompatText(allocator, http, "https://api.openai.com/v1/chat/completions", "openai", api_key, model, request);
+}
+
+fn callDeepSeekText(allocator: std.mem.Allocator, http: http_transport.Client, api_key: []const u8, model: []const u8, request: TextRequest) ![]const u8 {
+    return callOpenAICompatText(allocator, http, "https://api.deepseek.com/v1/chat/completions", "deepseek", api_key, model, request);
+}
+
+fn callOpenAICompatText(allocator: std.mem.Allocator, http: http_transport.Client, url: []const u8, provider: []const u8, api_key: []const u8, model: []const u8, request: TextRequest) ![]const u8 {
     const maybe_effort = if (request.reasoning_effort != null and supportsReasoningEffort(model))
         try std.fmt.allocPrint(allocator, ",\"reasoning_effort\":{s}", .{try jsonString(allocator, @tagName(request.reasoning_effort.?))})
     else
@@ -293,7 +479,7 @@ fn callOpenAIText(allocator: std.mem.Allocator, http: http_transport.Client, api
         .{ try jsonString(allocator, model), maybe_effort, request.temperature, maybe_format, try jsonString(allocator, request.system_prompt), try jsonString(allocator, request.user_prompt) },
     );
     const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
-    return callChatCompletionsWithRetry(allocator, http, request.subsystem, "openai", model, auth, body);
+    return callChatCompletionsWithRetry(allocator, http, request.subsystem, provider, model, url, auth, body);
 }
 
 fn callAnthropicText(allocator: std.mem.Allocator, http: http_transport.Client, api_key: []const u8, model: []const u8, request: TextRequest) ![]const u8 {
@@ -389,6 +575,14 @@ fn providerModelsJson(allocator: std.mem.Allocator, models_spec: []const u8) ![]
 }
 
 fn callOpenAIVision(allocator: std.mem.Allocator, io: std.Io, http: http_transport.Client, api_key: []const u8, model: []const u8, request: VisionRequest) ![]const u8 {
+    return callOpenAICompatVision(allocator, io, http, "https://api.openai.com/v1/chat/completions", "openai", api_key, model, request);
+}
+
+fn callDeepSeekVision(allocator: std.mem.Allocator, io: std.Io, http: http_transport.Client, api_key: []const u8, model: []const u8, request: VisionRequest) ![]const u8 {
+    return callOpenAICompatVision(allocator, io, http, "https://api.deepseek.com/v1/chat/completions", "deepseek", api_key, model, request);
+}
+
+fn callOpenAICompatVision(allocator: std.mem.Allocator, io: std.Io, http: http_transport.Client, url: []const u8, provider: []const u8, api_key: []const u8, model: []const u8, request: VisionRequest) ![]const u8 {
     var content = std.ArrayList(u8).empty;
     try content.appendSlice(allocator, "[{\"type\":\"text\",\"text\":");
     try content.appendSlice(allocator, try jsonString(allocator, request.prompt));
@@ -410,7 +604,7 @@ fn callOpenAIVision(allocator: std.mem.Allocator, io: std.Io, http: http_transpo
         .{ try jsonString(allocator, model), request.temperature, maybe_format, content.items },
     );
     const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
-    return callChatCompletionsWithRetry(allocator, http, request.subsystem, "openai", model, auth, body);
+    return callChatCompletionsWithRetry(allocator, http, request.subsystem, provider, model, url, auth, body);
 }
 
 fn callAnthropicVision(allocator: std.mem.Allocator, io: std.Io, http: http_transport.Client, api_key: []const u8, model: []const u8, request: VisionRequest) ![]const u8 {
@@ -455,11 +649,11 @@ fn callGoogleVision(allocator: std.mem.Allocator, io: std.Io, http: http_transpo
     return callGoogleGenerateContentWithRetry(allocator, http, request.subsystem, model, api_key, body);
 }
 
-fn callChatCompletionsWithRetry(allocator: std.mem.Allocator, http: http_transport.Client, subsystem: []const u8, provider: []const u8, model: []const u8, auth: []const u8, body: []const u8) ![]const u8 {
+fn callChatCompletionsWithRetry(allocator: std.mem.Allocator, http: http_transport.Client, subsystem: []const u8, provider: []const u8, model: []const u8, url: []const u8, auth: []const u8, body: []const u8) ![]const u8 {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         const transport_allocator = std.heap.page_allocator;
-        const out = try postJson(transport_allocator, http, "https://api.openai.com/v1/chat/completions", &.{
+        const out = try postJson(transport_allocator, http, url, &.{
             .{ .name = "Authorization", .value = authHeaderValue(auth) },
         }, body);
         defer transport_allocator.free(out);
@@ -510,18 +704,23 @@ fn callGoogleGenerateContentWithRetry(allocator: std.mem.Allocator, http: http_t
 }
 
 fn postJson(allocator: std.mem.Allocator, http: http_transport.Client, url: []const u8, extra_headers: []const http_transport.Header, body: []const u8) ![]u8 {
-    std.debug.print("HTTP start method=POST url={s} payload_bytes={d} response_limit={d}\n", .{ redactedUrl(url), body.len, max_response_bytes });
-    const bytes = try http.postJson(allocator, .{
+    const logged_url = redactedUrl(url);
+    http_log.logStart(logged_url, body.len, max_response_bytes);
+    const bytes = http.postJson(allocator, .{
         .url = url,
         .headers = extra_headers,
         .body = body,
         .max_response_bytes = max_response_bytes,
-    });
+    }) catch |err| {
+        http_log.logError(logged_url, err);
+        return err;
+    };
     errdefer allocator.free(bytes);
     if (bytes.len > max_response_bytes) {
-        std.debug.print("HTTP response_too_large url={s} response_bytes={d} response_limit={d}\n", .{ redactedUrl(url), bytes.len, max_response_bytes });
+        http_log.logResponseTooLarge(logged_url, bytes.len, max_response_bytes);
         return error.StreamTooLong;
     }
+    http_log.logDone(logged_url, bytes.len);
     return bytes;
 }
 

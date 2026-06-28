@@ -27,7 +27,7 @@ const camera_mod = ports.camera;
 const speaker_mod = ports.speaker;
 const input_mod = ports.input;
 const button_mod = ports.button;
-const command_log_mod = ports.command_log;
+const event_log_mod = ports.event_log;
 const facial_expression = ports.facial_expression;
 const system_senses_mod = ports.system_senses;
 const time_mod = @import("time.zig");
@@ -39,10 +39,14 @@ const seed_mod = @import("seed.zig");
 const vector_index = @import("vector_index.zig");
 const emotion = @import("emotion.zig");
 const helpers = @import("brain_helpers.zig");
+const recognition_composite = @import("recognition_composite.zig");
+const belief_updates = @import("belief_updates.zig");
+const experience_kinds = @import("experience_kinds.zig");
+const brain_process = @import("brain_process.zig");
 
 const Brain = brain_mod.Brain;
 const BrainDeps = brain_mod.BrainDeps;
-const CommandBatchResult = brain_mod.CommandBatchResult;
+const ActionPressureBatchResult = brain_mod.ActionPressureBatchResult;
 const ConversationTurnResult = brain_mod.ConversationTurnResult;
 const ConversationSpeakerContext = brain_mod.Brain.ConversationSpeakerContext;
 const QuietHours = brain_mod.Brain.QuietHours;
@@ -54,20 +58,33 @@ const speech_artifact_ttl_seconds = brain_mod.speech_artifact_ttl_seconds;
 const speech_artifact_prefix = brain_mod.speech_artifact_prefix;
 const speech_audio_suffix = brain_mod.speech_audio_suffix;
 const speech_transcription_json_suffix = brain_mod.speech_transcription_json_suffix;
+pub fn recognitionAlreadyInObservations(self: *Brain, observations: []const u8) bool {
+    if (std.mem.indexOf(u8, observations, "Current speaker recognition:") == null) return false;
+    if (self.last_visual_observation_path) |path| {
+        return std.mem.indexOf(u8, observations, path) != null;
+    }
+    return true;
+}
+
+pub fn recognitionRecentObservationNote(self: *Brain, observations: []const u8) ![]const u8 {
+    _ = observations;
+    const path = self.last_visual_observation_path orelse "unknown";
+    return try std.fmt.allocPrint(
+        self.allocator,
+        "recognition_dedup:\n- frame_path: {s}\n- identify_skipped: true\n- note: identification for this frame is recorded above as Current speaker recognition.\n",
+        .{path},
+    );
+}
+
 pub fn recognizeForObservation(self: *Brain) ![]const u8 {
-    // If a frontend camera pull is already in flight this turn, don't request
-    // another capture; report that the observation is pending so the turn can
-    // proceed instead of stacking duplicate pulls.
-    if (self.pending_camera_intent == .recognize) {
-        return try self.allocator.dupe(u8, "recognition_pending: a camera observation was already requested and arrives shortly as an awaited sense.\n");
+    if (self.awaitedHostRequestMatches("camera", "recognize")) {
+        return try self.allocator.dupe(u8, "host_sense_pull_pending: camera recognize already requested; waiting for host delivery.\n");
     }
     try self.logState(.Capture);
-    // Mark that the next frontend camera frame is wanted for recognition so the
-    // awaited pull observation can finish the identify+greet rather than failing
-    // the skill. On a host that captures inline this is cleared immediately.
-    self.pending_camera_intent = .recognize;
-    const capture = try self.deps.camera.capture(self.allocator);
-    self.pending_camera_intent = .none;
+    const capture = self.deps.camera.capture(self.allocator) catch |err| switch (err) {
+        error.FrontendCaptureRequested => return @import("awaited_host_request.zig").pullRequestedObservation(self, "camera", "recognize"),
+        else => return err,
+    };
     self.rememberVisualUpdate(capture.path);
     self.last_visual_observation_uploaded = false;
     self.outputImageCapture(capture);
@@ -80,8 +97,10 @@ pub fn recognizeForObservation(self: *Brain) ![]const u8 {
 /// recognize" behaves like one operation regardless of how the frame arrived.
 pub fn recognizeFromCapturedPath(self: *Brain, path: []const u8) ![]const u8 {
     try self.logState(.Identify);
-    const result = try self.deps.recognizer.identify(self.allocator, path);
-    self.outputRecognitionResult(result);
+    self.rememberVisualUpdate(path);
+    const composite = try recognition_composite.recognizeSubject(self, path, &.{});
+    const result = composite.result;
+    try belief_updates.onIdentityHypothesis(self, composite.hypothesis, result.candidate_name orelse "");
 
     var name: ?[]const u8 = result.candidate_name;
     if (result.match_status == .known) {
@@ -94,12 +113,134 @@ pub fn recognizeFromCapturedPath(self: *Brain, path: []const u8) ![]const u8 {
         try self.deps.store.savePerson(person);
         try addSighting(self, id, now, result.confidence, path, null, null);
         name = person.display_name;
-        try self.logSimple(.TransientConversation, path, id, null, "recognize_command_known,sighting_created,last_seen_updated");
+        try self.logSimple(.TransientConversation, path, id, null, "recognize_action_known,sighting_created,last_seen_updated");
     } else {
-        try self.logSimple(.TransientConversation, path, result.person_id, null, "recognize_command_observed");
+        try self.logSimple(.TransientConversation, path, result.person_id, null, "recognize_action_observed");
     }
 
     return try self.conversationSpeakerLine(path, result, name, @tagName(result.match_status));
+}
+
+pub fn recordIdentityHypothesis(self: *Brain, image_path: []const u8, result: identity.IdentityResult, override_decision: ?schema.IdentityDecision, parents: []const []const u8, hypothesis_confidence: ?f32) !schema.IdentityHypothesis {
+    const decision = override_decision orelse decisionFromIdentityResult(result);
+    const candidate_id = result.person_id orelse "";
+    const candidate_name = result.candidate_name orelse "";
+    const stored_confidence = clamp01(hypothesis_confidence orelse result.confidence);
+    const payload = try std.fmt.allocPrint(
+        self.allocator,
+        "image={s}; decision={s}; person_present={any}; match_status={s}; person_id={s}; name={s}; confidence={d:.2}; people_count={d}",
+        .{ image_path, @tagName(decision), result.person_present, @tagName(result.match_status), candidate_id, candidate_name, result.confidence, result.people_count },
+    );
+    const existing_events = self.deps.store.loadExperienceEvents(self.allocator) catch &.{};
+    const event: schema.ExperienceEvent = .{
+        .id = try std.fmt.allocPrint(self.allocator, "evt_{d}_{d}_Recognition.IdentityHypothesis_{d}_{s}", .{ self.now_seconds * 1000, existing_events.len, payload.len, @tagName(decision) }),
+        .brain_id = "default",
+        .host_id = self.currentHostId(),
+        .timestamp_ms = self.now_seconds * 1000,
+        .source = .subsystem,
+        .kind = experience_kinds.recognition_identity_hypothesis,
+        .payload = payload,
+        .salience = 0.70,
+        .confidence = stored_confidence,
+        .uncertainty = 1.0 - stored_confidence,
+        .causal_parent_ids = try self.allocator.dupe([]const u8, parents),
+        .retention = .episode,
+        .visibility = .internal,
+    };
+    try self.recordExperienceEvent(event);
+    const evidence_ids = try identityEvidenceIds(self.allocator, event.id, parents);
+    const contradictions = if (result.match_status == .uncertain or result.match_status == .multiple)
+        try self.allocator.dupe([]const u8, &[_][]const u8{"recognizer reported ambiguous visual evidence"})
+    else
+        try self.allocator.alloc([]const u8, 0);
+    const candidates_json = try std.fmt.allocPrint(
+        self.allocator,
+        "[{{\"person_id\":\"{s}\",\"name\":\"{s}\",\"confidence\":{d:.3},\"source\":\"visual_recognizer\"}}]",
+        .{ candidate_id, candidate_name, result.confidence },
+    );
+    const hypothesis: schema.IdentityHypothesis = .{
+        .hypothesis_id = try std.fmt.allocPrint(self.allocator, "identity_hyp_{d}_{s}_{d}", .{ self.now_seconds * 1000, @tagName(decision), image_path.len }),
+        .decision = decision,
+        .candidates_json = candidates_json,
+        .evidence_event_ids = evidence_ids,
+        .confidence = stored_confidence,
+        .contradictions = contradictions,
+        .provenance = if (parents.len > 0) "recognition_composite_with_causal_context" else "recognition_composite",
+        .created_at_ms = self.now_seconds * 1000,
+    };
+    try self.deps.store.addIdentityHypothesis(hypothesis);
+    return hypothesis;
+}
+
+fn identityEvidenceIds(allocator: std.mem.Allocator, hypothesis_event_id: []const u8, parent_event_ids: []const []const u8) ![][]const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    try out.append(allocator, hypothesis_event_id);
+    for (parent_event_ids) |event_id| {
+        if (!stringSliceContains(out.items, event_id)) try out.append(allocator, try allocator.dupe(u8, event_id));
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn stringSliceContains(values: []const []const u8, expected: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, expected)) return true;
+    }
+    return false;
+}
+
+fn findLatestMistakenHypothesisEventId(self: *Brain) !?[]const u8 {
+    const hypotheses = try self.deps.store.loadIdentityHypotheses(self.allocator);
+    var best_ms: i64 = -1;
+    var best_event_id: ?[]const u8 = null;
+    for (hypotheses) |hypothesis| {
+        if (hypothesis.decision == .corrected) continue;
+        if (hypothesis.evidence_event_ids.len == 0) continue;
+        if (hypothesis.created_at_ms > best_ms) {
+            best_ms = hypothesis.created_at_ms;
+            best_event_id = hypothesis.evidence_event_ids[0];
+        }
+    }
+    return best_event_id;
+}
+
+pub fn recordIdentityCorrectionLearning(self: *Brain, image_path: []const u8, person_id: []const u8, name: []const u8, confidence: f32) !void {
+    const mistaken_hypothesis_event_id = try findLatestMistakenHypothesisEventId(self);
+    const result: identity.IdentityResult = .{
+        .person_present = true,
+        .match_status = .known,
+        .person_id = person_id,
+        .confidence = confidence,
+        .candidate_name = name,
+        .people_count = 1,
+    };
+    const mistaken_event_id = mistaken_hypothesis_event_id orelse "";
+    if (mistaken_hypothesis_event_id) |event_id| {
+        _ = try self.recordIdentityHypothesis(image_path, result, .corrected, &[_][]const u8{event_id}, null);
+    } else {
+        _ = try self.recordIdentityHypothesis(image_path, result, .corrected, &.{}, null);
+    }
+    try self.publishRuntimeLearningCorrectionRecorded(.{
+        .image_path = image_path,
+        .person_id = person_id,
+        .name = name,
+        .confidence = confidence,
+        .hypothesis_event_id = mistaken_event_id,
+    }, "brain_person_memory.record_identity_correction");
+    try belief_updates.onIdentityCorrection(self, person_id, name, mistaken_event_id);
+}
+
+fn decisionFromIdentityResult(result: identity.IdentityResult) schema.IdentityDecision {
+    return switch (result.match_status) {
+        .none => .unknown,
+        .unknown => .unknown,
+        .known => if (result.confidence >= 0.85) .recognized else .soft_matched,
+        .uncertain => .suspected,
+        .multiple => .conflict,
+    };
+}
+
+fn clamp01(value: f32) f32 {
+    return @min(1.0, @max(0.0, value));
 }
 
 pub fn describeImageForObservation(self: *Brain, prompt: []const u8) ![]const u8 {
@@ -131,7 +272,7 @@ pub fn describeImageForObservation(self: *Brain, prompt: []const u8) ![]const u8
     return std.fmt.allocPrint(self.allocator, "image_description:\n- image: {s}\n- description: {s}\n", .{ image_path, description });
 }
 
-pub fn rememberPersonForObservation(self: *Brain, command: chat_mod.ChatCommand) ![]const u8 {
+pub fn rememberPersonForObservation(self: *Brain, command: chat_mod.ActionProposal) ![]const u8 {
     try self.logState(.RegisterPerson);
     const image_path = command.image_path orelse self.last_visual_observation_path orelse return error.NoImageToRegisterPerson;
     const name_or_id = command.person_id orelse command.name orelse command.query orelse command.text orelse return error.MissingFacePicturePerson;
@@ -171,7 +312,22 @@ pub fn rememberPersonForObservation(self: *Brain, command: chat_mod.ChatCommand)
     return std.fmt.allocPrint(self.allocator, "person_remembered:\n- person_id: {s}\n- name: {s}\n- mode: created\n", .{ person.person_id, person.display_name });
 }
 
-pub fn updateFacePictureForObservation(self: *Brain, command: chat_mod.ChatCommand) ![]const u8 {
+pub fn forgetPersonForObservation(self: *Brain, command: chat_mod.ActionProposal) ![]const u8 {
+    try self.logState(.ForgetPerson);
+    const target = command.person_id orelse command.name orelse command.text orelse blk: {
+        if (self.conversation_speaker_context) |context| {
+            if (context.result.person_id) |id| break :blk id;
+            if (context.result.candidate_name) |name| break :blk name;
+        }
+        break :blk "";
+    };
+    if (target.len == 0) return error.MissingForgetPersonTarget;
+    const forgotten = try self.deps.store.forgetPerson(target);
+    try self.logSimple(.ForgetPerson, null, null, null, if (forgotten) "profile_forgotten" else "profile_not_found");
+    return std.fmt.allocPrint(self.allocator, "person_forgotten:\n- target: {s}\n- forgotten: {any}\n", .{ target, forgotten });
+}
+
+pub fn updateFacePictureForObservation(self: *Brain, command: chat_mod.ActionProposal) ![]const u8 {
     const image_path = command.image_path orelse self.last_visual_observation_path orelse return error.NoImageToRegisterPerson;
     const person_id = command.person_id;
     const name = command.name orelse command.query orelse command.text;
@@ -263,7 +419,7 @@ pub fn uploadedAudioObservation(self: *Brain, path: []const u8, mime_type: []con
         },
         .music, .ambient, .unknown => try std.fmt.allocPrint(
             self.allocator,
-            "uploaded_audio:\n- path: {s}\n- mime_type: {s}\n- audio_kind: {s}\n- action: ask_human\n- reason: no_configured_non_speech_audio_analysis\n",
+            "uploaded_audio:\n- path: {s}\n- mime_type: {s}\n- audio_kind: {s}\n- action: say\n- reason: no_configured_non_speech_audio_analysis\n",
             .{ path, mime_type, @tagName(inspection.kind) },
         ),
     };
@@ -444,22 +600,13 @@ pub fn updateRepresentativePhoto(self: *Brain, person_id: []const u8, sighting_i
 pub fn say(self: *Brain, text: []const u8) !void {
     self.traceText("speech.say.start", text);
     errdefer |err| self.traceError("speech.say.error", err);
-    self.trace("speech.send.disable.start");
-    try self.setSendEnabled(false);
-    self.trace("speech.send.disable.done");
-    errdefer self.setSendEnabled(true) catch |err| {
-        std.debug.panic("failed to re-enable webview send after speech error: {s}", .{@errorName(err)});
-    };
     self.trace("speech.synthesize.start");
     const audio = try self.deps.speech_service.synthesize(self.allocator, text);
     self.traceText("speech.synthesize.done", audio.path);
     self.trace("speech.play.start");
     try self.deps.speaker.playFile(self.allocator, audio.path);
     self.trace("speech.play.done");
-    self.trace("speech.send.enable.start");
-    try self.setSendEnabled(true);
-    self.trace("speech.send.enable.done");
     self.trace("speech.log.start");
-    try self.appendCommandLog("brain", "Brain", text);
+    try self.appendEventLog("brain", "Brain", text);
     self.trace("speech.log.done");
 }

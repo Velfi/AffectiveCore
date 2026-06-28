@@ -42,6 +42,7 @@ test "provider route names are exact API endpoints" {
     try std.testing.expectEqualStrings("https://api.openai.com/v1/chat/completions", try routeName(allocator, .openai, "gpt-4.1-nano"));
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", try routeName(allocator, .anthropic, "claude-haiku-4-5-20251001"));
     try std.testing.expectEqualStrings("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent", try routeName(allocator, .google, "gemini-3.1-flash-lite"));
+    try std.testing.expectEqualStrings("https://api.deepseek.com/v1/chat/completions", try routeName(allocator, .deepseek, "deepseek-chat"));
 }
 
 test "direct random provider skips models whose provider key is missing" {
@@ -53,14 +54,15 @@ test "direct random provider skips models whose provider key is missing" {
     var env = std.process.Environ.Map.init(allocator);
     try env.put("ANTHROPIC_API_KEY", "test-anthropic-key");
     var transport = CapturingHttpTransport{};
+    const models_spec = "openai:gpt-4.1-nano,anthropic:claude-haiku-4-5-20251001,google:gemini-3.1-flash-lite";
     var client = DirectRandomProviderClient.initDirectFromEnv(
         io_threaded.io(),
         transport.client(),
         &env,
-        "openai:gpt-4.1-nano,anthropic:claude-haiku-4-5-20251001,google:gemini-3.1-flash-lite",
+        models_spec,
     );
 
-    const available = try client.availableModels(allocator);
+    const available = try client.availableModels(allocator, models_spec);
 
     try std.testing.expectEqual(@as(usize, 1), available.len);
     try std.testing.expectEqual(Provider.anthropic, available[0].provider);
@@ -75,14 +77,15 @@ test "direct random provider reports when every configured provider key is missi
     defer io_threaded.deinit();
     var env = std.process.Environ.Map.init(allocator);
     var transport = CapturingHttpTransport{};
+    const models_spec = "openai:gpt-4.1-nano,anthropic:claude-haiku-4-5-20251001";
     var client = DirectRandomProviderClient.initDirectFromEnv(
         io_threaded.io(),
         transport.client(),
         &env,
-        "openai:gpt-4.1-nano,anthropic:claude-haiku-4-5-20251001",
+        models_spec,
     );
 
-    try std.testing.expectError(error.MissingRandomProviderApiKey, client.availableModels(allocator));
+    try std.testing.expectError(error.MissingRandomProviderApiKey, client.availableModels(allocator, models_spec));
 }
 
 const CapturingHttpTransport = struct {

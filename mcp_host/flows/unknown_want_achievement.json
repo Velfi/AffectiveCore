@@ -1,0 +1,7 @@
+{
+  "setup": true,
+  "steps": [
+    { "request_id": "want-achievement-error", "event": { "type": "user_text", "text": "done" } },
+    { "op": "drain" }
+  ]
+}

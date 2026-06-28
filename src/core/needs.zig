@@ -24,8 +24,8 @@ pub const Inputs = struct {
     memory_records: []const schema.MemoryRecord,
     relationship_graph: []const u8 = "",
     power: senses_mod.PowerSnapshot,
-    autonomy_energy_remaining: ?u32,
-    autonomy_daily_energy: u32,
+    autonomy_control_capacity: ?f32,
+    autonomy_max_capacity: f32,
     autonomy_sleeping: ?bool,
 };
 
@@ -33,7 +33,7 @@ pub fn evaluate(allocator: std.mem.Allocator, inputs: Inputs) ![]Need {
     var out = std.ArrayList(Need).empty;
     try out.append(allocator, try dailyInteractionNeed(allocator, inputs.now_seconds, inputs.conversation_summaries));
     try appendAttachmentNeeds(allocator, &out, inputs.now_seconds, inputs.conversation_summaries, inputs.relationship_graph);
-    try out.append(allocator, try powerContinuityNeed(allocator, inputs.power, inputs.autonomy_energy_remaining, inputs.autonomy_daily_energy, inputs.autonomy_sleeping));
+    try out.append(allocator, try powerContinuityNeed(allocator, inputs.power, inputs.autonomy_control_capacity, inputs.autonomy_max_capacity, inputs.autonomy_sleeping));
     try appendSelfDefinedNeeds(allocator, &out, inputs.memory_records);
     return out.toOwnedSlice(allocator);
 }
@@ -84,8 +84,8 @@ fn dailyInteractionNeed(allocator: std.mem.Allocator, now_seconds: i64, summarie
 fn powerContinuityNeed(
     allocator: std.mem.Allocator,
     power: senses_mod.PowerSnapshot,
-    autonomy_energy_remaining: ?u32,
-    autonomy_daily_energy: u32,
+    autonomy_control_capacity: ?f32,
+    autonomy_max_capacity: f32,
     autonomy_sleeping: ?bool,
 ) !Need {
     var lowest_battery: ?u8 = null;
@@ -104,7 +104,7 @@ fn powerContinuityNeed(
         }
     }
 
-    const energy = autonomy_energy_remaining orelse autonomy_daily_energy;
+    const control_capacity = autonomy_control_capacity orelse autonomy_max_capacity;
     const sleeping = autonomy_sleeping orelse false;
     const battery_urgency: NeedUrgency = if (lowest_battery) |battery|
         if (battery <= 10 and !external_online) .urgent else if (battery <= 25 and !external_online) .need else if (battery <= 40 and !external_online) .watch else .satisfied
@@ -112,9 +112,9 @@ fn powerContinuityNeed(
         .watch
     else
         .satisfied;
-    const autonomy_budget_urgency: NeedUrgency = if (energy == 0 or sleeping)
+    const autonomy_budget_urgency: NeedUrgency = if (control_capacity <= 0.0 or sleeping)
         .watch
-    else if (energy <= @max(@as(u32, 1), autonomy_daily_energy / 10))
+    else if (control_capacity <= 0.10)
         .watch
     else
         .satisfied;
@@ -135,14 +135,14 @@ fn powerContinuityNeed(
         .need_id = try allocator.dupe(u8, "power_continuity"),
         .text = try allocator.dupe(u8, "I need to maintain power levels and I do not like turning off."),
         .urgency = urgency,
-        .evidence = try std.fmt.allocPrint(allocator, "{s}; {s}; autonomy_budget={d}/{d}; autonomy_sleeping={any}", .{
+        .evidence = try std.fmt.allocPrint(allocator, "{s}; {s}; control_capacity={d:.2}/{d:.2}; autonomy_sleeping={any}", .{
             battery_text,
             external_text,
-            energy,
-            autonomy_daily_energy,
+            control_capacity,
+            autonomy_max_capacity,
             sleeping,
         }),
-        .desired_action = try allocator.dupe(u8, "check power when power evidence is uncertain; ask a human only before real shutdown risk; conserve autonomy budget by sleeping when low"),
+        .desired_action = try allocator.dupe(u8, "check power when power evidence is uncertain; ask a human only before real shutdown risk; conserve control capacity when low"),
     };
 }
 
@@ -225,8 +225,8 @@ test "daily interaction need becomes urgent without recent conversation" {
         .conversation_summaries = &.{},
         .memory_records = &.{},
         .power = .{ .supplies = &.{} },
-        .autonomy_energy_remaining = 20,
-        .autonomy_daily_energy = 20,
+        .autonomy_control_capacity = 0.8,
+        .autonomy_max_capacity = 0.85,
         .autonomy_sleeping = false,
     });
     defer freeNeeds(std.testing.allocator, needs);
@@ -243,8 +243,8 @@ test "power continuity need notices low unplugged battery" {
         .conversation_summaries = &.{},
         .memory_records = &.{},
         .power = .{ .supplies = &supplies },
-        .autonomy_energy_remaining = 20,
-        .autonomy_daily_energy = 20,
+        .autonomy_control_capacity = 0.8,
+        .autonomy_max_capacity = 0.85,
         .autonomy_sleeping = false,
     });
     defer freeNeeds(std.testing.allocator, needs);
@@ -262,14 +262,14 @@ test "power continuity keeps autonomy budget separate from plugged-in power" {
         .conversation_summaries = &.{},
         .memory_records = &.{},
         .power = .{ .supplies = &supplies },
-        .autonomy_energy_remaining = 0,
-        .autonomy_daily_energy = 20,
+        .autonomy_control_capacity = 0.0,
+        .autonomy_max_capacity = 0.85,
         .autonomy_sleeping = true,
     });
     defer freeNeeds(std.testing.allocator, needs);
     const power = findNeedForTest(needs, "power_continuity") orelse return error.MissingPowerContinuityNeed;
     try std.testing.expectEqual(NeedUrgency.watch, power.urgency);
-    try std.testing.expect(std.mem.indexOf(u8, power.evidence, "autonomy_budget=0/20") != null);
+    try std.testing.expect(std.mem.indexOf(u8, power.evidence, "control_capacity=0.00/0.85") != null);
     try std.testing.expect(std.mem.indexOf(u8, power.desired_action, "real shutdown risk") != null);
 }
 

@@ -16,7 +16,10 @@ pub fn main(init: std.process.Init) !void {
 
     const args_cfg = try config_mod.Config.fromArgs(args_list.items);
     var local_filesystem = files_mod.LocalFileSystem{};
-    const cfg = try args_cfg.withLlmConfig(allocator, local_filesystem.filesystem(), init.io);
+    var cfg = args_cfg;
+    if (cfg.brain_root.len == 0) cfg.brain_root = "data/brains/default";
+    cfg = try cfg.ensureBrainPaths(allocator);
+    cfg = try cfg.loadForBrain(allocator, local_filesystem.filesystem(), init.io);
     var http_transport = main_http_transport.StdHttpTransport.init(init.io);
     var client = ai_provider.DirectRandomProviderClient.initDirectFromEnv(init.io, http_transport.client(), init.environ_map, cfg.conversation_models);
 

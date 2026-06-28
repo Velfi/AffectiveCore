@@ -14,10 +14,11 @@ const audio_mod = ports.audio;
 const want_achievement_mod = ports.want_achievement;
 const camera_mod = ports.camera;
 const input_mod = ports.input;
-const command_log_mod = ports.command_log;
+const event_log_mod = ports.event_log;
 const facial_expression = ports.facial_expression;
 const id_monitor = @import("id_monitor.zig");
 const maintenance = @import("maintenance.zig");
+const cognitive_clone = @import("../storage/json_store_cognitive.zig");
 
 const Brain = brain_mod.Brain;
 const BrainDeps = brain_mod.BrainDeps;
@@ -29,19 +30,28 @@ pub const TestStore = struct {
     conversation_summaries: std.ArrayList(schema.ConversationSummary),
     memories: std.ArrayList(schema.MemoryRecord),
     facts: std.ArrayList(schema.FactRecord),
-    traces: std.ArrayList(schema.Trace),
     beliefs: std.ArrayList(schema.Belief),
     subjects: std.ArrayList(schema.Subject),
     artifacts: std.ArrayList(schema.Artifact),
-    cognitive_dreams: std.ArrayList(schema.Dream),
     impressions: std.ArrayList(schema.Impression),
     appraisals: std.ArrayList(schema.Appraisal),
-    dreams: std.ArrayList(schema.DreamRecord),
-    experiences: std.ArrayList(schema.Experience),
-    runtime_events: std.ArrayList([]const u8),
+    experience_events: std.ArrayList(schema.ExperienceEvent),
+    host_bindings: std.ArrayList(schema.HostBinding),
+    capability_statuses: std.ArrayList(schema.CapabilityStatus),
+    capability_requests: std.ArrayList(schema.CapabilityRequest),
+    capability_results: std.ArrayList(schema.CapabilityResult),
+    self_trust: std.ArrayList(schema.SelfTrustEntry),
+    dispositions: std.ArrayList(schema.Disposition),
+    action_pressures: std.ArrayList(schema.ActionPressure),
+    action_outcomes: std.ArrayList(schema.ActionOutcome),
+    dream_time_records: std.ArrayList(schema.DreamTimeRecord),
+    mailbox_items: std.ArrayList(schema.MailboxItem),
+    identity_hypotheses: std.ArrayList(schema.IdentityHypothesis),
+    active_activity: ?schema.ActivityRecord = null,
+    activity_stack: std.ArrayList(schema.ActivityRecord),
+    activity_history: std.ArrayList(schema.ActivityRecord),
+    brain_mode: schema.BrainMode = .waking,
     want_detector: want_achievement_mod.ScriptedWantAchievementDetector,
-    log_count: usize = 0,
-    runtime_event_sweep_count: usize = 0,
     retain_prefix: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) TestStore {
@@ -52,16 +62,25 @@ pub const TestStore = struct {
             .conversation_summaries = .empty,
             .memories = .empty,
             .facts = .empty,
-            .traces = .empty,
             .beliefs = .empty,
             .subjects = .empty,
             .artifacts = .empty,
-            .cognitive_dreams = .empty,
             .impressions = .empty,
             .appraisals = .empty,
-            .dreams = .empty,
-            .experiences = .empty,
-            .runtime_events = .empty,
+            .experience_events = .empty,
+            .host_bindings = .empty,
+            .capability_statuses = .empty,
+            .capability_requests = .empty,
+            .capability_results = .empty,
+            .self_trust = .empty,
+            .dispositions = .empty,
+            .action_pressures = .empty,
+            .action_outcomes = .empty,
+            .dream_time_records = .empty,
+            .mailbox_items = .empty,
+            .identity_hypotheses = .empty,
+            .activity_stack = .empty,
+            .activity_history = .empty,
             .want_detector = .{},
         };
     }
@@ -69,10 +88,6 @@ pub const TestStore = struct {
     pub fn store(self: *TestStore) store_mod.MemoryStore {
         return .{
             .ctx = self,
-            .addTraceFn = addTrace,
-            .updateTraceFn = updateTrace,
-            .loadTracesFn = loadTraces,
-            .forgetTraceFn = forgetTrace,
             .upsertBeliefFn = upsertBelief,
             .loadBeliefsFn = loadBeliefs,
             .invalidateBeliefFn = invalidateBelief,
@@ -80,11 +95,10 @@ pub const TestStore = struct {
             .loadSubjectsFn = loadSubjects,
             .addArtifactFn = addArtifact,
             .loadArtifactsFn = loadArtifacts,
-            .addDreamFn = addDream,
-            .loadDreamsFn = loadDreams,
             .loadPeopleFn = loadPeople,
             .savePersonFn = savePerson,
             .addSightingFn = addSighting,
+            .loadSightingsFn = loadSightings,
             .findByNameFn = findByName,
             .findByIdFn = findById,
             .forgetPersonFn = forgetPerson,
@@ -100,48 +114,45 @@ pub const TestStore = struct {
             .addImpressionFn = addImpression,
             .loadAppraisalsFn = loadAppraisals,
             .addAppraisalFn = addAppraisal,
-            .loadDreamRecordsFn = loadDreamRecords,
-            .addDreamRecordFn = addDreamRecord,
-            .loadExperiencesFn = loadExperiences,
-            .addExperienceFn = addExperience,
             .sweepExpiredExperiencesFn = sweepExpiredExperiences,
             .sweepUnreferencedCapturesFn = sweepUnreferencedCaptures,
-            .sweepRuntimeEventsFn = sweepRuntimeEvents,
+            .pruneTombstonedCognitiveRecordsFn = pruneTombstonedCognitiveRecords,
             .retainCaptureFn = retainCapture,
-            .logEventFn = logEvent,
+            .addExperienceEventFn = addExperienceEvent,
+            .loadExperienceEventsFn = loadExperienceEvents,
+            .setBrainModeFn = setBrainMode,
+            .loadBrainModeFn = loadBrainMode,
+            .upsertHostBindingFn = upsertHostBinding,
+            .loadHostBindingsFn = loadHostBindings,
+            .upsertCapabilityStatusFn = upsertCapabilityStatus,
+            .loadCapabilityStatusesFn = loadCapabilityStatuses,
+            .addCapabilityRequestFn = addCapabilityRequest,
+            .addCapabilityResultFn = addCapabilityResult,
+            .upsertSelfTrustFn = upsertSelfTrust,
+            .loadSelfTrustFn = loadSelfTrust,
+            .upsertDispositionFn = upsertDisposition,
+            .loadDispositionsFn = loadDispositions,
+            .addActionPressureFn = addActionPressure,
+            .loadActionPressuresFn = loadActionPressures,
+            .addActionOutcomeFn = addActionOutcome,
+            .loadActionOutcomesFn = loadActionOutcomes,
+            .upsertActionOutcomeFn = upsertActionOutcome,
+            .loadCapabilityResultsFn = loadCapabilityResults,
+            .loadCapabilityRequestsFn = loadCapabilityRequests,
+            .addDreamTimeRecordFn = addDreamTimeRecord,
+            .loadDreamTimeRecordsFn = loadDreamTimeRecords,
+            .addMailboxItemFn = addMailboxItem,
+            .loadMailboxItemsFn = loadMailboxItems,
+            .markMailboxItemReadFn = markMailboxItemRead,
+            .addIdentityHypothesisFn = addIdentityHypothesis,
+            .loadIdentityHypothesesFn = loadIdentityHypotheses,
+            .saveActiveActivityFn = saveActiveActivity,
+            .loadActiveActivityFn = loadActiveActivity,
+            .saveActivityStackFn = saveActivityStack,
+            .loadActivityStackFn = loadActivityStack,
+            .appendActivityHistoryFn = appendActivityHistory,
+            .loadActivityHistoryFn = loadActivityHistory,
         };
-    }
-
-    pub fn addTrace(ctx: *anyopaque, trace: schema.Trace) !void {
-        const self: *TestStore = @ptrCast(@alignCast(ctx));
-        try self.traces.append(self.allocator, trace);
-    }
-
-    pub fn updateTrace(ctx: *anyopaque, trace: schema.Trace) !void {
-        const self: *TestStore = @ptrCast(@alignCast(ctx));
-        for (self.traces.items, 0..) |existing, i| {
-            if (std.mem.eql(u8, existing.trace_id, trace.trace_id)) {
-                self.traces.items[i] = trace;
-                return;
-            }
-        }
-        try self.traces.append(self.allocator, trace);
-    }
-
-    pub fn loadTraces(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.Trace {
-        const self: *TestStore = @ptrCast(@alignCast(ctx));
-        return self.traces.items;
-    }
-
-    pub fn forgetTrace(ctx: *anyopaque, trace_id: []const u8) !bool {
-        const self: *TestStore = @ptrCast(@alignCast(ctx));
-        for (self.traces.items, 0..) |trace, i| {
-            if (std.mem.eql(u8, trace.trace_id, trace_id)) {
-                _ = self.traces.swapRemove(i);
-                return true;
-            }
-        }
-        return false;
     }
 
     pub fn upsertBelief(ctx: *anyopaque, belief: schema.Belief) !void {
@@ -166,7 +177,6 @@ pub const TestStore = struct {
             if (std.mem.eql(u8, belief.belief_id, belief_id)) {
                 self.beliefs.items[i].lifecycle.status = .invalidated;
                 self.beliefs.items[i].lifecycle.updated_at = invalidated_at;
-                self.beliefs.items[i].lifecycle.invalidated_at = invalidated_at;
                 return true;
             }
         }
@@ -199,15 +209,101 @@ pub const TestStore = struct {
         return self.artifacts.items;
     }
 
-    pub fn addDream(ctx: *anyopaque, dream: schema.Dream) !void {
+
+    pub fn addExperienceEvent(ctx: *anyopaque, event: schema.ExperienceEvent) !void {
         const self: *TestStore = @ptrCast(@alignCast(ctx));
-        try self.cognitive_dreams.append(self.allocator, dream);
+        try self.experience_events.append(self.allocator, event);
     }
 
-    pub fn loadDreams(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.Dream {
+    pub fn loadExperienceEvents(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.ExperienceEvent {
         const self: *TestStore = @ptrCast(@alignCast(ctx));
-        return self.cognitive_dreams.items;
+        return self.experience_events.items;
     }
+
+    pub fn setBrainMode(ctx: *anyopaque, mode: schema.BrainMode) !void {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        self.brain_mode = mode;
+    }
+
+    pub fn loadBrainMode(ctx: *anyopaque) !schema.BrainMode {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        return self.brain_mode;
+    }
+
+    pub fn upsertHostBinding(ctx: *anyopaque, binding: schema.HostBinding) !void {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        for (self.host_bindings.items, 0..) |existing, i| if (std.mem.eql(u8, existing.host_id, binding.host_id)) { self.host_bindings.items[i] = binding; return; };
+        try self.host_bindings.append(self.allocator, binding);
+    }
+
+    pub fn loadHostBindings(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.HostBinding { const self: *TestStore = @ptrCast(@alignCast(ctx)); return self.host_bindings.items; }
+
+    pub fn upsertCapabilityStatus(ctx: *anyopaque, status: schema.CapabilityStatus) !void {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        for (self.capability_statuses.items, 0..) |existing, i| if (std.mem.eql(u8, existing.capability_id, status.capability_id) and std.mem.eql(u8, existing.host_id, status.host_id)) { self.capability_statuses.items[i] = status; return; };
+        try self.capability_statuses.append(self.allocator, status);
+    }
+
+    pub fn loadCapabilityStatuses(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.CapabilityStatus { const self: *TestStore = @ptrCast(@alignCast(ctx)); return self.capability_statuses.items; }
+    pub fn addCapabilityRequest(ctx: *anyopaque, request: schema.CapabilityRequest) !void { const self: *TestStore = @ptrCast(@alignCast(ctx)); try self.capability_requests.append(self.allocator, request); }
+    pub fn addCapabilityResult(ctx: *anyopaque, result: schema.CapabilityResult) !void { const self: *TestStore = @ptrCast(@alignCast(ctx)); try self.capability_results.append(self.allocator, result); }
+
+    pub fn upsertSelfTrust(ctx: *anyopaque, entry: schema.SelfTrustEntry) !void {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        for (self.self_trust.items, 0..) |existing, i| if (std.mem.eql(u8, existing.self_trust_id, entry.self_trust_id)) { self.self_trust.items[i] = entry; return; };
+        try self.self_trust.append(self.allocator, entry);
+    }
+
+    pub fn loadSelfTrust(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.SelfTrustEntry { const self: *TestStore = @ptrCast(@alignCast(ctx)); return self.self_trust.items; }
+
+    pub fn upsertDisposition(ctx: *anyopaque, disposition: schema.Disposition) !void {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        for (self.dispositions.items, 0..) |existing, i| if (std.mem.eql(u8, existing.disposition_id, disposition.disposition_id)) { self.dispositions.items[i] = disposition; return; };
+        try self.dispositions.append(self.allocator, disposition);
+    }
+
+    pub fn loadDispositions(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.Disposition { const self: *TestStore = @ptrCast(@alignCast(ctx)); return self.dispositions.items; }
+    pub fn addActionPressure(ctx: *anyopaque, pressure: schema.ActionPressure) !void { const self: *TestStore = @ptrCast(@alignCast(ctx)); try self.action_pressures.append(self.allocator, pressure); }
+    pub fn loadActionPressures(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.ActionPressure { const self: *TestStore = @ptrCast(@alignCast(ctx)); return self.action_pressures.items; }
+    pub fn addActionOutcome(ctx: *anyopaque, outcome: schema.ActionOutcome) !void { const self: *TestStore = @ptrCast(@alignCast(ctx)); try self.action_outcomes.append(self.allocator, outcome); }
+    pub fn loadActionOutcomes(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.ActionOutcome { const self: *TestStore = @ptrCast(@alignCast(ctx)); return self.action_outcomes.items; }
+    pub fn upsertActionOutcome(ctx: *anyopaque, outcome: schema.ActionOutcome) !void {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        for (self.action_outcomes.items, 0..) |existing, i| {
+            if (std.mem.eql(u8, existing.outcome_id, outcome.outcome_id)) {
+                self.action_outcomes.items[i] = outcome;
+                return;
+            }
+        }
+        try self.action_outcomes.append(self.allocator, outcome);
+    }
+    pub fn loadCapabilityResults(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.CapabilityResult { const self: *TestStore = @ptrCast(@alignCast(ctx)); return self.capability_results.items; }
+    pub fn loadCapabilityRequests(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.CapabilityRequest { const self: *TestStore = @ptrCast(@alignCast(ctx)); return self.capability_requests.items; }
+    pub fn addDreamTimeRecord(ctx: *anyopaque, dream: schema.DreamTimeRecord) !void {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        for (self.dream_time_records.items, 0..) |existing, i| {
+            if (std.mem.eql(u8, existing.dream_id, dream.dream_id)) {
+                self.dream_time_records.items[i] = dream;
+                return;
+            }
+        }
+        try self.dream_time_records.append(self.allocator, dream);
+    }
+    pub fn loadDreamTimeRecords(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.DreamTimeRecord { const self: *TestStore = @ptrCast(@alignCast(ctx)); return self.dream_time_records.items; }
+    pub fn addMailboxItem(ctx: *anyopaque, item: schema.MailboxItem) !void { const self: *TestStore = @ptrCast(@alignCast(ctx)); try self.mailbox_items.append(self.allocator, item); }
+    pub fn loadMailboxItems(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.MailboxItem { const self: *TestStore = @ptrCast(@alignCast(ctx)); return self.mailbox_items.items; }
+    pub fn markMailboxItemRead(ctx: *anyopaque, mailbox_id: []const u8, read_at_ms: i64) !schema.MailboxItem {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        for (self.mailbox_items.items) |*item| {
+            if (std.mem.eql(u8, item.mailbox_id, mailbox_id)) {
+                item.read_at_ms = read_at_ms;
+                return item.*;
+            }
+        }
+        return error.UnknownMailboxItem;
+    }
+    pub fn addIdentityHypothesis(ctx: *anyopaque, hypothesis: schema.IdentityHypothesis) !void { const self: *TestStore = @ptrCast(@alignCast(ctx)); try self.identity_hypotheses.append(self.allocator, hypothesis); }
+    pub fn loadIdentityHypotheses(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.IdentityHypothesis { const self: *TestStore = @ptrCast(@alignCast(ctx)); return self.identity_hypotheses.items; }
 
     pub fn loadPeople(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.Person {
         const self: *TestStore = @ptrCast(@alignCast(ctx));
@@ -228,6 +324,11 @@ pub const TestStore = struct {
     pub fn addSighting(ctx: *anyopaque, sighting: schema.Sighting) !void {
         const self: *TestStore = @ptrCast(@alignCast(ctx));
         try self.sightings.append(self.allocator, sighting);
+    }
+
+    pub fn loadSightings(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.Sighting {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        return self.sightings.items;
     }
 
     pub fn findByName(ctx: *anyopaque, _: std.mem.Allocator, name: []const u8) !?schema.Person {
@@ -276,58 +377,10 @@ pub const TestStore = struct {
         for (self.memories.items, 0..) |existing, i| {
             if (std.mem.eql(u8, existing.memory_id, memory.memory_id)) {
                 self.memories.items[i] = memory;
-                try updateTrace(ctx, .{
-                    .trace_id = memory.memory_id,
-                    .source = .memory,
-                    .kind = .memory_update,
-                    .scope = switch (memory.scope) {
-                        .short_term => .short_term,
-                        .long_term => .long_term,
-                    },
-                    .text = memory.text,
-                    .interpretation = memory.interpretation,
-                    .confidence = memory.confidence,
-                    .salience = memory.salience,
-                    .valence = memory.valence,
-                    .access_count = memory.access_count,
-                    .score = memory.score,
-                    .vector = memory.vector,
-                    .tags = memory.tags,
-                    .lifecycle = .{
-                        .status = .active,
-                        .created_at = memory.created_at,
-                        .updated_at = memory.last_accessed_at orelse memory.created_at,
-                        .revisions = memory.revisions,
-                    },
-                });
                 return;
             }
         }
         try self.memories.append(self.allocator, memory);
-        try addTrace(ctx, .{
-            .trace_id = memory.memory_id,
-            .source = .memory,
-            .kind = .memory_update,
-            .scope = switch (memory.scope) {
-                .short_term => .short_term,
-                .long_term => .long_term,
-            },
-            .text = memory.text,
-            .interpretation = memory.interpretation,
-            .confidence = memory.confidence,
-            .salience = memory.salience,
-            .valence = memory.valence,
-            .access_count = memory.access_count,
-            .score = memory.score,
-            .vector = memory.vector,
-            .tags = memory.tags,
-            .lifecycle = .{
-                .status = .active,
-                .created_at = memory.created_at,
-                .updated_at = memory.last_accessed_at orelse memory.created_at,
-                .revisions = memory.revisions,
-            },
-        });
     }
 
     pub fn forgetMemoryRecord(ctx: *anyopaque, memory_id: []const u8) !bool {
@@ -335,7 +388,6 @@ pub const TestStore = struct {
         for (self.memories.items, 0..) |memory, i| {
             if (std.mem.eql(u8, memory.memory_id, memory_id)) {
                 _ = self.memories.swapRemove(i);
-                _ = try forgetTrace(ctx, memory_id);
                 return true;
             }
         }
@@ -362,7 +414,6 @@ pub const TestStore = struct {
                         .status = if (!fact.active) .invalidated else if (fact.confidence < 0.75) .doubted else .active,
                         .created_at = fact.created_at,
                         .updated_at = fact.updated_at,
-                        .invalidated_at = fact.invalidated_at,
                         .revisions = fact.revisions,
                     },
                 });
@@ -380,7 +431,6 @@ pub const TestStore = struct {
                 .status = if (!fact.active) .invalidated else if (fact.confidence < 0.75) .doubted else .active,
                 .created_at = fact.created_at,
                 .updated_at = fact.updated_at,
-                .invalidated_at = fact.invalidated_at,
                 .revisions = fact.revisions,
             },
         });
@@ -392,7 +442,6 @@ pub const TestStore = struct {
             if (std.mem.eql(u8, fact.fact_id, fact_id)) {
                 self.facts.items[i].active = false;
                 self.facts.items[i].updated_at = invalidated_at;
-                self.facts.items[i].invalidated_at = invalidated_at;
                 _ = try invalidateBelief(ctx, fact_id, invalidated_at);
                 return true;
             }
@@ -420,59 +469,18 @@ pub const TestStore = struct {
         try self.appraisals.append(self.allocator, appraisal);
     }
 
-    pub fn loadDreamRecords(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.DreamRecord {
-        const self: *TestStore = @ptrCast(@alignCast(ctx));
-        return self.dreams.items;
-    }
-
-    pub fn addDreamRecord(ctx: *anyopaque, dream: schema.DreamRecord) !void {
-        const self: *TestStore = @ptrCast(@alignCast(ctx));
-        try self.dreams.append(self.allocator, dream);
-    }
-
-    pub fn loadExperiences(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.Experience {
-        const self: *TestStore = @ptrCast(@alignCast(ctx));
-        return self.experiences.items;
-    }
-
-    pub fn addExperience(ctx: *anyopaque, experience: schema.Experience) !void {
-        const self: *TestStore = @ptrCast(@alignCast(ctx));
-        try self.experiences.append(self.allocator, experience);
-    }
-
-    pub fn sweepExpiredExperiences(ctx: *anyopaque, now_seconds: i64) !usize {
-        const self: *TestStore = @ptrCast(@alignCast(ctx));
-        var removed: usize = 0;
-        var i: usize = 0;
-        while (i < self.experiences.items.len) {
-            const experience = self.experiences.items[i];
-            const expires_at = experience.expires_at orelse {
-                i += 1;
-                continue;
-            };
-            const expires = std.fmt.parseInt(i64, expires_at, 10) catch {
-                i += 1;
-                continue;
-            };
-            if ((experience.retention == .raw_ephemeral or experience.retention == .discard) and expires <= now_seconds) {
-                _ = self.experiences.swapRemove(i);
-                removed += 1;
-            } else {
-                i += 1;
-            }
-        }
-        return removed;
+    pub fn sweepExpiredExperiences(_: *anyopaque, _: i64) !usize {
+        return 0;
     }
 
     pub fn sweepUnreferencedCaptures(_: *anyopaque) !usize {
         return 0;
     }
 
-    pub fn sweepRuntimeEvents(ctx: *anyopaque) !usize {
-        const self: *TestStore = @ptrCast(@alignCast(ctx));
-        self.runtime_event_sweep_count += 1;
-        return 0;
+    pub fn pruneTombstonedCognitiveRecords(_: *anyopaque, _: []const u8) !schema.CognitivePruneResult {
+        return .{};
     }
+
 
     pub fn retainCapture(ctx: *anyopaque, allocator: std.mem.Allocator, source_path: []const u8, _: []const u8) ![]const u8 {
         const self: *TestStore = @ptrCast(@alignCast(ctx));
@@ -482,9 +490,47 @@ pub const TestStore = struct {
         return allocator.dupe(u8, source_path);
     }
 
-    pub fn logEvent(ctx: *anyopaque, json_line: []const u8) !void {
+    pub fn saveActiveActivity(ctx: *anyopaque, record: ?schema.ActivityRecord) !void {
         const self: *TestStore = @ptrCast(@alignCast(ctx));
-        self.log_count += 1;
-        try self.runtime_events.append(self.allocator, try self.allocator.dupe(u8, json_line));
+        self.active_activity = if (record) |active| try cognitive_clone.cloneActivityRecord(self.allocator, active) else null;
     }
+
+    pub fn loadActiveActivity(ctx: *anyopaque, allocator: std.mem.Allocator) !?schema.ActivityRecord {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        const active = self.active_activity orelse return null;
+        return try cognitive_clone.cloneActivityRecord(allocator, active);
+    }
+
+    pub fn saveActivityStack(ctx: *anyopaque, stack: []const schema.ActivityRecord) !void {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        for (self.activity_stack.items) |previous| cognitive_clone.freeActivityRecord(self.allocator, previous);
+        self.activity_stack.clearRetainingCapacity();
+        for (stack) |record| {
+            try self.activity_stack.append(self.allocator, try cognitive_clone.cloneActivityRecord(self.allocator, record));
+        }
+    }
+
+    pub fn loadActivityStack(ctx: *anyopaque, allocator: std.mem.Allocator) ![]schema.ActivityRecord {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        var copied = try allocator.alloc(schema.ActivityRecord, self.activity_stack.items.len);
+        for (self.activity_stack.items, 0..) |record, i| {
+            copied[i] = try cognitive_clone.cloneActivityRecord(allocator, record);
+        }
+        return copied;
+    }
+
+    pub fn appendActivityHistory(ctx: *anyopaque, record: schema.ActivityRecord) !void {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        try self.activity_history.append(self.allocator, try cognitive_clone.cloneActivityRecord(self.allocator, record));
+    }
+
+    pub fn loadActivityHistory(ctx: *anyopaque, allocator: std.mem.Allocator) ![]schema.ActivityRecord {
+        const self: *TestStore = @ptrCast(@alignCast(ctx));
+        var copied = try allocator.alloc(schema.ActivityRecord, self.activity_history.items.len);
+        for (self.activity_history.items, 0..) |record, i| {
+            copied[i] = try cognitive_clone.cloneActivityRecord(allocator, record);
+        }
+        return copied;
+    }
+
 };

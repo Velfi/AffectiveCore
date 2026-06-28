@@ -1,0 +1,34 @@
+{
+  "setup": true,
+  "steps": [
+    {
+      "api_version": 1,
+      "request_id": "flow-enroll-greet",
+      "event": { "type": "user_text", "text": "who are you?" }
+    },
+    {
+      "api_version": 1,
+      "request_id": "flow-enroll-camera",
+      "event": {
+        "type": "sense_observation",
+        "sense": "camera",
+        "observation": {
+          "path": "fixtures/visitors/unknown_01.jpg",
+          "mime_type": "image/jpeg",
+          "source": "affective_requested_capture"
+        }
+      }
+    },
+    {
+      "api_version": 1,
+      "request_id": "flow-enroll-name",
+      "event": { "type": "user_text", "text": "My name is Alice" }
+    },
+    {
+      "api_version": 1,
+      "request_id": "flow-enroll-read-models",
+      "event": { "type": "read_models_snapshot" }
+    },
+    { "op": "drain" }
+  ]
+}

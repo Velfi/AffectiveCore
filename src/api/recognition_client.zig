@@ -5,6 +5,8 @@ const schema = @import("../storage/schema.zig");
 const store_mod = @import("../storage/store.zig");
 const vector_index = @import("../core/vector_index.zig");
 const http_transport = @import("http_transport.zig");
+const http_log = @import("http_log.zig");
+const error_descriptions = @import("../core/error_descriptions.zig");
 
 pub const TestRecognitionClient = struct {
     known_threshold: f32 = 0.85,
@@ -78,11 +80,17 @@ pub const HostRecognitionClient = struct {
             .uncertain_threshold = self.uncertain_threshold,
         }, .{}, &body_writer.writer);
         const body = body_writer.written();
-        const out = try self.http.postJson(allocator, .{
-            .url = "affective-host://recognize/identify",
+        const url = "affective-host://recognize/identify";
+        http_log.logStart(url, body.len, 1024 * 1024);
+        const out = self.http.postJson(allocator, .{
+            .url = url,
             .body = body,
-        });
+        }) catch |err| {
+            http_log.logError(url, err);
+            return err;
+        };
         defer allocator.free(out);
+        http_log.logDone(url, out.len);
         return parseHostIdentityResult(allocator, out);
     }
 
@@ -99,11 +107,17 @@ pub const HostRecognitionClient = struct {
             .keep_existing = request.keep_existing,
         }, .{}, &body_writer.writer);
         const body = body_writer.written();
-        const out = try self.http.postJson(allocator, .{
-            .url = "affective-host://recognize/enroll",
+        const url = "affective-host://recognize/enroll";
+        http_log.logStart(url, body.len, 1024 * 1024);
+        const out = self.http.postJson(allocator, .{
+            .url = url,
             .body = body,
-        });
+        }) catch |err| {
+            http_log.logError(url, err);
+            return err;
+        };
         defer allocator.free(out);
+        http_log.logDone(url, out.len);
         return parseHostFacePictureUpdateResult(allocator, out);
     }
 };
@@ -127,8 +141,8 @@ pub const DescriptiveRecognitionClient = struct {
         if (current_text.len == 0) return .{ .person_present = false, .match_status = .none, .confidence = 0, .people_count = 0 };
 
         const people = try self.store.loadPeople(allocator);
-        const traces = try self.store.loadTraces(allocator);
-        const candidates = try buildDescriptionCandidates(allocator, people, try tracesToSightings(allocator, traces));
+        const sightings = try self.store.loadSightings(allocator);
+        const candidates = try buildDescriptionCandidates(allocator, people, sightings);
         if (candidates.len == 0) return .{ .person_present = true, .match_status = .unknown, .confidence = 0, .people_count = 1 };
 
         const best = try bestDescriptionCandidate(allocator, candidates, current_text);
@@ -212,30 +226,6 @@ fn bestCandidateConfidence(best: ?CandidateMatch) f32 {
     return 0;
 }
 
-fn tracesToSightings(allocator: std.mem.Allocator, traces: []const schema.Trace) ![]schema.Sighting {
-    var out = std.ArrayList(schema.Sighting).empty;
-    for (traces) |trace| {
-        if (trace.source != .visual or trace.kind != .perception) continue;
-        if (!hasTag(trace.tags, "sighting")) continue;
-        try out.append(allocator, .{
-            .sighting_id = try allocator.dupe(u8, trace.trace_id),
-            .person_id = null,
-            .seen_at = try allocator.dupe(u8, trace.lifecycle.created_at),
-            .confidence = trace.confidence,
-            .image_path = null,
-            .description = try allocator.dupe(u8, trace.text),
-            .change_summary = try allocator.dupe(u8, trace.interpretation),
-            .retained_until = null,
-        });
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn hasTag(tags: []const []const u8, wanted: []const u8) bool {
-    for (tags) |tag| if (std.mem.eql(u8, tag, wanted)) return true;
-    return false;
-}
-
 const HostIdentityWire = struct {
     person_present: bool,
     match_status: []const u8,
@@ -253,7 +243,13 @@ const HostRecognitionError = error{
 };
 
 fn parseHostIdentityResult(allocator: std.mem.Allocator, body: []const u8) !identity.IdentityResult {
-    const parsed = try std.json.parseFromSlice(HostIdentityWire, allocator, body, .{ .ignore_unknown_fields = true });
+    const parsed = std.json.parseFromSlice(HostIdentityWire, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| {
+        std.debug.print(
+            "\nIDENTIFY PARSE ERROR\nERROR: {s}\nDETAIL: {s}\nEXPECTED: strict JSON with keys person_present, match_status, confidence, people_count\nRAW HOST CONTENT:\n{s}\n\n",
+            .{ error_descriptions.name(err), error_descriptions.detail(err), body },
+        );
+        return err;
+    };
     defer parsed.deinit();
 
     const status = try parseMatchStatus(parsed.value.match_status);
@@ -279,7 +275,7 @@ const HostFacePictureUpdateWire = struct {
     embedding_path: []const u8,
     quality_score: f32 = 0,
     removed_embeddings: u32 = 0,
-    kept_existing: bool = false,
+    kept_existing: ?bool = null,
 };
 
 fn parseHostFacePictureUpdateResult(allocator: std.mem.Allocator, body: []const u8) !identity.FacePictureUpdateResult {
@@ -292,7 +288,7 @@ fn parseHostFacePictureUpdateResult(allocator: std.mem.Allocator, body: []const 
         .embedding_path = try allocator.dupe(u8, parsed.value.embedding_path),
         .quality_score = parsed.value.quality_score,
         .removed_embeddings = parsed.value.removed_embeddings,
-        .kept_existing = parsed.value.kept_existing,
+        .kept_existing = parsed.value.kept_existing orelse false,
     };
 }
 
@@ -318,6 +314,16 @@ test "host recognition parser accepts strict identity result" {
     try std.testing.expectEqual(@as(u32, 1), result.people_count);
 }
 
+test "host recognition parser accepts fixture none response" {
+    const result = try parseHostIdentityResult(std.testing.allocator,
+        \\{"person_present":false,"match_status":"none","confidence":0.0,"people_count":0}
+    );
+    try std.testing.expect(!result.person_present);
+    try std.testing.expectEqual(identity.MatchStatus.none, result.match_status);
+    try std.testing.expectEqual(@as(u32, 0), result.people_count);
+    try std.testing.expectEqual(@as(f32, 0), result.confidence);
+}
+
 test "host recognition parser rejects known result without person id" {
     try std.testing.expectError(
         HostRecognitionError.MissingKnownPersonId,
@@ -325,4 +331,30 @@ test "host recognition parser rejects known result without person id" {
             \\{"person_present":true,"match_status":"known","confidence":0.91,"people_count":1}
         ),
     );
+}
+
+test "host recognition parser rejects malformed identify JSON" {
+    try std.testing.expectError(
+        error.SyntaxError,
+        parseHostIdentityResult(std.testing.allocator, "not json"),
+    );
+}
+
+test "host recognition parser rejects invalid match status" {
+    try std.testing.expectError(
+        HostRecognitionError.InvalidRecognitionStatus,
+        parseHostIdentityResult(std.testing.allocator,
+            \\{"person_present":true,"match_status":"maybe","confidence":0.5,"people_count":1}
+        ),
+    );
+}
+
+test "host face picture update parser accepts null kept_existing" {
+    const result = try parseHostFacePictureUpdateResult(std.testing.allocator,
+        \\{"person_id":"person_1","representative_image_path":"/tmp/rep.jpg","embedding_path":"/tmp/embed.json","quality_score":0.9,"removed_embeddings":1,"kept_existing":null}
+    );
+    defer std.testing.allocator.free(result.person_id);
+    defer std.testing.allocator.free(result.representative_image_path);
+    defer std.testing.allocator.free(result.embedding_path);
+    try std.testing.expectEqual(false, result.kept_existing);
 }

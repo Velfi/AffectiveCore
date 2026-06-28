@@ -182,7 +182,7 @@ test "ensureParentDir supports absolute paths" {
     const io = std.testing.io;
     const dirname = "affective-core-files-test";
     const root = "/tmp/" ++ dirname;
-    const path = root ++ "/nested/events.jsonl";
+    const path = root ++ "/nested/sample.txt";
     defer cleanup: {
         var tmp = std.Io.Dir.openDirAbsolute(io, "/tmp", .{}) catch break :cleanup;
         defer tmp.close(io);
@@ -197,7 +197,7 @@ test "writeFilePath supports absolute paths" {
     const io = std.testing.io;
     const dirname = "affective-core-files-write-test";
     const root = "/tmp/" ++ dirname;
-    const path = root ++ "/nested/events.jsonl";
+    const path = root ++ "/nested/sample.txt";
     defer cleanup: {
         var tmp = std.Io.Dir.openDirAbsolute(io, "/tmp", .{}) catch break :cleanup;
         defer tmp.close(io);

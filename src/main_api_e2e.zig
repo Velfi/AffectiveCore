@@ -11,6 +11,7 @@ const Provider = enum {
     openai,
     anthropic,
     google,
+    deepseek,
 };
 
 const ProviderModel = struct {
@@ -36,7 +37,9 @@ pub fn main(init: std.process.Init) !void {
 
     const args_cfg = try config_mod.Config.fromArgs(args_list.items);
     var local_filesystem = files_mod.LocalFileSystem{};
-    const cfg = try config_paths.withBrainPathsFromEnv(try args_cfg.withLlmConfig(allocator, local_filesystem.filesystem(), init.io), allocator, init.environ_map);
+    var cfg = try args_cfg.ensureBrainPaths(allocator);
+    cfg = try cfg.loadForBrain(allocator, local_filesystem.filesystem(), init.io);
+    cfg = try config_paths.withBrainPathsFromEnv(cfg, allocator, init.environ_map);
     const models = try parseProviderModels(allocator, cfg.conversation_models);
     try requireProviderKeys(init.environ_map, models);
     var http_transport = main_http_transport.StdHttpTransport.init(init.io);
@@ -127,6 +130,7 @@ fn requireProviderKeys(env: *const std.process.Environ.Map, models: []const Prov
             .openai => if (env.get("OPENAI_API_KEY") == null) return error.MissingOpenAIAPIKey,
             .anthropic => if (env.get("ANTHROPIC_API_KEY") == null) return error.MissingAnthropicAPIKey,
             .google => if (googleApiKey(env) == null) return error.MissingGoogleAPIKey,
+            .deepseek => if (env.get("DEEPSEEK_API_KEY") == null) return error.MissingDeepSeekAPIKey,
         }
     }
 }
@@ -161,6 +165,7 @@ fn parseProvider(text: []const u8) ?Provider {
     if (std.ascii.eqlIgnoreCase(text, "openai")) return .openai;
     if (std.ascii.eqlIgnoreCase(text, "anthropic")) return .anthropic;
     if (std.ascii.eqlIgnoreCase(text, "google") or std.ascii.eqlIgnoreCase(text, "gemini")) return .google;
+    if (std.ascii.eqlIgnoreCase(text, "deepseek")) return .deepseek;
     return null;
 }
 
@@ -173,6 +178,7 @@ fn providerName(provider: Provider) []const u8 {
         .openai => "openai",
         .anthropic => "anthropic",
         .google => "google",
+        .deepseek => "deepseek",
     };
 }
 

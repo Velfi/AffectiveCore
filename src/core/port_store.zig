@@ -3,10 +3,6 @@ const schema = @import("port_schema.zig");
 
 pub const MemoryStore = struct {
     ctx: *anyopaque,
-    addTraceFn: *const fn (*anyopaque, schema.Trace) anyerror!void,
-    updateTraceFn: *const fn (*anyopaque, schema.Trace) anyerror!void,
-    loadTracesFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.Trace,
-    forgetTraceFn: *const fn (*anyopaque, []const u8) anyerror!bool,
     upsertBeliefFn: *const fn (*anyopaque, schema.Belief) anyerror!void,
     loadBeliefsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.Belief,
     invalidateBeliefFn: *const fn (*anyopaque, []const u8, []const u8) anyerror!bool,
@@ -14,11 +10,10 @@ pub const MemoryStore = struct {
     loadSubjectsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.Subject,
     addArtifactFn: *const fn (*anyopaque, schema.Artifact) anyerror!void,
     loadArtifactsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.Artifact,
-    addDreamFn: *const fn (*anyopaque, schema.Dream) anyerror!void,
-    loadDreamsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.Dream,
     loadPeopleFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.Person,
     savePersonFn: *const fn (*anyopaque, schema.Person) anyerror!void,
     addSightingFn: *const fn (*anyopaque, schema.Sighting) anyerror!void,
+    loadSightingsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.Sighting,
     findByNameFn: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?schema.Person,
     findByIdFn: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?schema.Person,
     forgetPersonFn: *const fn (*anyopaque, []const u8) anyerror!bool,
@@ -34,32 +29,44 @@ pub const MemoryStore = struct {
     addImpressionFn: *const fn (*anyopaque, schema.Impression) anyerror!void,
     loadAppraisalsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.Appraisal,
     addAppraisalFn: *const fn (*anyopaque, schema.Appraisal) anyerror!void,
-    loadDreamRecordsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.DreamRecord,
-    addDreamRecordFn: *const fn (*anyopaque, schema.DreamRecord) anyerror!void,
-    loadExperiencesFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.Experience,
-    addExperienceFn: *const fn (*anyopaque, schema.Experience) anyerror!void,
     sweepExpiredExperiencesFn: *const fn (*anyopaque, i64) anyerror!usize,
     sweepUnreferencedCapturesFn: *const fn (*anyopaque) anyerror!usize,
-    sweepRuntimeEventsFn: *const fn (*anyopaque) anyerror!usize,
+    pruneTombstonedCognitiveRecordsFn: *const fn (*anyopaque, []const u8) anyerror!schema.CognitivePruneResult,
     retainCaptureFn: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror![]const u8,
-    logEventFn: *const fn (*anyopaque, []const u8) anyerror!void,
-
-    pub fn addTrace(self: MemoryStore, trace: schema.Trace) !void {
-        return self.addTraceFn(self.ctx, trace);
-    }
-
-    pub fn updateTrace(self: MemoryStore, trace: schema.Trace) !void {
-        return self.updateTraceFn(self.ctx, trace);
-    }
-
-    pub fn loadTraces(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.Trace {
-        return self.loadTracesFn(self.ctx, allocator);
-    }
-
-    pub fn forgetTrace(self: MemoryStore, trace_id: []const u8) !bool {
-        return self.forgetTraceFn(self.ctx, trace_id);
-    }
-
+    addExperienceEventFn: *const fn (*anyopaque, schema.ExperienceEvent) anyerror!void,
+    loadExperienceEventsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.ExperienceEvent,
+    setBrainModeFn: *const fn (*anyopaque, schema.BrainMode) anyerror!void,
+    loadBrainModeFn: *const fn (*anyopaque) anyerror!schema.BrainMode,
+    upsertHostBindingFn: *const fn (*anyopaque, schema.HostBinding) anyerror!void,
+    loadHostBindingsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.HostBinding,
+    upsertCapabilityStatusFn: *const fn (*anyopaque, schema.CapabilityStatus) anyerror!void,
+    loadCapabilityStatusesFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.CapabilityStatus,
+    addCapabilityRequestFn: *const fn (*anyopaque, schema.CapabilityRequest) anyerror!void,
+    addCapabilityResultFn: *const fn (*anyopaque, schema.CapabilityResult) anyerror!void,
+    upsertSelfTrustFn: *const fn (*anyopaque, schema.SelfTrustEntry) anyerror!void,
+    loadSelfTrustFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.SelfTrustEntry,
+    upsertDispositionFn: *const fn (*anyopaque, schema.Disposition) anyerror!void,
+    loadDispositionsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.Disposition,
+    addActionPressureFn: *const fn (*anyopaque, schema.ActionPressure) anyerror!void,
+    loadActionPressuresFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.ActionPressure,
+    addActionOutcomeFn: *const fn (*anyopaque, schema.ActionOutcome) anyerror!void,
+    loadActionOutcomesFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.ActionOutcome,
+    upsertActionOutcomeFn: *const fn (*anyopaque, schema.ActionOutcome) anyerror!void,
+    loadCapabilityResultsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.CapabilityResult,
+    loadCapabilityRequestsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.CapabilityRequest,
+    addDreamTimeRecordFn: *const fn (*anyopaque, schema.DreamTimeRecord) anyerror!void,
+    loadDreamTimeRecordsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.DreamTimeRecord,
+    addMailboxItemFn: *const fn (*anyopaque, schema.MailboxItem) anyerror!void,
+    loadMailboxItemsFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.MailboxItem,
+    markMailboxItemReadFn: *const fn (*anyopaque, []const u8, i64) anyerror!schema.MailboxItem,
+    addIdentityHypothesisFn: *const fn (*anyopaque, schema.IdentityHypothesis) anyerror!void,
+    loadIdentityHypothesesFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.IdentityHypothesis,
+    saveActiveActivityFn: *const fn (*anyopaque, ?schema.ActivityRecord) anyerror!void,
+    loadActiveActivityFn: *const fn (*anyopaque, std.mem.Allocator) anyerror!?schema.ActivityRecord,
+    saveActivityStackFn: *const fn (*anyopaque, []const schema.ActivityRecord) anyerror!void,
+    loadActivityStackFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.ActivityRecord,
+    appendActivityHistoryFn: *const fn (*anyopaque, schema.ActivityRecord) anyerror!void,
+    loadActivityHistoryFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.ActivityRecord,
     pub fn upsertBelief(self: MemoryStore, belief: schema.Belief) !void {
         return self.upsertBeliefFn(self.ctx, belief);
     }
@@ -88,14 +95,6 @@ pub const MemoryStore = struct {
         return self.loadArtifactsFn(self.ctx, allocator);
     }
 
-    pub fn addDream(self: MemoryStore, dream: schema.Dream) !void {
-        return self.addDreamFn(self.ctx, dream);
-    }
-
-    pub fn loadDreams(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.Dream {
-        return self.loadDreamsFn(self.ctx, allocator);
-    }
-
     pub fn loadPeople(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.Person {
         return self.loadPeopleFn(self.ctx, allocator);
     }
@@ -106,6 +105,10 @@ pub const MemoryStore = struct {
 
     pub fn addSighting(self: MemoryStore, sighting: schema.Sighting) !void {
         return self.addSightingFn(self.ctx, sighting);
+    }
+
+    pub fn loadSightings(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.Sighting {
+        return self.loadSightingsFn(self.ctx, allocator);
     }
 
     pub fn findByName(self: MemoryStore, allocator: std.mem.Allocator, name: []const u8) !?schema.Person {
@@ -168,22 +171,6 @@ pub const MemoryStore = struct {
         return self.addAppraisalFn(self.ctx, appraisal);
     }
 
-    pub fn loadDreamRecords(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.DreamRecord {
-        return self.loadDreamRecordsFn(self.ctx, allocator);
-    }
-
-    pub fn addDreamRecord(self: MemoryStore, dream: schema.DreamRecord) !void {
-        return self.addDreamRecordFn(self.ctx, dream);
-    }
-
-    pub fn loadExperiences(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.Experience {
-        return self.loadExperiencesFn(self.ctx, allocator);
-    }
-
-    pub fn addExperience(self: MemoryStore, experience: schema.Experience) !void {
-        return self.addExperienceFn(self.ctx, experience);
-    }
-
     pub fn sweepExpiredExperiences(self: MemoryStore, now_seconds: i64) !usize {
         return self.sweepExpiredExperiencesFn(self.ctx, now_seconds);
     }
@@ -192,15 +179,47 @@ pub const MemoryStore = struct {
         return self.sweepUnreferencedCapturesFn(self.ctx);
     }
 
-    pub fn sweepRuntimeEvents(self: MemoryStore) !usize {
-        return self.sweepRuntimeEventsFn(self.ctx);
+    pub fn pruneTombstonedCognitiveRecords(self: MemoryStore, now: []const u8) !schema.CognitivePruneResult {
+        return self.pruneTombstonedCognitiveRecordsFn(self.ctx, now);
     }
 
     pub fn retainCapture(self: MemoryStore, allocator: std.mem.Allocator, source_path: []const u8, label: []const u8) ![]const u8 {
         return self.retainCaptureFn(self.ctx, allocator, source_path, label);
     }
 
-    pub fn logEvent(self: MemoryStore, json_line: []const u8) !void {
-        return self.logEventFn(self.ctx, json_line);
-    }
+
+    pub fn addExperienceEvent(self: MemoryStore, event: schema.ExperienceEvent) !void { return self.addExperienceEventFn(self.ctx, event); }
+    pub fn loadExperienceEvents(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.ExperienceEvent { return self.loadExperienceEventsFn(self.ctx, allocator); }
+    pub fn setBrainMode(self: MemoryStore, mode: schema.BrainMode) !void { return self.setBrainModeFn(self.ctx, mode); }
+    pub fn loadBrainMode(self: MemoryStore) !schema.BrainMode { return self.loadBrainModeFn(self.ctx); }
+    pub fn upsertHostBinding(self: MemoryStore, binding: schema.HostBinding) !void { return self.upsertHostBindingFn(self.ctx, binding); }
+    pub fn loadHostBindings(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.HostBinding { return self.loadHostBindingsFn(self.ctx, allocator); }
+    pub fn upsertCapabilityStatus(self: MemoryStore, status: schema.CapabilityStatus) !void { return self.upsertCapabilityStatusFn(self.ctx, status); }
+    pub fn loadCapabilityStatuses(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.CapabilityStatus { return self.loadCapabilityStatusesFn(self.ctx, allocator); }
+    pub fn addCapabilityRequest(self: MemoryStore, request: schema.CapabilityRequest) !void { return self.addCapabilityRequestFn(self.ctx, request); }
+    pub fn addCapabilityResult(self: MemoryStore, result: schema.CapabilityResult) !void { return self.addCapabilityResultFn(self.ctx, result); }
+    pub fn upsertSelfTrust(self: MemoryStore, entry: schema.SelfTrustEntry) !void { return self.upsertSelfTrustFn(self.ctx, entry); }
+    pub fn loadSelfTrust(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.SelfTrustEntry { return self.loadSelfTrustFn(self.ctx, allocator); }
+    pub fn upsertDisposition(self: MemoryStore, disposition: schema.Disposition) !void { return self.upsertDispositionFn(self.ctx, disposition); }
+    pub fn loadDispositions(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.Disposition { return self.loadDispositionsFn(self.ctx, allocator); }
+    pub fn addActionPressure(self: MemoryStore, pressure: schema.ActionPressure) !void { return self.addActionPressureFn(self.ctx, pressure); }
+    pub fn loadActionPressures(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.ActionPressure { return self.loadActionPressuresFn(self.ctx, allocator); }
+    pub fn addActionOutcome(self: MemoryStore, outcome: schema.ActionOutcome) !void { return self.addActionOutcomeFn(self.ctx, outcome); }
+    pub fn loadActionOutcomes(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.ActionOutcome { return self.loadActionOutcomesFn(self.ctx, allocator); }
+    pub fn upsertActionOutcome(self: MemoryStore, outcome: schema.ActionOutcome) !void { return self.upsertActionOutcomeFn(self.ctx, outcome); }
+    pub fn loadCapabilityResults(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.CapabilityResult { return self.loadCapabilityResultsFn(self.ctx, allocator); }
+    pub fn loadCapabilityRequests(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.CapabilityRequest { return self.loadCapabilityRequestsFn(self.ctx, allocator); }
+    pub fn addDreamTimeRecord(self: MemoryStore, dream: schema.DreamTimeRecord) !void { return self.addDreamTimeRecordFn(self.ctx, dream); }
+    pub fn loadDreamTimeRecords(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.DreamTimeRecord { return self.loadDreamTimeRecordsFn(self.ctx, allocator); }
+    pub fn addMailboxItem(self: MemoryStore, item: schema.MailboxItem) !void { return self.addMailboxItemFn(self.ctx, item); }
+    pub fn loadMailboxItems(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.MailboxItem { return self.loadMailboxItemsFn(self.ctx, allocator); }
+    pub fn markMailboxItemRead(self: MemoryStore, mailbox_id: []const u8, read_at_ms: i64) !schema.MailboxItem { return self.markMailboxItemReadFn(self.ctx, mailbox_id, read_at_ms); }
+    pub fn addIdentityHypothesis(self: MemoryStore, hypothesis: schema.IdentityHypothesis) !void { return self.addIdentityHypothesisFn(self.ctx, hypothesis); }
+    pub fn loadIdentityHypotheses(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.IdentityHypothesis { return self.loadIdentityHypothesesFn(self.ctx, allocator); }
+    pub fn saveActiveActivity(self: MemoryStore, record: ?schema.ActivityRecord) !void { return self.saveActiveActivityFn(self.ctx, record); }
+    pub fn loadActiveActivity(self: MemoryStore, allocator: std.mem.Allocator) !?schema.ActivityRecord { return self.loadActiveActivityFn(self.ctx, allocator); }
+    pub fn saveActivityStack(self: MemoryStore, stack: []const schema.ActivityRecord) !void { return self.saveActivityStackFn(self.ctx, stack); }
+    pub fn loadActivityStack(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.ActivityRecord { return self.loadActivityStackFn(self.ctx, allocator); }
+    pub fn appendActivityHistory(self: MemoryStore, record: schema.ActivityRecord) !void { return self.appendActivityHistoryFn(self.ctx, record); }
+    pub fn loadActivityHistory(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.ActivityRecord { return self.loadActivityHistoryFn(self.ctx, allocator); }
 };

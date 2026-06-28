@@ -1,6 +1,10 @@
 # Zig build outputs
 .zig-cache/
+.zig-cache-test/
 zig-out/
+
+# Swift Package Manager (apple/AffectiveCore dashboard)
+.build/
 
 # Downloaded model weights
 models/
@@ -19,12 +23,13 @@ data/memory/*.json
 data/memory/*.sqlite*
 data/memory/face_embeddings/
 data/audio/
+data/captures/
 
 # Test outputs
-data/test/*.json
-data/test/*.jsonl
-data/test/*.log
-data/test/*.sqlite*
+data/test/**
+!data/test/image.png
+!data/test/image2.png
+!data/test/image3.png
 
 # Logs and temporary files
 *.log

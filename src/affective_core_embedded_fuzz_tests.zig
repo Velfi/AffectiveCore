@@ -11,17 +11,32 @@ const affective_core_embedded_dispatch_json = embedded.affective_core_embedded_d
 const affective_core_embedded_free_global_string = embedded.affective_core_embedded_free_global_string;
 const stringSlice = @import("affective_core_embedded_config.zig").stringSlice;
 
+threadlocal var embedded_fuzz_test_io_threaded: std.Io.Threaded = .init_single_threaded;
+
+fn embeddedFuzzTestIo() std.Io {
+    return embedded_fuzz_test_io_threaded.io();
+}
+
+fn prepareEmbeddedBrainRoot(io: std.Io, root: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var dst_buf: [512]u8 = undefined;
+    const dst = try std.fmt.bufPrint(&dst_buf, "{s}/llm_providers.json", .{root});
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "data/llm_providers.json", std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(bytes);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst, .data = bytes, .flags = .{ .truncate = true } });
+}
+
 test "embedded dispatch survives fuzzed host messages" {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = embeddedFuzzTestIo();
     const root = "data/test/embedded_fuzz";
     _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
     defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
-    try std.Io.Dir.cwd().createDirPath(io, root);
+    try prepareEmbeddedBrainRoot(io, root);
 
     const manifest =
         \\{
         \\  "platform": "android",
-        \\  "capabilities": ["typed_text", "poke_sequence", "tool_call", "event_envelope", "event_drain", "introspection", "orientation_query", "sense_observation"],
+        \\  "capabilities": ["text_input", "poke_sequence", "event_envelope", "event_drain", "orientation_query", "sense_observation"],
         \\  "feature_flags": {},
         \\  "max_envelope_bytes": 4096,
         \\  "max_event_count": 4,
@@ -32,10 +47,10 @@ test "embedded dispatch survives fuzzed host messages" {
     const cfg = AffectiveCoreEmbeddedConfig{
         .brain_id = str("default"),
         .brain_root = str(root),
+        .conversation_models = str("openai:gpt-4.1-nano"),
         .memory_path = str(root ++ "/memory/people.sqlite"),
         .graph_path = str(root ++ "/memory/relationships.sqlite"),
         .schedule_path = str(root ++ "/maintenance.md"),
-        .events_path = str(root ++ "/events.jsonl"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
         .host_manifest_json = str(manifest),
@@ -59,7 +74,6 @@ test "embedded dispatch survives fuzzed host messages" {
         "{}",
         "{\"event\":null}",
         "{\"request_id\":42,\"event\":{\"type\":false}}",
-        "{\"request_id\":\"seed\",\"event\":{\"type\":\"tool_call\",\"name\":\"remember_memory\",\"arguments\":[]}}",
         "{\"request_id\":\"seed\",\"event\":{\"type\":\"sense_observation\",\"sense\":\"orientation\",\"observation\":{\"confidence\":1.0e309,\"summary\":false}}}",
         "{\"request_id\":\"seed\",\"event\":{\"type\":\"poke_sequence\",\"pulses\":[null,{\"press_ms\":-999999999999,\"pause_before_ms\":\"bad\"},{\"press_ms\":1.0e308}]}}",
     };
@@ -144,15 +158,14 @@ fn appendRandomEvent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), rand
     try out.append(allocator, '{');
     try out.appendSlice(allocator, "\"type\":");
     const event_type = switch (random.intRangeLessThan(u8, 0, 10)) {
-        0 => "typed_text",
-        1 => "speech_transcript",
+        0 => "unsupported_text_event",
+        1 => "unsupported_speech_event",
         2 => "poke_sequence",
-        3 => "tool_call",
-        4 => "sense_observation",
-        5 => "raw_ref_lookup",
-        6 => "maintenance_tick",
-        7 => "autonomy_tick",
-        8 => "definitely_not_real",
+        3 => "sense_observation",
+        4 => "raw_ref_lookup",
+        5 => "maintenance_tick",
+        6 => "autonomy_tick",
+        7 => "definitely_not_real",
         else => "",
     };
     try appendJsonString(allocator, out, event_type);
@@ -165,11 +178,11 @@ fn appendRandomEvent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), rand
         1 => {
             try out.appendSlice(allocator, ",\"name\":");
             try appendJsonString(allocator, out, switch (random.intRangeLessThan(u8, 0, 5)) {
-                0 => "remember_memory",
-                1 => "recall_memory",
+                0 => "unsupported_memory_operation",
+                1 => "unsupported_recall_operation",
                 2 => "request_orientation",
                 3 => "raw_ref_lookup",
-                else => "missing_tool",
+                else => "missing_operation",
             });
             try out.appendSlice(allocator, ",\"arguments\":");
             try appendRandomArguments(allocator, out, random, index);

@@ -27,7 +27,7 @@ const camera_mod = ports.camera;
 const speaker_mod = ports.speaker;
 const input_mod = ports.input;
 const button_mod = ports.button;
-const command_log_mod = ports.command_log;
+const event_log_mod = ports.event_log;
 const facial_expression = ports.facial_expression;
 const system_senses_mod = ports.system_senses;
 const time_mod = @import("time.zig");
@@ -40,10 +40,28 @@ const vector_index = @import("vector_index.zig");
 const emotion = @import("emotion.zig");
 const process = ports.process;
 const helpers = @import("brain_helpers.zig");
+const subsystems = @import("subsystems.zig");
+const memory_selection_mod = @import("memory_selection.zig");
+const read_models = @import("read_models.zig");
+const experience_kinds = @import("experience_kinds.zig");
+const recognition_composite = @import("recognition_composite.zig");
+const belief_updates = @import("belief_updates.zig");
+const experiential_observations = @import("experiential_observations.zig");
+const brain_dream_memory = @import("brain_dream_memory.zig");
+const brain_autonomy = @import("brain_autonomy.zig");
+const brain_context_stats = @import("brain_context_stats.zig");
+const brain_process = @import("brain_process.zig");
+const process_goal_resolver = @import("process_goal_resolver.zig");
+const actor_payloads = @import("actors/payloads.zig");
+const runtime_bridge = @import("brain_runtime_bridge.zig");
+const cognitive_capacity = @import("cognitive_capacity.zig");
+const context_composition = @import("context_composition.zig");
+const activity_mod = @import("activity.zig");
+const stimulus_mod = @import("stimulus.zig");
 
 const Brain = brain_mod.Brain;
 const BrainDeps = brain_mod.BrainDeps;
-const CommandBatchResult = brain_mod.CommandBatchResult;
+const ActionPressureBatchResult = brain_mod.ActionPressureBatchResult;
 const ConversationTurnResult = brain_mod.ConversationTurnResult;
 const ConversationSpeakerContext = brain_mod.Brain.ConversationSpeakerContext;
 const QuietHours = brain_mod.Brain.QuietHours;
@@ -60,7 +78,67 @@ pub fn init(allocator: std.mem.Allocator, cfg: config_mod.Config, deps: BrainDep
         if (deps.io) |io| clock.nowSeconds(io) catch 0 else 0
     else
         0;
-    return .{ .allocator = allocator, .cfg = cfg, .deps = deps, .now_seconds = initial_now };
+    const brain: Brain = .{
+        .allocator = allocator,
+        .cfg = cfg,
+        .deps = deps,
+        .runtime = brain_mod.BrainRuntime.init(allocator, .{}),
+        .now_seconds = initial_now,
+        .context_stats = brain_context_stats.State.init(allocator),
+    };
+    return brain;
+}
+
+pub fn clearChatParseFailure(self: *Brain) void {
+    if (self.chat_parse_failure_body) |body| {
+        self.allocator.free(body);
+        self.chat_parse_failure_body = null;
+    }
+}
+
+pub fn rememberChatParseFailure(self: *Brain, body: []const u8) !void {
+    self.clearChatParseFailure();
+    self.chat_parse_failure_body = try self.allocator.dupe(u8, body);
+}
+
+pub fn chatParseFailureBody(self: *Brain) ?[]const u8 {
+    return self.chat_parse_failure_body;
+}
+
+pub fn executeRuntimeProposalBatch(self: *Brain, proposals: []chat_mod.ActionProposal, observations: *std.ArrayList(u8)) !ActionPressureBatchResult {
+    return runtime_bridge.executeProposalBatch(self, proposals, observations);
+}
+
+pub fn executeRuntimeAutonomyBatch(self: *Brain, proposals: []chat_mod.ActionProposal, observations: *std.ArrayList(u8)) !ActionPressureBatchResult {
+    return runtime_bridge.executeAutonomyBatch(self, proposals, observations);
+}
+
+pub fn publishRuntimeMemoryCandidate(self: *Brain, payload_json: []const u8, source_actor: []const u8) !void {
+    try runtime_bridge.publishMemoryCandidate(self, payload_json, source_actor);
+}
+
+pub fn publishRuntimeMemoryConsolidation(self: *Brain, payload_json: []const u8, source_actor: []const u8) !void {
+    try runtime_bridge.publishMemoryConsolidation(self, payload_json, source_actor);
+}
+
+pub fn publishRuntimeLearningCapabilityRecorded(
+    self: *Brain,
+    payload: actor_payloads.LearningCapabilityRecordedPayload,
+    source_actor: []const u8,
+) !void {
+    try runtime_bridge.publishLearningCapabilityRecorded(self, payload, source_actor);
+}
+
+pub fn publishRuntimeLearningCorrectionRecorded(
+    self: *Brain,
+    payload: actor_payloads.LearningCorrectionRecordedPayload,
+    source_actor: []const u8,
+) !void {
+    try runtime_bridge.publishLearningCorrectionRecorded(self, payload, source_actor);
+}
+
+pub fn queryRuntimeMemoryAudit(self: *Brain, belief_id: []const u8) ![]const u8 {
+    return runtime_bridge.queryMemoryAuditFormatted(self, belief_id);
 }
 
 pub fn seedFromFile(self: *Brain, io: std.Io, path: []const u8) !void {
@@ -79,65 +157,25 @@ pub fn seedDocument(self: *Brain, doc: seed_mod.SeedDocument) !void {
     }
 }
 
-pub fn handleFaceMemoryActivation(self: *Brain) !void {
-    try handleTouchStimulus(self, "short_touch");
+pub fn handleFaceMemoryActivation(self: *Brain) !?ConversationTurnResult {
+    return try handleTouchStimulus(self, "short_touch");
 }
 
-pub fn performFaceMemoryActivation(self: *Brain) !void {
-    try handleTouchActivation(self, "button_activated", "person present but not recognized; touch stimulus made this person salient; curiosity is active; if the person offers a name or identity, remember_person is an available skill", "touch stimulus received; recognition found no known person; curiosity is active; if the person offers a name or identity, remember_person is an available skill");
+pub fn handleLongTouchActivation(self: *Brain) !?ConversationTurnResult {
+    return try handleTouchStimulus(self, "long_touch");
 }
 
-pub fn handleLongTouchActivation(self: *Brain) !void {
-    try handleTouchStimulus(self, "long_touch");
-}
-
-pub fn handleTouchStimulus(self: *Brain, touch_kind: []const u8) !void {
+pub fn handleTouchStimulus(self: *Brain, touch_kind: []const u8) !?ConversationTurnResult {
     const assignment = try self.assignTouchStimulus(touch_kind);
-    self.setCurrentStimulusContext(assignment.stimulus_context);
     try self.refreshFocus();
     try self.logSimple(.Idle, null, null, null, assignment.stimulus_context);
-    if (!assignment.should_look) {
-        try self.appendCommandLog("state", "Touch stimulus", assignment.stimulus_context);
-        return;
-    }
-    if (std.mem.eql(u8, touch_kind, "long_touch")) {
-        try handleTouchActivation(self, "long_touch_activated", "person present but not recognized; long touch stimulus made this person salient; no speech words were transcribed; curiosity is active; if the person offers a name or identity, remember_person is an available skill", "long touch stimulus received; no speech words were transcribed; recognition found no known person; curiosity is active; if the person offers a name or identity, remember_person is an available skill");
-    } else {
-        try performFaceMemoryActivation(self);
-    }
-}
-
-pub fn handleTouchActivation(self: *Brain, activation_note: []const u8, present_status: []const u8, none_status: []const u8) !void {
-    self.conversation_speaker_context = null;
-    self.last_conversation_turn_seconds = null;
-    try self.logSimple(.Idle, null, null, null, activation_note);
-    try self.logState(.Capture);
-    var capture = try self.deps.camera.capture(self.allocator);
-    self.rememberVisualUpdate(capture.path);
-    self.last_visual_observation_uploaded = false;
-    self.outputImageCapture(capture);
-
-    try self.logState(.Identify);
-    const result = try self.deps.recognizer.identify(self.allocator, capture.path);
-    self.outputRecognitionResult(result);
-
-    try self.retainCaptureForPersonMemory(&capture);
-
-    switch (result.match_status) {
-        .known => try self.handleKnown(capture, result),
-        .unknown, .multiple => try self.handleUnknown(capture, result, present_status),
-        .uncertain => try self.handleUncertain(capture, result),
-        .none => try self.handleUnknown(capture, result, none_status),
-    }
+    return try self.reactToSalientSense(assignment.packet);
 }
 
 pub fn forgetByNameOrId(self: *Brain, name_or_id: []const u8) !bool {
     try self.logState(.ForgetPerson);
     const forgotten = try self.deps.store.forgetPerson(name_or_id);
-    const text = try self.generateSimpleGreeting(.forget_profile);
-    self.outputBrain(text);
-    try self.say(text);
-    try self.logSimple(.ForgetPerson, null, null, text, if (forgotten) "profile_forgotten" else "profile_not_found");
+    try self.logSimple(.ForgetPerson, null, null, null, if (forgotten) "profile_forgotten" else "profile_not_found");
     return forgotten;
 }
 
@@ -151,12 +189,12 @@ pub fn handleConversationTurn(self: *Brain) !void {
     self.trace("conversation.input.ask.start");
     const heard_speech = try self.deps.input.ask(self.allocator, "I'm listening.");
     self.traceText("conversation.input.ask.done", heard_speech.text);
-    _ = try handleConversationText(self, heard_speech);
+    _ = try handleConversationText(self, heard_speech, .{});
 }
 
 pub fn handleButtonAction(self: *Brain, action: button_mod.ButtonAction) !void {
     switch (action) {
-        .short_touch => try handleFaceMemoryActivation(self),
+        .short_touch => _ = try handleFaceMemoryActivation(self),
         .held_input => try handleHoldActivation(self),
         .text_input => try handleConversationTurn(self),
     }
@@ -164,11 +202,11 @@ pub fn handleButtonAction(self: *Brain, action: button_mod.ButtonAction) !void {
 
 pub fn handleTouchStimulusError(self: *Brain, err: anyerror) !bool {
     if (err == error.ShortTouchStimulus) {
-        try handleFaceMemoryActivation(self);
+        _ = try handleFaceMemoryActivation(self);
         return true;
     }
     if (err == error.LongTouchStimulus) {
-        try handleLongTouchActivation(self);
+        _ = try handleLongTouchActivation(self);
         return true;
     }
     return false;
@@ -181,17 +219,17 @@ pub fn handleHoldActivation(self: *Brain) !void {
     const heard_speech = self.deps.input.ask(self.allocator, "I'm listening.") catch |err| {
         if (err == error.ShortTouchStimulus) {
             self.trace("hold.input.short_touch");
-            try handleFaceMemoryActivation(self);
+            _ = try handleFaceMemoryActivation(self);
             return;
         }
         if (err == error.HoldReleasedBeforeRecordingStarted) {
             self.trace("hold.input.released_before_recording.long_touch");
-            try handleLongTouchActivation(self);
+            _ = try handleLongTouchActivation(self);
             return;
         }
         if (err == error.LongTouchStimulus) {
             self.trace("hold.input.no_speech.long_touch");
-            try handleLongTouchActivation(self);
+            _ = try handleLongTouchActivation(self);
             return;
         }
         return @errorCast(err);
@@ -200,7 +238,7 @@ pub fn handleHoldActivation(self: *Brain) !void {
     self.traceText("hold.input.ask.done", user_text);
     if (helpers.isBlankText(user_text)) {
         self.trace("hold.input.blank.long_touch");
-        try handleLongTouchActivation(self);
+        _ = try handleLongTouchActivation(self);
         return;
     }
     self.trace("conversation.start");
@@ -208,13 +246,18 @@ pub fn handleHoldActivation(self: *Brain) !void {
     self.trace("conversation.expire_idle.start");
     try expireConversationIfIdle(self);
     self.trace("conversation.expire_idle.done");
-    _ = try handleConversationText(self, heard_speech);
+    _ = try handleConversationText(self, heard_speech, .{});
 }
 
 /// Tell the language mind whether this turn is the start of a fresh social
 /// situation versus a continuation, plus whether it can pull the camera to see
 /// who is present. These are facts for the bot to reason over — it decides
 /// whether to look, wait, or simply respond; there is no scripted greeting.
+pub fn classifyIntent(self: *Brain, context: intent_mod.IntentContext, text: []const u8) !intent_mod.IntentResult {
+    try self.traceContextComposition(context_composition.auditIntent(context, text));
+    return self.deps.intent_service.classify(self.allocator, context, text);
+}
+
 pub fn appendSocialContextObservation(self: *Brain, out: *std.ArrayList(u8)) !void {
     const timeout: i64 = @intCast(self.cfg.conversation_idle_timeout_seconds);
     const since_turn: i64 = if (self.last_conversation_turn_seconds) |t| @max(0, self.now_seconds - t) else -1;
@@ -227,123 +270,385 @@ pub fn appendSocialContextObservation(self: *Brain, out: *std.ArrayList(u8)) !vo
     );
 }
 
-pub fn handleConversationText(self: *Brain, heard_speech: input_mod.HeardSpeech) !ConversationTurnResult {
-    const user_text = heard_speech.text;
-    // A new user turn supersedes any camera pull still marked from a prior turn,
-    // so a never-delivered observation cannot wedge later recognitions.
-    self.pending_camera_intent = .none;
-    const stimulus_assignment = try self.assignSpeechStimulus(heard_speech);
-    self.setCurrentStimulusContext(stimulus_assignment.stimulus_context);
-    // Update working memory now that this turn's stimulus is fresh, so the focus
-    // block reflects what is happening as the bot composes its reply.
-    try self.refreshFocus();
-    var speaker_context = stimulus_assignment.speaker_context;
-    const heard_speech_raw = try self.heardSpeechRaw(heard_speech);
-    self.trace("conversation.memory.user_experience.start");
-    try self.recordMemoryCandidateEvent(.user_utterance, "human", "conversation_turn", user_text, .human, .utterance, .summarize, "conversation_turn", heard_speech_raw, user_text, &.{}, &[_][]const u8{ "conversation", "heard_speech" });
-    self.trace("conversation.memory.user_experience.done");
-    self.trace("conversation.impression.start");
-    const user_impression = try self.createImpression(.user_speech, user_text, &[_][]const u8{"conversation"});
-    try self.deps.store.addImpression(user_impression);
-    self.trace("conversation.impression.done");
-    self.trace("conversation.appraisal.start");
-    const user_appraisal = try self.createAppraisal(user_text, user_impression.impression_id, &[_][]const u8{"conversation"});
-    try self.deps.store.addAppraisal(user_appraisal);
-    try self.recordMemoryCandidateEvent(.observation, "brain", "user_speech_appraisal", user_appraisal.freeform, .brain, .appraisal, .keep_disposition, "user_speech_appraisal", user_text, user_appraisal.freeform, &.{}, user_appraisal.tags);
-    _ = try self.detectWantAchievements(user_text);
-    self.trace("conversation.appraisal.done");
-    self.trace("conversation.intent.identity_claim.start");
-    const identity_claim = try self.deps.intent_service.classify(self.allocator, .identity_claim, user_text);
-    self.traceIntent("conversation.intent.identity_claim.done", identity_claim.action);
-    if (identity_claim.action == .claim_identity and speaker_context == null) {
-        self.trace("conversation.speaker_context.identity_claim.start");
-        speaker_context = try self.conversationSpeakerContext();
-        self.trace("conversation.speaker_context.identity_claim.done");
-    }
-    if (speaker_context) |context| if (try self.handleIdentityClaim(identity_claim, context)) {
-        const label = if (self.conversation_speaker_context) |updated_context| updated_context.chat_label else context.chat_label;
-        try self.logUserUtterance(label, user_text);
-        self.last_conversation_turn_seconds = self.now_seconds;
-        self.trace("conversation.done.identity_claim");
-        return .{
-            .user_text = user_text,
-            .spoken_text = "",
-            .user_summary = user_text,
-            .brain_summary = "recognized identity claim",
-        };
+pub fn setWaitingFor(self: *Brain, kind: Brain.WaitingKind, intent: []const u8) !void {
+    self.clearWaitingFor();
+    self.waiting_for = .{
+        .kind = kind,
+        .intent = try self.allocator.dupe(u8, intent),
+        .since = self.now_seconds,
     };
-    self.trace("conversation.intent.provide_name.start");
-    const immediate = try self.deps.intent_service.classify(self.allocator, .provide_name, user_text);
-    self.traceIntent("conversation.intent.provide_name.done", immediate.action);
-    if (try self.handleImmediateIntent(immediate)) {
-        try self.logUserUtterance(if (speaker_context) |context| context.chat_label else "User", user_text);
-        self.trace("conversation.done.immediate_intent");
-        return .{
-            .user_text = user_text,
-            .spoken_text = "",
-            .user_summary = user_text,
-            .brain_summary = "handled immediate intent",
-        };
-    }
+    try brain_process.syncActivityContextFromBrain(self);
+}
 
-    self.trace("conversation.observations.start");
+pub fn clearWaitingFor(self: *Brain) void {
+    const waiting = self.waiting_for orelse return;
+    self.allocator.free(waiting.intent);
+    self.waiting_for = null;
+}
+
+pub fn appendReadModelsObservation(self: *Brain, out: *std.ArrayList(u8)) !void {
+    const snapshot = try read_models.readModelsSnapshot(self, self.allocator);
+    const salient_belief = if (snapshot.belief_model.salient) |belief| belief.proposition else "none";
+    const self_trust_text = if (snapshot.self_trust_model.strongest) |entry|
+        try std.fmt.allocPrint(self.allocator, "{s}={d:.2}", .{ entry.faculty, entry.confidence })
+    else
+        try self.allocator.dupe(u8, "none");
+    defer self.allocator.free(self_trust_text);
+    const disposition = if (snapshot.disposition_model.strongest) |entry| entry.action_tendency else "none";
+    const focus_text = if (self.current_focus) |focus|
+        try std.fmt.allocPrint(self.allocator, "{s} ({s})", .{ focus.text, @tagName(focus.source) })
+    else
+        try self.allocator.dupe(u8, "none");
+    defer self.allocator.free(focus_text);
+    const stimulus_text = self.current_stimulus_context orelse "none";
+    try out.print(
+        self.allocator,
+        "read_models_snapshot:\n- brain_mode: {s}\n- salient_belief: {s}\n- strongest_self_trust: {s}\n- winning_disposition: {s}\n- current_focus: {s}\n- current_stimulus: {s}\n- host_capabilities: available={d} unavailable={d} degraded={d}\n",
+        .{
+            @tagName(snapshot.brain_mode),
+            salient_belief,
+            self_trust_text,
+            disposition,
+            focus_text,
+            stimulus_text,
+            snapshot.host_capability_model.available_count,
+            snapshot.host_capability_model.unavailable_count,
+            snapshot.host_capability_model.degraded_count,
+        },
+    );
+    try cognitive_capacity.appendCapacityObservation(self.allocator, self.cfg.capacity, snapshot.capacity_model, out);
+}
+
+pub fn appendHostCapabilityObservationIfChanged(self: *Brain, out: *std.ArrayList(u8)) !void {
+    const statuses = try self.deps.store.loadCapabilityStatuses(self.allocator);
+    var digest = std.ArrayList(u8).empty;
+    defer digest.deinit(self.allocator);
+    for (statuses) |status| {
+        const part = try std.fmt.allocPrint(self.allocator, "{s}:{s};", .{ status.capability_id, @tagName(status.availability) });
+        defer self.allocator.free(part);
+        try digest.appendSlice(self.allocator, part);
+    }
+    const digest_text = try digest.toOwnedSlice(self.allocator);
+    defer self.allocator.free(digest_text);
+    if (self.last_host_capability_digest) |previous| {
+        if (std.mem.eql(u8, previous, digest_text)) return;
+        self.allocator.free(previous);
+    }
+    self.last_host_capability_digest = try self.allocator.dupe(u8, digest_text);
+    try out.print(
+        self.allocator,
+        "host_capability_summary:\n- binding_changed: true\n- digest: {s}\n",
+        .{digest_text},
+    );
+}
+
+const ConversationPassResult = struct {
+    spoken_text: []const u8,
+    final_turn: ?chat_mod.ChatTurn,
+    pending_interrupt: ?interrupt_mod.Stimulus,
+    awaiting_host_sense: bool,
+};
+
+pub fn clearPendingConversationPause(self: *Brain) void {
+    brain_process.clearActiveActivity(self);
+}
+
+pub const salient_sense_attention_threshold: f32 = 0.55;
+
+fn isOrchestrationAnchor(text: []const u8) bool {
+    if (std.mem.startsWith(u8, text, "self-defined want:")) return true;
+    if (std.mem.startsWith(u8, text, "self-defined goal:")) return true;
+    if (std.mem.startsWith(u8, text, "A salient ")) return true;
+    if (std.mem.startsWith(u8, text, "A scheduled wait has ended.")) return true;
+    return false;
+}
+
+fn appendHostSenseDeliveredObservation(self: *Brain, observations: *std.ArrayList(u8), delivered_line: []const u8) !void {
+    try observations.appendSlice(
+        self.allocator,
+        "host_sense_delivered:\n- note: host fulfilled a pending pull sense; continue the active goal from context.\n",
+    );
+    try observations.appendSlice(self.allocator, delivered_line);
+}
+
+fn shouldFollowUpAfterHostSenseDelivery(self: *Brain) bool {
+    const active = self.active_activity orelse return false;
+    if (active.status != .active) return false;
+    return active.kind == .conversation or isOrchestrationAnchor(active.goal);
+}
+
+pub fn runHostSenseFollowUpChat(self: *Brain, delivered_line: []const u8) !?ConversationTurnResult {
+    if (!shouldFollowUpAfterHostSenseDelivery(self)) return null;
+    if (self.activity_stack.items.len > 0) {
+        try brain_process.collapseActivityStack(self, "host sense follow-up collapsed stale stack");
+    }
+    const anchor = self.active_activity.?.goal;
+
+    const memory = try self.buildConversationMemory();
+    defer self.allocator.free(memory);
+
     var observations = std.ArrayList(u8).empty;
-    try self.appendHeardSpeechObservation(&observations, heard_speech);
-    self.traceCount("conversation.observations.heard_speech.done", observations.items.len);
-    const uploaded_observation = try self.uploadedMediaObservation(user_text);
-    if (uploaded_observation) |line| try observations.appendSlice(self.allocator, line);
-    self.traceCount("conversation.observations.uploaded.done", observations.items.len);
-    if (speaker_context == null and uploaded_observation == null) self.trace("conversation.speaker_context.deferred");
-    try self.logUserUtterance(if (speaker_context) |context| context.chat_label else "User", user_text);
-    self.trace("conversation.memory.build.start");
-    const memory = try self.buildConversationMemoryWithSpeaker(if (speaker_context) |context| context.memory_line else null);
-    self.traceCount("conversation.memory.build.done", memory.len);
-    self.trace("conversation.affordances.start");
+    defer observations.deinit(self.allocator);
+    try appendHostSenseDeliveredObservation(self, &observations, delivered_line);
     try self.appendAffordanceObservation(&observations);
-    try self.appendSocialContextObservation(&observations);
-    self.traceCount("conversation.affordances.done", observations.items.len);
-    const had_pending_hard_error = self.pending_hard_error != null;
-    try self.appendPendingHardErrorObservation(&observations);
-    if (had_pending_hard_error) self.pending_hard_error = null;
-    var spoken_text: []const u8 = "";
-    var final_turn: ?chat_mod.ChatTurn = null;
-    var pending_interrupt: ?interrupt_mod.Stimulus = null;
-    var i: usize = 0;
-    while (i < 3) : (i += 1) {
-        self.traceTurn("conversation.chat.respond.start", i, observations.items.len);
-        const turn = try self.deps.chat_service.respond(self.allocator, memory, user_text, observations.items);
-        self.traceTurnCommands("conversation.chat.respond.done", i, turn.commands.len, turn.conversation_done);
-        final_turn = turn;
-        self.traceTurn("conversation.commands.start", i, observations.items.len);
-        const batch = self.executeChatCommands(turn.commands, &observations) catch |err| {
-            if (err == error.FrontendCaptureRequested or err == error.FrontendOrientationRequested) {
-                // The host effect is already queued; the observation arrives as a
-                // separate awaited sense, so this turn pauses without fabricating a
-                // reply.
-                final_turn = turn;
-                break;
-            }
-            spoken_text = try self.handleHardCommandError(err);
-            final_turn = turn;
-            break;
-        };
-        self.traceCommandBatch("conversation.commands.done", i, batch, observations.items.len);
-        if (batch.spoken_text) |text| {
-            spoken_text = text;
-        }
-        if (batch.interrupted_by) |stimulus| {
-            pending_interrupt = stimulus;
-            break;
-        }
-        if (turn.conversation_done or batch.ended_with_speech) break;
+    try appendReadModelsObservation(self, &observations);
+    try brain_process.appendActivityObservation(self, &observations);
+    try experiential_observations.appendRecentExperienceObservation(self, &observations, null);
+    try experiential_observations.appendWaitingForObservation(self, &observations);
+    try appendHostCapabilityObservationIfChanged(self, &observations);
+
+    self.conversation_user_text = anchor;
+    defer self.conversation_user_text = null;
+
+    if (!try chat_mod.chatPromptWithinBudget(self.allocator, memory, anchor, observations.items, self.cfg.capacity.chat_context_tokens_max)) {
+        try self.recordContextBudgetExceeded();
+        return null;
     }
 
+    const loop_result = try runSingleChatPass(self, memory, &.{}, anchor, &observations);
+    const result = try finalizeConversationTurn(
+        self,
+        anchor,
+        memory,
+        loop_result.spoken_text,
+        loop_result.final_turn,
+        observations.items,
+        loop_result.pending_interrupt,
+        false,
+    );
+    try finishActivityTurn(self, anchor, loop_result.spoken_text, loop_result.final_turn);
+    return try brain_process.attachActivityFields(self, result);
+}
+
+fn finishActivityTurn(
+    self: *Brain,
+    user_text: []const u8,
+    spoken_text: []const u8,
+    turn: ?chat_mod.ChatTurn,
+) !void {
+    const turn_complete = if (turn) |chat_turn| chat_turn.turn_complete else false;
+    const cont = try brain_process.classifyTurnContinuation(self, user_text, turn_complete);
+    try brain_process.applyTurnContinuation(self, cont, user_text, spoken_text, turn, turn_complete);
+}
+
+pub fn clearPendingDeferredSpeech(self: *Brain) void {
+    const deferred = self.pending_deferred_heard_speech orelse return;
+    self.pending_deferred_heard_speech = null;
+    freeHeardSpeechFields(self, deferred);
+}
+
+fn stashDeferredSpeech(self: *Brain, heard_speech: input_mod.HeardSpeech) !void {
+    clearPendingDeferredSpeech(self);
+    self.pending_deferred_heard_speech = try cloneHeardSpeech(self, heard_speech);
+}
+
+fn takePendingDeferredSpeech(self: *Brain) ?input_mod.HeardSpeech {
+    const deferred = self.pending_deferred_heard_speech orelse return null;
+    self.pending_deferred_heard_speech = null;
+    return deferred;
+}
+
+fn drainDeferredConversationSpeech(self: *Brain, result: ConversationTurnResult) !ConversationTurnResult {
+    var latest = result;
+    while (takePendingDeferredSpeech(self)) |deferred| {
+        defer freeHeardSpeechFields(self, deferred);
+        latest = try runConversationTurnBody(self, deferred);
+    }
+    return latest;
+}
+
+pub fn drainPendingDeferredConversation(self: *Brain) !?ConversationTurnResult {
+    if (self.pending_deferred_heard_speech == null) return null;
+    return try drainDeferredConversationSpeech(self, .{
+        .user_text = "",
+        .spoken_text = "",
+        .user_summary = "",
+        .brain_summary = "deferred conversation processed",
+    });
+}
+
+fn freeHeardSpeechFields(self: *Brain, heard_speech: input_mod.HeardSpeech) void {
+    self.allocator.free(heard_speech.text);
+    if (heard_speech.provider) |provider| self.allocator.free(provider);
+    if (heard_speech.model_path) |model_path| self.allocator.free(model_path);
+    if (heard_speech.audio_path) |audio_path| self.allocator.free(audio_path);
+    if (heard_speech.raw_provider_json_path) |raw_path| self.allocator.free(raw_path);
+    if (heard_speech.summary_json) |summary_json| self.allocator.free(summary_json);
+}
+
+fn cloneHeardSpeech(self: *Brain, heard_speech: input_mod.HeardSpeech) !input_mod.HeardSpeech {
+    return .{
+        .text = try self.allocator.dupe(u8, heard_speech.text),
+        .source = heard_speech.source,
+        .provider = if (heard_speech.provider) |provider| try self.allocator.dupe(u8, provider) else null,
+        .model_path = if (heard_speech.model_path) |model_path| try self.allocator.dupe(u8, model_path) else null,
+        .audio_path = if (heard_speech.audio_path) |audio_path| try self.allocator.dupe(u8, audio_path) else null,
+        .raw_provider_json_path = if (heard_speech.raw_provider_json_path) |raw_path| try self.allocator.dupe(u8, raw_path) else null,
+        .summary_json = if (heard_speech.summary_json) |summary_json| try self.allocator.dupe(u8, summary_json) else null,
+    };
+}
+
+fn visualObservationLine(self: *Brain, path: []const u8, source: []const u8) ![]const u8 {
+    if (self.fulfillAwaitedHostRequestIfMatches("camera", "recognize")) {
+        return try self.recognizeFromCapturedPath(path);
+    }
+    if (self.fulfillAwaitedHostRequestIfMatches("camera", "take_picture")) {
+        const description = try self.deps.description_service.describePerson(self.allocator, path, "");
+        return try std.fmt.allocPrint(self.allocator, "picture: {s}\n", .{description.description});
+    }
+    if (try self.uploadedImageObservation(path, source)) |line| return line;
+    return try std.fmt.allocPrint(
+        self.allocator,
+        "sensed_image:\n- image: {s}\n- source: {s}\n",
+        .{ path, source },
+    );
+}
+
+pub const HostVisualObservationResult = union(enum) {
+    conversation_resume: ConversationTurnResult,
+    recognition_only: []const u8,
+    salient_reaction: ConversationTurnResult,
+    detail_only: []const u8,
+};
+
+/// Deliver a host-provided image path into the brain, record the observation,
+/// and optionally run a follow-up chat pass when an active conversation is waiting
+/// on the delivered pull sense.
+pub fn handleHostVisualObservation(
+    self: *Brain,
+    path: []const u8,
+    source: []const u8,
+    mime_type: []const u8,
+) !HostVisualObservationResult {
+    const owned_path = try self.allocator.dupe(u8, path);
+    self.rememberVisualUpdate(owned_path);
+    self.last_visual_observation_uploaded = false;
+
+    const metadata = try std.fmt.allocPrint(self.allocator, "path={s} mime_type={s} source={s}", .{ owned_path, mime_type, source });
+    const packet = try self.observeSenseStimulus(.{
+        .kind = .visual,
+        .source = "affective_camera",
+        .signature = owned_path,
+        .raw_magnitude = 0.75,
+        .threat = 0,
+        .curiosity = 0.50,
+        .metadata = metadata,
+    });
+
+    const observation_line = try visualObservationLine(self, owned_path, source);
+
+    if (try runHostSenseFollowUpChat(self, observation_line)) |conversation| {
+        return .{ .conversation_resume = conversation };
+    }
+
+    if (try self.reactToSalientSense(packet)) |conversation| {
+        return .{ .salient_reaction = conversation };
+    }
+    if (std.mem.indexOf(u8, observation_line, "Current speaker recognition:") != null or
+        std.mem.indexOf(u8, observation_line, "picture:") != null)
+    {
+        return .{ .recognition_only = observation_line };
+    }
+    const detail = try std.fmt.allocPrint(self.allocator, "camera: observed image at {s}", .{owned_path});
+    return .{ .detail_only = detail };
+}
+
+fn syntheticConversationTurn(
+    self: *Brain,
+    user_text: []const u8,
+    brain_summary: []const u8,
+) !chat_mod.ChatTurn {
+    return .{
+        .action_pressures = &.{},
+        .user_summary = try self.allocator.dupe(u8, user_text),
+        .brain_summary = try self.allocator.dupe(u8, brain_summary),
+        .turn_complete = true,
+    };
+}
+
+fn recordConversationPassFailure(
+    self: *Brain,
+    user_text: []const u8,
+    err: anyerror,
+    pass_result: *ConversationPassResult,
+) !void {
+    pass_result.spoken_text = try self.handleHardActionError(err);
+    pass_result.final_turn = try syntheticConversationTurn(
+        self,
+        user_text,
+        "Runtime failed before chat interpretation finished; surfaced the error to the user.",
+    );
+}
+
+fn runSingleChatPass(
+    self: *Brain,
+    memory: []const u8,
+    memory_sections: []const context_composition.SectionStat,
+    user_text: []const u8,
+    observations: *std.ArrayList(u8),
+) !ConversationPassResult {
+    if (!try chat_mod.chatPromptWithinBudget(self.allocator, memory, user_text, observations.items, self.cfg.capacity.chat_context_tokens_max)) {
+        const audit = try chat_mod.auditChatPrompt(self.allocator, memory, user_text, observations.items);
+        self.traceCount("conversation.runtime.turn.skipped context_budget", audit.user_prompt_tokens);
+        try self.recordContextBudgetExceeded();
+        return .{
+            .spoken_text = "",
+            .final_turn = try syntheticConversationTurn(
+                self,
+                user_text,
+                "Conversation prompt exceeded context budget; skipped chat interpretation.",
+            ),
+            .pending_interrupt = null,
+            .awaiting_host_sense = false,
+        };
+    }
+    self.traceTurn("conversation.runtime.turn.start", 0, observations.items.len);
+    const runtime_turn = runtime_bridge.runConversationPass(self, memory, memory_sections, user_text, observations, 0) catch |err| {
+        var failure: ConversationPassResult = .{
+            .spoken_text = "",
+            .final_turn = null,
+            .pending_interrupt = null,
+            .awaiting_host_sense = false,
+        };
+        try recordConversationPassFailure(self, user_text, err, &failure);
+        return failure;
+    };
+    const turn = runtime_turn.turn;
+    self.traceTurnActionPressures("conversation.runtime.turn.done", 0, turn.action_pressures.len, turn.turn_complete);
+    if (runtime_turn.execution_error) |exec_err| {
+        return .{
+            .spoken_text = try self.handleHardActionError(exec_err),
+            .final_turn = turn,
+            .pending_interrupt = null,
+            .awaiting_host_sense = false,
+        };
+    }
+    const batch = runtime_turn.batch;
+    self.traceActionPressureBatch("conversation.action_pressures.done", 0, batch, observations.items.len);
+    return .{
+        .spoken_text = batch.spoken_text orelse "",
+        .final_turn = turn,
+        .pending_interrupt = batch.interrupted_by,
+        .awaiting_host_sense = false,
+    };
+}
+
+fn finalizeConversationTurn(
+    self: *Brain,
+    user_text: []const u8,
+    memory: []const u8,
+    spoken_text: []const u8,
+    final_turn: ?chat_mod.ChatTurn,
+    observations: []const u8,
+    pending_interrupt: ?interrupt_mod.Stimulus,
+    had_pending_hard_error: bool,
+) !ConversationTurnResult {
+    _ = memory;
+    _ = observations;
     self.trace("conversation.summary.timestamp.start");
     const now = try self.timestampNow();
     self.trace("conversation.summary.timestamp.done");
-    if (final_turn == null) self.trace("conversation.summary.extra_respond.start");
-    const summary_turn = final_turn orelse try self.deps.chat_service.respond(self.allocator, memory, user_text, observations.items);
-    if (final_turn == null) self.trace("conversation.summary.extra_respond.done");
+    const summary_turn = final_turn orelse return error.MissingRuntimeChatTurnSummary;
     self.trace("conversation.summary.store.start");
     try self.deps.store.addConversationSummary(.{
         .summary_id = try std.fmt.allocPrint(self.allocator, "conversation_{d}_{d}", .{ self.now_seconds, self.now_seconds + @as(i64, @intCast(user_text.len)) }),
@@ -355,9 +660,10 @@ pub fn handleConversationText(self: *Brain, heard_speech: input_mod.HeardSpeech)
     try self.recordMemoryCandidateEvent(.memory_mutation, "memory", "conversation_summary", summary_text, .memory, .summary, .keep_fact, "conversation_summary", user_text, summary_text, &.{}, &[_][]const u8{ "conversation", "summary" });
     self.trace("conversation.summary.store.done");
     self.last_conversation_turn_seconds = self.now_seconds;
+    if (summary_turn.effort_tier) |tier| self.last_conversation_effort_tier = tier;
     try self.logSimple(.TransientConversation, null, null, spoken_text, "conversation_summary_added");
     if (had_pending_hard_error and self.pending_hard_error == null) {
-        try self.appendCommandLog("state", "Hard error recovery", "pending hard error resolved by follow-up conversation");
+        try self.appendEventLog("state", "Hard error recovery", "pending hard error resolved by follow-up conversation");
     }
     self.trace("conversation.done");
     if (pending_interrupt) |stimulus| try self.handleInterruptStimulus(stimulus);
@@ -370,10 +676,176 @@ pub fn handleConversationText(self: *Brain, heard_speech: input_mod.HeardSpeech)
     };
 }
 
+/// Run a follow-up chat pass after host sense delivery (tests and legacy callers).
+pub fn continueConversationAfterAwaitedVisual(self: *Brain, visual_line: []const u8) !ConversationTurnResult {
+    _ = self.fulfillAwaitedHostRequestIfMatches("camera", "recognize");
+    _ = self.fulfillAwaitedHostRequestIfMatches("camera", "take_picture");
+    _ = self.fulfillAwaitedHostRequestIfMatches("orientation", "sample");
+    return try runHostSenseFollowUpChat(self, visual_line) orelse error.NoActiveActivity;
+}
+
+pub fn handleConversationText(self: *Brain, heard_speech: input_mod.HeardSpeech, dispatch: brain_process.StimulusDispatch) !ConversationTurnResult {
+    try beginDispatchScope(self, dispatch, heard_speech.text);
+    defer endDispatchScope(self);
+    const result = try runConversationTurnBody(self, heard_speech);
+    const drained = try drainDeferredConversationSpeech(self, result);
+    return try stampDispatchIdOnResult(self, drained);
+}
+
+fn beginDispatchScope(self: *Brain, dispatch: brain_process.StimulusDispatch, user_text: []const u8) !void {
+    if (self.current_dispatch_request_id != null) return;
+    if (dispatch.request_id.len > 0) {
+        self.current_dispatch_request_id = try self.allocator.dupe(u8, dispatch.request_id);
+    } else {
+        self.dispatch_serial += 1;
+        self.current_dispatch_request_id = try std.fmt.allocPrint(self.allocator, "dispatch_{d}_{d}", .{ self.now_seconds, self.dispatch_serial });
+    }
+    self.traceText("dispatch.start", user_text);
+}
+
+fn endDispatchScope(self: *Brain) void {
+    self.trace("dispatch.done");
+    if (self.current_dispatch_request_id) |request_id| self.allocator.free(request_id);
+    self.current_dispatch_request_id = null;
+}
+
+fn stampDispatchIdOnResult(self: *Brain, result: ConversationTurnResult) !ConversationTurnResult {
+    if (result.dispatch_id.len > 0) return result;
+    const id = self.current_dispatch_request_id orelse "";
+    return .{
+        .user_text = result.user_text,
+        .spoken_text = result.spoken_text,
+        .user_summary = result.user_summary,
+        .brain_summary = result.brain_summary,
+        .dispatch_id = if (id.len > 0) try self.allocator.dupe(u8, id) else "",
+        .interrupted_by = result.interrupted_by,
+        .awaiting_host_sense = result.awaiting_host_sense,
+        .activity_id = result.activity_id,
+        .activity_kind = result.activity_kind,
+        .activity_kind_label = result.activity_kind_label,
+        .activity_state = result.activity_state,
+        .activity_goal = result.activity_goal,
+        .activity_awaiting = result.activity_awaiting,
+    };
+}
+
+fn runConversationTurnBody(self: *Brain, heard_speech: input_mod.HeardSpeech) !ConversationTurnResult {
+    const user_text = heard_speech.text;
+    self.clearWaitingFor();
+    const brain_mode = self.deps.store.loadBrainMode() catch .waking;
+    if (brain_mode == .dreaming or brain_mode == .waking_up or brain_mode == .unavailable or brain_mode == .drowsy) {
+        self.trace("conversation.blocked_by_brain_mode");
+        _ = try self.recordSimpleExperienceEvent(experience_kinds.conversation_blocked, .system, @tagName(brain_mode));
+        return .{
+            .user_text = user_text,
+            .spoken_text = "",
+            .user_summary = user_text,
+            .brain_summary = "Brain is unavailable for waking conversation",
+        };
+    }
+    try recoverAutonomyFromUserTurn(self);
+    const stimulus_assignment = try self.assignSpeechStimulus(heard_speech);
+    self.setCurrentStimulusContext(stimulus_assignment.stimulus_context);
+    // Update working memory now that this turn's stimulus is fresh, so the focus
+    // block reflects what is happening as the bot composes its reply.
+    try self.refreshFocus();
+    const request_id = self.current_dispatch_request_id orelse "";
+    try brain_process.ensureActiveActivity(self, user_text, request_id, .user_speech);
+    const turn_event = try self.recordSimpleExperienceEvent(experience_kinds.user_text_received, .user, user_text);
+    self.current_turn_event_id = turn_event.id;
+    defer self.current_turn_event_id = null;
+    const speaker_context = stimulus_assignment.speaker_context;
+    const heard_speech_raw = try self.heardSpeechRaw(heard_speech);
+    self.trace("conversation.memory.user_experience.start");
+    try self.recordMemoryCandidateEvent(.user_utterance, "human", "user_text", user_text, .human, .utterance, .summarize, "user_text", heard_speech_raw, user_text, &.{}, &[_][]const u8{ "conversation", "heard_speech" });
+    self.trace("conversation.memory.user_experience.done");
+    self.trace("conversation.impression.start");
+    const user_impression = try self.createImpression(.user_speech, user_text, &[_][]const u8{"conversation"});
+    try self.deps.store.addImpression(user_impression);
+    self.trace("conversation.impression.done");
+    self.trace("conversation.appraisal.start");
+    const user_appraisal = try self.createAppraisal(user_text, user_impression.impression_id, &[_][]const u8{"conversation"});
+    try self.deps.store.addAppraisal(user_appraisal);
+    try self.recordMemoryCandidateEvent(.observation, "brain", "user_speech_appraisal", user_appraisal.freeform, .brain, .appraisal, .keep_disposition, "user_speech_appraisal", user_text, user_appraisal.freeform, &.{}, user_appraisal.tags);
+    self.trace("conversation.appraisal.done");
+
+    self.trace("conversation.observations.start");
+    var observations = std.ArrayList(u8).empty;
+    try self.appendHeardSpeechObservation(&observations, heard_speech);
+    if (speaker_context) |context| {
+        try observations.appendSlice(self.allocator, context.memory_line);
+    }
+    self.traceCount("conversation.observations.heard_speech.done", observations.items.len);
+    const uploaded_observation = try self.uploadedMediaObservation(user_text);
+    if (uploaded_observation) |line| try observations.appendSlice(self.allocator, line);
+    self.traceCount("conversation.observations.uploaded.done", observations.items.len);
+    if (speaker_context == null and uploaded_observation == null) self.trace("conversation.speaker_context.deferred");
+    try self.logUserUtterance(if (speaker_context) |context| context.chat_label else "User", user_text);
+    self.trace("conversation.memory.selection.start");
+    const memory_selection_result = try memory_selection_mod.selectConversationMemories(self, user_text);
+    self.traceCount("conversation.memory.selection.done", memory_selection_result.entries.len);
+    self.trace("conversation.memory.build.start");
+    var memory_sections = std.ArrayList(context_composition.SectionStat).empty;
+    defer memory_sections.deinit(self.allocator);
+    const memory = try self.buildConversationMemoryWithSpeaker(
+        if (speaker_context) |context| context.memory_line else null,
+        &memory_sections,
+        memory_selection_result,
+    );
+    self.traceCount("conversation.memory.build.done", memory.len);
+    self.trace("conversation.affordances.start");
+    try self.appendAffordanceObservation(&observations);
+    try self.appendSocialContextObservation(&observations);
+    try appendReadModelsObservation(self, &observations);
+    try brain_process.appendActivityObservation(self, &observations);
+    try experiential_observations.appendRecentExperienceObservation(self, &observations, turn_event.id);
+    try experiential_observations.appendStimulusContinuityObservation(self, &observations, heard_speech);
+    try experiential_observations.appendWaitingForObservation(self, &observations);
+    try memory_selection_mod.appendMemorySelectionObservation(self.allocator, &observations, memory_selection_result);
+    try appendHostCapabilityObservationIfChanged(self, &observations);
+    self.traceCount("conversation.affordances.done", observations.items.len);
+    self.trace("conversation.subsystems.start");
+    try subsystems.appendSubsystemObservations(self, self.allocator, &observations, .{
+        .source_event_ids = &[_][]const u8{turn_event.id},
+        .focus = if (self.current_focus) |focus| focus.text else null,
+    });
+    self.trace("conversation.subsystems.done");
+    const had_pending_hard_error = self.pending_hard_error != null;
+    try self.appendPendingHardErrorObservation(&observations);
+    if (had_pending_hard_error) self.pending_hard_error = null;
+    self.conversation_user_text = user_text;
+    defer self.conversation_user_text = null;
+    const loop_result = try runSingleChatPass(self, memory, memory_sections.items, user_text, &observations);
+    const result = try finalizeConversationTurn(
+        self,
+        user_text,
+        memory,
+        loop_result.spoken_text,
+        loop_result.final_turn,
+        observations.items,
+        loop_result.pending_interrupt,
+        had_pending_hard_error,
+    );
+    const attached = try brain_process.attachActivityFields(self, result);
+    try finishActivityTurn(self, user_text, loop_result.spoken_text, loop_result.final_turn);
+    return attached;
+}
+
+fn recoverAutonomyFromUserTurn(self: *Brain) !void {
+    const io = self.deps.io orelse return;
+    const fs = self.deps.filesystem orelse return;
+    var state = try maintenance.loadAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, self.defaultAutonomySleeping(), self.cfg.autonomy_mode, .{
+        .limited_max_capacity = self.cfg.autonomy_limited_max_capacity,
+        .full_max_capacity = self.cfg.autonomy_full_max_capacity,
+    });
+    maintenance.recoverOnUserTurn(&state, self.cfg.autonomy_social_engagement_boost, self.now_seconds);
+    try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state);
+}
+
 pub fn reportRemoteThinkingFailure(self: *Brain) !void {
     const text = remote_thinking_failure_message;
     self.outputBrain(text);
-    try self.appendCommandLog("error", "Brain", text);
+    try self.appendEventLog("error", "Brain", text);
 }
 
 pub fn dryRunConversationPrompt(self: *Brain, user_text: []const u8) !chat_mod.ChatPrompt {
@@ -381,7 +853,7 @@ pub fn dryRunConversationPrompt(self: *Brain, user_text: []const u8) !chat_mod.C
     var observations = std.ArrayList(u8).empty;
     const memory = try self.buildConversationMemory();
     try self.appendAffordanceObservation(&observations);
-    return chat_mod.buildChatPrompt(self.allocator, memory, user_text, observations.items);
+    return chat_mod.buildChatPrompt(self.allocator, memory, user_text, observations.items, self.cfg.capacity.chat_context_tokens_max);
 }
 
 pub fn syncClock(self: *Brain, io: std.Io) void {
@@ -394,12 +866,139 @@ pub fn runMaintenance(self: *Brain, io: std.Io) !void {
     const fs = self.deps.filesystem orelse return error.MissingFileSystem;
     const tasks = try maintenance.dueTasks(self.allocator, fs, io, self.cfg.maintenance_schedule_path, self.cfg.maintenance_state_path, self.now_seconds);
     for (tasks) |task| {
-        if (try self.runMaintenanceCommand(task.command)) {
+        if (brain_dream_memory.maintenanceSpeechText(task.capability_spec)) |intent| {
+            _ = try self.reconsiderFromReminder(intent);
             try maintenance.markRun(self.allocator, fs, io, self.cfg.maintenance_state_path, task.task_id, self.now_seconds);
-            const text = try std.fmt.allocPrint(self.allocator, "maintenance:{s}", .{task.command});
+            const text = try std.fmt.allocPrint(self.allocator, "maintenance:{s}", .{task.capability_spec});
             try self.logSimple(.Idle, null, null, null, text);
+            continue;
+        }
+        try self.runMaintenanceCapability(task.capability_spec);
+        try maintenance.markRun(self.allocator, fs, io, self.cfg.maintenance_state_path, task.task_id, self.now_seconds);
+        const text = try std.fmt.allocPrint(self.allocator, "maintenance:{s}", .{task.capability_spec});
+        try self.logSimple(.Idle, null, null, null, text);
+    }
+    try self.flushContextStatsIfDirty();
+}
+
+fn salientSenseWarrantsOrchestration(self: *Brain, packet: stimulus_mod.Packet) bool {
+    if (packet.attention_intensity < salient_sense_attention_threshold) return false;
+    if (packet.threat >= 0.55) return true;
+    if (self.waiting_for != null) return true;
+    if (self.active_activity != null) return true;
+    if (self.current_focus != null) {
+        if (self.currentFocusAttention()) |attention| {
+            if (attention >= 0.35) return true;
         }
     }
+    const since_turn: i64 = if (self.last_conversation_turn_seconds) |t| @max(0, self.now_seconds - t) else -1;
+    const timeout: i64 = @intCast(self.cfg.conversation_idle_timeout_seconds);
+    return since_turn >= 0 and since_turn <= timeout;
+}
+
+pub fn reactToSalientSense(self: *Brain, packet: stimulus_mod.Packet) !?ConversationTurnResult {
+    if (!salientSenseWarrantsOrchestration(self, packet)) return null;
+
+    const brain_mode = self.deps.store.loadBrainMode() catch .waking;
+    if (brain_mode == .dreaming or brain_mode == .waking_up or brain_mode == .unavailable or brain_mode == .drowsy) return null;
+
+    const orchestration_text = try std.fmt.allocPrint(
+        self.allocator,
+        "A salient {s} sense arrived. Reconsider what to do.",
+        .{@tagName(packet.kind)},
+    );
+    defer self.allocator.free(orchestration_text);
+
+    try self.refreshFocus();
+    var observations = std.ArrayList(u8).empty;
+    try observations.print(
+        self.allocator,
+        "salient_sense:\n- kind: {s}\n- attention_intensity: {d:.3}\n- note: this sense is strong enough to warrant reconsideration; choose whether to speak, look, remember, or wait.\n",
+        .{ @tagName(packet.kind), packet.attention_intensity },
+    );
+    var salient_memory_sections = std.ArrayList(context_composition.SectionStat).empty;
+    defer salient_memory_sections.deinit(self.allocator);
+    const memory = try self.buildConversationMemoryWithSpeaker(null, &salient_memory_sections, null);
+    defer self.allocator.free(memory);
+    try self.appendAffordanceObservation(&observations);
+    try appendReadModelsObservation(self, &observations);
+    try brain_process.appendActivityObservation(self, &observations);
+    try experiential_observations.appendRecentExperienceObservation(self, &observations, null);
+    try experiential_observations.appendWaitingForObservation(self, &observations);
+    try appendHostCapabilityObservationIfChanged(self, &observations);
+    self.conversation_user_text = orchestration_text;
+    defer self.conversation_user_text = null;
+
+    if (!try chat_mod.chatPromptWithinBudget(self.allocator, memory, orchestration_text, observations.items, self.cfg.capacity.chat_context_tokens_max)) {
+        const audit = try chat_mod.auditChatPrompt(self.allocator, memory, orchestration_text, observations.items);
+        self.traceCount("salient_sense.orchestration.skipped context_budget", audit.user_prompt_tokens);
+        try self.recordContextBudgetExceeded();
+        return null;
+    }
+
+    const stack_depth_before = self.activity_stack.items.len;
+    try brain_process.ensureActiveActivity(self, orchestration_text, "", .salient_sense);
+    errdefer if (self.activity_stack.items.len > stack_depth_before) {
+        brain_process.abandonOrchestrationSubtask(self, "salient sense orchestration aborted") catch {};
+    };
+    const loop_result = try runSingleChatPass(self, memory, salient_memory_sections.items, orchestration_text, &observations);
+    const result = try finalizeConversationTurn(
+        self,
+        orchestration_text,
+        memory,
+        loop_result.spoken_text,
+        loop_result.final_turn,
+        observations.items,
+        loop_result.pending_interrupt,
+        false,
+    );
+    try brain_process.completeSubtaskActivity(self, orchestration_text, result.spoken_text, loop_result.final_turn);
+    if (result.spoken_text.len == 0 and !self.awaitedHostRequestActive()) return null;
+    return try brain_process.attachActivityFields(self, result);
+}
+
+pub fn reconsiderFromReminder(self: *Brain, intent_text: []const u8) !ConversationTurnResult {
+    self.clearWaitingFor();
+    const reconsider_text = try std.fmt.allocPrint(
+        self.allocator,
+        "A scheduled wait has ended. Reconsider what to do. Intended reminder: {s}",
+        .{intent_text},
+    );
+    defer self.allocator.free(reconsider_text);
+    _ = try self.recordSimpleExperienceEvent(experience_kinds.reminder_fired, .system, intent_text);
+    try self.refreshFocus();
+    try brain_process.ensureActiveActivity(self, reconsider_text, "", .reminder);
+    var observations = std.ArrayList(u8).empty;
+    try observations.print(
+        self.allocator,
+        "timer_fired:\n- intent: {s}\n- note: you scheduled this wait; reconsider whether to speak, continue focus, or wait again.\n",
+        .{intent_text},
+    );
+    var reminder_memory_sections = std.ArrayList(context_composition.SectionStat).empty;
+    defer reminder_memory_sections.deinit(self.allocator);
+    const memory = try self.buildConversationMemoryWithSpeaker(null, &reminder_memory_sections, null);
+    defer self.allocator.free(memory);
+    try self.appendAffordanceObservation(&observations);
+    try appendReadModelsObservation(self, &observations);
+    try brain_process.appendActivityObservation(self, &observations);
+    try experiential_observations.appendRecentExperienceObservation(self, &observations, null);
+    try experiential_observations.appendWaitingForObservation(self, &observations);
+    try appendHostCapabilityObservationIfChanged(self, &observations);
+    self.conversation_user_text = reconsider_text;
+    defer self.conversation_user_text = null;
+    const loop_result = try runSingleChatPass(self, memory, reminder_memory_sections.items, reconsider_text, &observations);
+    const result = try finalizeConversationTurn(
+        self,
+        reconsider_text,
+        memory,
+        loop_result.spoken_text,
+        loop_result.final_turn,
+        observations.items,
+        loop_result.pending_interrupt,
+        false,
+    );
+    try brain_process.completeSubtaskActivity(self, reconsider_text, loop_result.spoken_text, loop_result.final_turn);
+    return try brain_process.attachActivityFields(self, result);
 }
 
 pub fn runIdMonitors(self: *Brain, io: std.Io) !void {
@@ -422,7 +1021,7 @@ pub fn runIdMonitors(self: *Brain, io: std.Io) !void {
     };
     if (self.id_monitor_manager.externalDue(self.now_seconds, external_cfg)) {
         self.id_monitor_manager.markExternalPoll(self.now_seconds);
-        try self.recordRuntimeEvent(.{
+        try self.recordExperienceLogEvent(.{
             .kind = .system,
             .source = "id_monitor",
             .title = "id_monitor_external_start",
@@ -442,7 +1041,7 @@ pub fn runIdMonitors(self: *Brain, io: std.Io) !void {
             return;
         };
         for (monitor_events) |event| try self.recordIdMonitorEvent(event);
-        try self.recordRuntimeEvent(.{
+        try self.recordExperienceLogEvent(.{
             .kind = .system,
             .source = "id_monitor",
             .title = "id_monitor_external_stop",
@@ -509,7 +1108,7 @@ pub fn recordCriticalPowerShutdown(self: *Brain, power: system_senses_mod.PowerS
         &.{},
         &[_][]const u8{ "system", "power", "battery", "critical", "shutdown" },
     );
-    try self.appendCommandLog("error", "Power critical", interpretation);
+    try self.appendEventLog("error", "Power critical", interpretation);
     self.outputFmt("\nBRAIN STATE: Shutdown\nREASON: critical host battery <= {d}% without external power\n{s}\n", .{ critical_percent, power_text });
 }
 
@@ -538,39 +1137,70 @@ pub fn recordSignalShutdown(self: *Brain, signal_name: []const u8) !void {
         &.{},
         &[_][]const u8{ "system", "process", "signal", "shutdown" },
     );
-    try self.appendCommandLog("result", "Signal shutdown", interpretation);
+    try self.appendEventLog("result", "Signal shutdown", interpretation);
     self.outputFmt("\nBRAIN STATE: Shutdown\nREASON: received {s}\n", .{signal_name});
+}
+
+pub fn runAutonomyReplenish(self: *Brain, io: std.Io) !void {
+    if (!self.autonomyEnabled()) return;
+    const fs = self.deps.filesystem orelse return error.MissingFileSystem;
+    var state = try maintenance.loadAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, self.defaultAutonomySleeping(), self.cfg.autonomy_mode, .{
+        .limited_max_capacity = self.cfg.autonomy_limited_max_capacity,
+        .full_max_capacity = self.cfg.autonomy_full_max_capacity,
+    });
+    _ = maintenance.replenishCapacity(
+        &state,
+        brain_autonomy.autonomyReplenishRatePerSecond(self.cfg),
+        self.cfg.autonomy_planner_min_capacity,
+        self.now_seconds,
+    );
+    try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state);
+}
+
+pub fn runAutonomyReplenishFromPush(self: *Brain, io: std.Io, actions: u32) !u32 {
+    if (!self.autonomyEnabled()) return error.AutonomyDisabled;
+    const fs = self.deps.filesystem orelse return error.MissingFileSystem;
+    var state = try maintenance.loadAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, self.defaultAutonomySleeping(), self.cfg.autonomy_mode, .{
+        .limited_max_capacity = self.cfg.autonomy_limited_max_capacity,
+        .full_max_capacity = self.cfg.autonomy_full_max_capacity,
+    });
+    const applied_actions = maintenance.replenishWholeActionsFromPush(&state, actions, self.cfg.autonomy_planner_min_capacity, self.now_seconds);
+    try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state);
+    return applied_actions;
 }
 
 pub fn runAutonomyTick(self: *Brain, io: std.Io) !void {
     if (!self.autonomyEnabled()) return;
     const fs = self.deps.filesystem orelse return error.MissingFileSystem;
-    const day_key = try self.localDayKey(io);
-    var state = try maintenance.loadAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, self.defaultAutonomySleeping(), self.cfg.autonomy_daily_energy, day_key);
+    var state = try maintenance.loadAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, self.defaultAutonomySleeping(), self.cfg.autonomy_mode, .{
+        .limited_max_capacity = self.cfg.autonomy_limited_max_capacity,
+        .full_max_capacity = self.cfg.autonomy_full_max_capacity,
+    });
     if (!try prepareAutonomyPlanning(self, io, &state)) return;
-    if (!try autonomyTickDue(self, io, &state)) return;
+    if (!maintenance.autonomyPlannerReady(state)) {
+        state.last_reason = try self.allocator.dupe(u8, "autonomy waiting: overdrawn");
+        try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state);
+        return;
+    }
     try runAutonomyPlannerWithState(self, io, &state);
 }
 
 pub fn runStimulusAutonomy(self: *Brain, io: std.Io) !void {
     if (!self.autonomyEnabled()) return;
     const fs = self.deps.filesystem orelse return error.MissingFileSystem;
-    const day_key = try self.localDayKey(io);
-    var state = try maintenance.loadAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, self.defaultAutonomySleeping(), self.cfg.autonomy_daily_energy, day_key);
+    var state = try maintenance.loadAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, self.defaultAutonomySleeping(), self.cfg.autonomy_mode, .{
+        .limited_max_capacity = self.cfg.autonomy_limited_max_capacity,
+        .full_max_capacity = self.cfg.autonomy_full_max_capacity,
+    });
     if (!try prepareAutonomyPlanning(self, io, &state)) return;
+    if (!maintenance.autonomyPlannerReady(state)) return;
     try runAutonomyPlannerWithState(self, io, &state);
 }
 
 fn prepareAutonomyPlanning(self: *Brain, io: std.Io, state: *maintenance.AutonomyState) !bool {
+    const brain_mode = self.deps.store.loadBrainMode() catch .waking;
+    if (brain_mode == .dreaming or brain_mode == .drowsy or brain_mode == .waking_up) return false;
     const fs = self.deps.filesystem orelse return error.MissingFileSystem;
-    if (state.energy_remaining == 0) {
-        state.last_autonomy_tick_at = self.now_seconds;
-        state.sleeping = true;
-        state.energy_exhausted = true;
-        state.last_reason = try self.allocator.dupe(u8, "energy exhausted");
-        try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state.*);
-        return false;
-    }
     if (state.sleeping) return false;
     if (try self.deps.input.isActive(self.allocator)) {
         state.last_reason = try self.allocator.dupe(u8, "autonomy paused: human input active");
@@ -582,47 +1212,40 @@ fn prepareAutonomyPlanning(self: *Brain, io: std.Io, state: *maintenance.Autonom
 
 fn runAutonomyPlannerWithState(self: *Brain, io: std.Io, state: *maintenance.AutonomyState) !void {
     const fs = self.deps.filesystem orelse return error.MissingFileSystem;
-    if (state.energy_remaining < Brain.autonomyPlannerCost()) {
-        state.sleeping = true;
-        state.energy_exhausted = true;
-        state.last_autonomy_tick_at = self.now_seconds;
-        state.last_reason = try self.allocator.dupe(u8, "insufficient energy for planner");
-        try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state.*);
-        return;
-    }
-
     const planner = self.deps.autonomy_planner orelse return error.MissingAutonomyPlanner;
-    state.energy_remaining -= Brain.autonomyPlannerCost();
     state.last_autonomy_tick_at = self.now_seconds;
     try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state.*);
 
     try self.refreshFocus();
     const context = try self.buildAutonomyContext(io, state.*);
+    defer self.allocator.free(context);
     const turn = planner.plan(self.allocator, context) catch |err| {
         state.last_error = try std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)});
         try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state.*);
         return err;
     };
-    try self.executeAutonomyTurn(io, state, turn);
-    try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state.*);
-}
-
-pub fn autonomyTickDue(self: *Brain, io: std.Io, state: *maintenance.AutonomyState) !bool {
-    const fs = self.deps.filesystem orelse return error.MissingFileSystem;
-    const last_tick = state.last_autonomy_tick_at orelse {
-        state.last_autonomy_tick_at = self.now_seconds;
-        state.last_reason = try self.allocator.dupe(u8, "autonomy armed");
-        try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state.*);
-        return false;
-    };
-    const interval_seconds: i64 = @intCast(self.cfg.autonomy_interval_seconds);
-    return self.now_seconds - last_tick >= interval_seconds;
+    defer autonomy_mod.freeAutonomyTurn(self.allocator, turn);
+    const composition_context = try process_goal_resolver.buildAutonomyCompositionContext(self.allocator, context, turn.reason);
+    defer self.allocator.free(composition_context);
+    const expanded_turn = try process_goal_resolver.expandAutonomyTurn(self, turn, composition_context);
+    defer {
+        chat_mod.freeActionProposals(self.allocator, expanded_turn.action_pressures);
+        self.allocator.free(@constCast(expanded_turn.reason));
+    }
+    try self.executeAutonomyTurn(io, state, expanded_turn);
+    var latest_state = try maintenance.loadAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, self.defaultAutonomySleeping(), self.cfg.autonomy_mode, .{
+        .limited_max_capacity = self.cfg.autonomy_limited_max_capacity,
+        .full_max_capacity = self.cfg.autonomy_full_max_capacity,
+    });
+    if (state.last_reason) |reason| latest_state.last_reason = reason;
+    try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, latest_state);
 }
 
 pub fn expireConversationIfIdle(self: *Brain) !void {
     const last = self.last_conversation_turn_seconds orelse return;
     const timeout: i64 = @intCast(self.cfg.conversation_idle_timeout_seconds);
     if (self.now_seconds - last >= timeout) {
-        _ = try self.runMaintenanceCommand("end_conversation");
+        try brain_process.pauseActiveActivityForIdle(self, "conversation idle timeout");
+        try self.runMaintenanceCapability("end_conversation");
     }
 }

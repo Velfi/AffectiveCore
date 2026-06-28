@@ -4,8 +4,11 @@ const brain_mod = @import("../core/brain.zig");
 const host_adapter = @import("host_adapter.zig");
 const embedded_protocol = @import("embedded_protocol.zig");
 const config_mod = @import("../core/config.zig");
+const llm_routing = @import("../core/llm_routing.zig");
 const identity = @import("../core/identity.zig");
 const chat = @import("../api/chat_client.zig");
+const extraction = @import("../api/extraction_client.zig");
+const memory_selection = @import("../api/memory_selection_client.zig");
 const intent = @import("../api/intent_client.zig");
 const recognition = @import("../api/recognition_client.zig");
 const openai = @import("../api/openai_client.zig");
@@ -16,6 +19,7 @@ const image = @import("../api/image_client.zig");
 const autonomy = @import("../api/autonomy_client.zig");
 const psyche = @import("../api/psyche_client.zig");
 const want_achievement = @import("../api/want_achievement_client.zig");
+const process_composition = @import("../api/process_composition_client.zig");
 const http_transport = @import("../api/http_transport.zig");
 const camera_mod = @import("../platform/common/camera.zig");
 const speaker_mod = @import("../platform/common/speaker.zig");
@@ -31,6 +35,7 @@ const brain_storage = @import("../storage/brain_storage.zig");
 pub const HeadlessMcpBrainHost = struct {
     brain: brain_mod.Brain,
     storage: brain_storage.BrainStorage,
+    llm_provider_clients: []*ai_provider.RandomProviderClient,
 
     pub fn deinit(self: *HeadlessMcpBrainHost, allocator: std.mem.Allocator) void {
         self.storage.deinit(allocator);
@@ -38,17 +43,24 @@ pub const HeadlessMcpBrainHost = struct {
 };
 
 pub fn initHeadlessMcpBrainHost(allocator: std.mem.Allocator, io: std.Io, http: http_transport.Client, cfg: config_mod.Config) !HeadlessMcpBrainHost {
-    var storage = try brain_storage.BrainStorage.init(allocator, io, cfg.memory_path, cfg.events_path, cfg.graph_path, cfg.captures_dir);
+    var storage = try brain_storage.BrainStorage.init(allocator, io, cfg.memory_path, cfg.graph_path, cfg.captures_dir);
     errdefer storage.deinit(allocator);
-    const host = try makeHeadlessHost(allocator, io, http, cfg, storage);
-    const brain = brain_mod.Brain.init(allocator, cfg, host.brainDeps());
-    return .{ .brain = brain, .storage = storage };
+    const bundle = try makeHeadlessHost(allocator, io, http, cfg, storage);
+    var host = HeadlessMcpBrainHost{
+        .brain = brain_mod.Brain.init(allocator, cfg, bundle.host.brainDeps()),
+        .storage = storage,
+        .llm_provider_clients = bundle.llm_provider_clients,
+    };
+    try host.brain.applyNewBrainDefaults();
+    try host.brain.restorePersistedActivity();
+    return host;
 }
 
 pub const EmbeddedMacosBrainHost = struct {
     brain: brain_mod.Brain,
     storage: brain_storage.BrainStorage,
     effects: *embedded_protocol.HostEffectCollector,
+    llm_provider_clients: []*ai_provider.RandomProviderClient,
 
     pub fn deinit(self: *EmbeddedMacosBrainHost, allocator: std.mem.Allocator) void {
         self.storage.deinit(allocator);
@@ -56,11 +68,19 @@ pub const EmbeddedMacosBrainHost = struct {
 };
 
 pub fn initEmbeddedMacosBrainHost(allocator: std.mem.Allocator, io: std.Io, http: http_transport.Client, cfg: config_mod.Config, host_capabilities: chat.CapabilitySet) !EmbeddedMacosBrainHost {
-    var storage = try brain_storage.BrainStorage.init(allocator, io, cfg.memory_path, cfg.events_path, cfg.graph_path, cfg.captures_dir);
+    var storage = try brain_storage.BrainStorage.init(allocator, io, cfg.memory_path, cfg.graph_path, cfg.captures_dir);
     errdefer storage.deinit(allocator);
     const bundle = try makeEmbeddedMacosHost(allocator, io, http, cfg, storage, host_capabilities);
-    const brain = brain_mod.Brain.init(allocator, cfg, bundle.host.brainDeps());
-    return .{ .brain = brain, .storage = storage, .effects = bundle.effects };
+    var host = EmbeddedMacosBrainHost{
+        .brain = brain_mod.Brain.init(allocator, cfg, bundle.host.brainDeps()),
+        .storage = storage,
+        .effects = bundle.effects,
+        .llm_provider_clients = bundle.llm_provider_clients,
+    };
+    bundle.chat_service.parse_failure_brain = &host.brain;
+    try host.brain.applyNewBrainDefaults();
+    try host.brain.restorePersistedActivity();
+    return host;
 }
 
 fn makeHeadlessHost(
@@ -69,7 +89,7 @@ fn makeHeadlessHost(
     http: http_transport.Client,
     cfg: config_mod.Config,
     storage: brain_storage.BrainStorage,
-) !host_adapter.HostAdapter {
+) !HeadlessHostBundle {
     const unsupported = try allocator.create(UnsupportedHostServices);
     unsupported.* = .{};
     const local_process_runner = try allocator.create(process_mod.LocalProcessRunner);
@@ -82,30 +102,32 @@ fn makeHeadlessHost(
     local_output.* = .{};
     const senses = try allocator.create(HeadlessSystemSenses);
     senses.* = .{ .io = io, .storage_backend = storage };
-    const use_provider = cfg.conversation_models.len > 0;
+    try requireConversationModels(cfg);
+
+    const llm_quality = parseLlmQuality(cfg.llm_quality);
 
     const random_ai = try allocator.create(ai_provider.RandomProviderClient);
-    random_ai.* = ai_provider.RandomProviderClient.init(io, http, cfg.conversation_models);
+    random_ai.* = ai_provider.RandomProviderClient.initWithRoster(io, http, cfg.conversation_roster, llm_quality);
     const description_service = try allocator.create(openai.RandomProviderDescriptionService);
     description_service.* = openai.RandomProviderDescriptionService.init(random_ai);
 
     const test_intent_service = try allocator.create(intent.TestIntentService);
     test_intent_service.* = .{};
 
-    const test_greeting_service = try allocator.create(greeting.TestGreetingService);
-    test_greeting_service.* = .{};
     const greeting_service = try allocator.create(greeting.RandomProviderGreetingService);
     greeting_service.* = greeting.RandomProviderGreetingService.init(random_ai);
 
-    const unconfigured_chat_service = try allocator.create(chat.UnconfiguredChatService);
-    unconfigured_chat_service.* = .{};
     const chat_service = try allocator.create(chat.RandomProviderChatService);
-    chat_service.* = chat.RandomProviderChatService.init(io, http, cfg.conversation_models, parseReasoningEffort(cfg.conversation_reasoning_effort));
+    chat_service.* = chat.RandomProviderChatService.init(io, http, cfg.conversation_roster, llm_quality, parseReasoningEffort(cfg.conversation_reasoning_effort));
+    const extraction_service = try allocator.create(extraction.RandomProviderMemoryExtractionService);
+    extraction_service.* = extraction.RandomProviderMemoryExtractionService.init(io, http, cfg.conversation_roster, llm_quality, parseReasoningEffort(cfg.conversation_reasoning_effort));
+    const selection_service = try allocator.create(memory_selection.RandomProviderMemorySelectionService);
+    selection_service.* = memory_selection.RandomProviderMemorySelectionService.init(io, http, cfg.conversation_roster, llm_quality, parseReasoningEffort(cfg.conversation_reasoning_effort));
 
     const autonomy_planner = try allocator.create(autonomy.RandomProviderAutonomyPlanner);
-    autonomy_planner.* = autonomy.RandomProviderAutonomyPlanner.init(io, http, cfg.conversation_models, parseReasoningEffort(cfg.conversation_reasoning_effort));
+    autonomy_planner.* = autonomy.RandomProviderAutonomyPlanner.init(io, http, cfg.conversation_roster, llm_quality, parseReasoningEffort(cfg.conversation_reasoning_effort));
     const psyche_service = try allocator.create(psyche.RandomProviderPsycheService);
-    psyche_service.* = psyche.RandomProviderPsycheService.init(io, http, cfg.psyche_models, parseReasoningEffort(cfg.psyche_reasoning_effort));
+    psyche_service.* = psyche.RandomProviderPsycheService.init(io, http, cfg.psyche_roster, llm_quality, parseReasoningEffort(cfg.psyche_reasoning_effort));
 
     const image_service = try allocator.create(image.NanoBananaImageService);
     image_service.* = image.NanoBananaImageService.init(io, http, cfg.image_generation_model, cfg.image_generation_output_dir);
@@ -114,41 +136,64 @@ fn makeHeadlessHost(
     const speaker = try allocator.create(speaker_mod.TestSpeaker);
     speaker.* = .{};
 
-    const scripted_want_detector = try allocator.create(want_achievement.ScriptedWantAchievementDetector);
-    scripted_want_detector.* = .{};
     const want_detector = try allocator.create(want_achievement.RandomProviderWantAchievementDetector);
-    want_detector.* = want_achievement.RandomProviderWantAchievementDetector.init(io, http, cfg.conversation_models, parseReasoningEffort(cfg.conversation_reasoning_effort));
+    want_detector.* = want_achievement.RandomProviderWantAchievementDetector.init(io, http, cfg.conversation_roster, llm_quality, parseReasoningEffort(cfg.conversation_reasoning_effort));
 
+    const process_composer = try allocator.create(process_composition.RandomProviderProcessComposer);
+    process_composer.* = process_composition.RandomProviderProcessComposer.init(io, http, cfg.conversation_roster, llm_quality, parseReasoningEffort(cfg.conversation_reasoning_effort));
+
+    const llm_provider_clients = try allocator.alloc(*ai_provider.RandomProviderClient, 8);
+    llm_provider_clients[0] = random_ai;
+    llm_provider_clients[1] = &chat_service.provider_client;
+    llm_provider_clients[2] = &extraction_service.provider_client;
+    llm_provider_clients[3] = &selection_service.provider_client;
+    llm_provider_clients[4] = &autonomy_planner.provider_client;
+    llm_provider_clients[5] = &psyche_service.provider_client;
+    llm_provider_clients[6] = &want_detector.provider_client;
+    llm_provider_clients[7] = &process_composer.provider_client;
 
     return .{
-        .io = io,
-        .capabilities = mcpHeadlessCapabilities(),
-        .camera = unsupported.camera(),
-        .recognizer = unsupported.recognizer(),
-        .description_service = if (use_provider) description_service.service() else unsupported.descriptionService(),
-        .greeting_service = if (use_provider) greeting_service.service() else test_greeting_service.service(),
-        .intent_service = test_intent_service.service(),
-        .chat_service = if (use_provider) chat_service.service() else unconfigured_chat_service.service(),
-        .image_generation_service = image_service.service(),
-        .autonomy_planner = if (use_provider) autonomy_planner.planner() else null,
-        .psyche_service = if (use_provider) psyche_service.service() else null,
-        .want_achievement_detector = if (use_provider) want_detector.detector() else scripted_want_detector.detector(),
-        .speech_service = speech_service.service(),
-        .speaker = speaker.speaker(),
-        .input = unsupported.input(),
-        .store = storage.memoryStore(),
-        .graph = storage.graphStore(),
-        .output = local_output.output(),
-        .system_senses = senses.senses(),
-        .clock = local_clock.clock(),
-        .filesystem = local_filesystem.filesystem(),
-        .process_runner = local_process_runner.runner(),
+        .host = .{
+            .io = io,
+            .capabilities = mcpHeadlessCapabilities(),
+            .camera = unsupported.camera(),
+            .recognizer = unsupported.recognizer(),
+            .description_service = description_service.service(),
+            .greeting_service = greeting_service.service(),
+            .intent_service = test_intent_service.service(),
+            .chat_service = chat_service.service(),
+            .memory_extraction_service = extraction_service.service(),
+            .memory_selection_service = selection_service.service(),
+            .image_generation_service = image_service.service(),
+            .autonomy_planner = autonomy_planner.planner(),
+            .psyche_service = psyche_service.service(),
+            .want_achievement_detector = want_detector.detector(),
+            .process_composer = process_composer.composer(),
+            .speech_service = speech_service.service(),
+            .speaker = speaker.speaker(),
+            .input = unsupported.input(),
+            .store = storage.memoryStore(),
+            .graph = storage.graphStore(),
+            .output = local_output.output(),
+            .system_senses = senses.senses(),
+            .clock = local_clock.clock(),
+            .filesystem = local_filesystem.filesystem(),
+            .process_runner = local_process_runner.runner(),
+        },
+        .llm_provider_clients = llm_provider_clients,
     };
 }
+
+const HeadlessHostBundle = struct {
+    host: host_adapter.HostAdapter,
+    llm_provider_clients: []*ai_provider.RandomProviderClient,
+};
 
 const EmbeddedMacosHostBundle = struct {
     host: host_adapter.HostAdapter,
     effects: *embedded_protocol.HostEffectCollector,
+    llm_provider_clients: []*ai_provider.RandomProviderClient,
+    chat_service: *chat.RandomProviderChatService,
 };
 
 fn makeEmbeddedMacosHost(
@@ -171,7 +216,8 @@ fn makeEmbeddedMacosHost(
     local_output.* = .{};
     const senses = try allocator.create(HeadlessSystemSenses);
     senses.* = .{ .io = io, .storage_backend = storage };
-    const use_provider = cfg.conversation_models.len > 0;
+    try requireConversationModels(cfg);
+    try requirePsycheModels(cfg);
 
     const effects = try allocator.create(embedded_protocol.HostEffectCollector);
     effects.* = embedded_protocol.HostEffectCollector.init(allocator);
@@ -180,14 +226,13 @@ fn makeEmbeddedMacosHost(
     const frontend_orientation = try allocator.create(FrontendOrientation);
     frontend_orientation.* = .{ .effects = effects };
 
+    const llm_quality = parseLlmQuality(cfg.llm_quality);
+
     const random_ai = try allocator.create(ai_provider.RandomProviderClient);
-    random_ai.* = ai_provider.RandomProviderClient.init(io, http, cfg.conversation_models);
+    random_ai.* = ai_provider.RandomProviderClient.initWithRoster(io, http, cfg.conversation_roster, llm_quality);
     const description_service = try allocator.create(openai.RandomProviderDescriptionService);
     description_service.* = openai.RandomProviderDescriptionService.init(random_ai);
-    const selected_descriptions = if (use_provider)
-        description_service.service()
-    else
-        unsupported.descriptionService();
+    const selected_descriptions = description_service.service();
 
     const random_comparison = try allocator.create(openai.RandomProviderIdentityComparisonService);
     random_comparison.* = openai.RandomProviderIdentityComparisonService.init(random_ai);
@@ -219,26 +264,36 @@ fn makeEmbeddedMacosHost(
 
     const test_intent_service = try allocator.create(intent.TestIntentService);
     test_intent_service.* = .{};
-    const test_greeting_service = try allocator.create(greeting.TestGreetingService);
-    test_greeting_service.* = .{};
     const greeting_service = try allocator.create(greeting.RandomProviderGreetingService);
     greeting_service.* = greeting.RandomProviderGreetingService.init(random_ai);
 
-    const unconfigured_chat_service = try allocator.create(chat.UnconfiguredChatService);
-    unconfigured_chat_service.* = .{};
     const chat_service = try allocator.create(chat.RandomProviderChatService);
-    chat_service.* = chat.RandomProviderChatService.init(io, http, cfg.conversation_models, parseReasoningEffort(cfg.conversation_reasoning_effort));
+    chat_service.* = chat.RandomProviderChatService.init(io, http, cfg.conversation_roster, llm_quality, parseReasoningEffort(cfg.conversation_reasoning_effort));
+    const extraction_service = try allocator.create(extraction.RandomProviderMemoryExtractionService);
+    extraction_service.* = extraction.RandomProviderMemoryExtractionService.init(io, http, cfg.conversation_roster, llm_quality, parseReasoningEffort(cfg.conversation_reasoning_effort));
+    const selection_service = try allocator.create(memory_selection.RandomProviderMemorySelectionService);
+    selection_service.* = memory_selection.RandomProviderMemorySelectionService.init(io, http, cfg.conversation_roster, llm_quality, parseReasoningEffort(cfg.conversation_reasoning_effort));
 
     const autonomy_planner = try allocator.create(autonomy.RandomProviderAutonomyPlanner);
-    autonomy_planner.* = autonomy.RandomProviderAutonomyPlanner.init(io, http, cfg.conversation_models, parseReasoningEffort(cfg.conversation_reasoning_effort));
+    autonomy_planner.* = autonomy.RandomProviderAutonomyPlanner.init(io, http, cfg.conversation_roster, llm_quality, parseReasoningEffort(cfg.conversation_reasoning_effort));
     const psyche_service = try allocator.create(psyche.RandomProviderPsycheService);
-    psyche_service.* = psyche.RandomProviderPsycheService.init(io, http, cfg.psyche_models, parseReasoningEffort(cfg.psyche_reasoning_effort));
+    psyche_service.* = psyche.RandomProviderPsycheService.init(io, http, cfg.psyche_roster, llm_quality, parseReasoningEffort(cfg.psyche_reasoning_effort));
     const image_service = try allocator.create(image.NanoBananaImageService);
     image_service.* = image.NanoBananaImageService.init(io, http, cfg.image_generation_model, cfg.image_generation_output_dir);
-    const scripted_want_detector = try allocator.create(want_achievement.ScriptedWantAchievementDetector);
-    scripted_want_detector.* = .{};
     const want_detector = try allocator.create(want_achievement.RandomProviderWantAchievementDetector);
-    want_detector.* = want_achievement.RandomProviderWantAchievementDetector.init(io, http, cfg.conversation_models, parseReasoningEffort(cfg.conversation_reasoning_effort));
+    want_detector.* = want_achievement.RandomProviderWantAchievementDetector.init(io, http, cfg.conversation_roster, llm_quality, parseReasoningEffort(cfg.conversation_reasoning_effort));
+    const process_composer = try allocator.create(process_composition.RandomProviderProcessComposer);
+    process_composer.* = process_composition.RandomProviderProcessComposer.init(io, http, cfg.conversation_roster, llm_quality, parseReasoningEffort(cfg.conversation_reasoning_effort));
+
+    const llm_provider_clients = try allocator.alloc(*ai_provider.RandomProviderClient, 8);
+    llm_provider_clients[0] = random_ai;
+    llm_provider_clients[1] = &chat_service.provider_client;
+    llm_provider_clients[2] = &extraction_service.provider_client;
+    llm_provider_clients[3] = &selection_service.provider_client;
+    llm_provider_clients[4] = &autonomy_planner.provider_client;
+    llm_provider_clients[5] = &psyche_service.provider_client;
+    llm_provider_clients[6] = &want_detector.provider_client;
+    llm_provider_clients[7] = &process_composer.provider_client;
 
     return .{ .host = .{
         .io = io,
@@ -247,27 +302,35 @@ fn makeEmbeddedMacosHost(
         .recognizer = selected_recognizer,
         .face_picture_updater = selected_face_picture_updater,
         .description_service = selected_descriptions,
-        .greeting_service = if (use_provider) greeting_service.service() else test_greeting_service.service(),
+        .greeting_service = greeting_service.service(),
         .intent_service = test_intent_service.service(),
-        .chat_service = if (use_provider) chat_service.service() else unconfigured_chat_service.service(),
+        .chat_service = chat_service.service(),
+        .memory_extraction_service = extraction_service.service(),
+        .memory_selection_service = selection_service.service(),
         .image_generation_service = image_service.service(),
-        .autonomy_planner = if (use_provider) autonomy_planner.planner() else null,
-        .psyche_service = if (use_provider) psyche_service.service() else null,
-        .want_achievement_detector = if (use_provider) want_detector.detector() else scripted_want_detector.detector(),
+        .autonomy_planner = autonomy_planner.planner(),
+        .psyche_service = psyche_service.service(),
+        .want_achievement_detector = want_detector.detector(),
+        .process_composer = process_composer.composer(),
         .speech_service = effects.speechService(),
         .speaker = effects.speaker(),
         .input = unsupported.input(),
         .store = storage.memoryStore(),
         .graph = storage.graphStore(),
-        .command_log = effects.commandLog(),
+        .event_log = effects.eventLog(),
         .facial_expression_output = effects.facialExpressionOutput(),
+        .mise_en_scene_output = effects.miseEnSceneOutput(),
         .orientation_query = frontend_orientation.query(),
         .output = local_output.output(),
         .system_senses = senses.senses(),
         .clock = local_clock.clock(),
         .filesystem = local_filesystem.filesystem(),
         .process_runner = local_process_runner.runner(),
-    }, .effects = effects };
+    }, .effects = effects, .llm_provider_clients = llm_provider_clients, .chat_service = chat_service };
+}
+
+fn parseLlmQuality(text: []const u8) llm_routing.LlmQuality {
+    return llm_routing.LlmQuality.parse(text) catch .auto;
 }
 
 fn parseReasoningEffort(text: []const u8) ?chat.ReasoningEffort {
@@ -277,11 +340,23 @@ fn parseReasoningEffort(text: []const u8) ?chat.ReasoningEffort {
     return null;
 }
 
+fn requireConversationModels(cfg: config_mod.Config) !void {
+    if (cfg.conversation_roster.entries.len == 0 and std.mem.trim(u8, cfg.conversation_models, " \r\n\t").len == 0) {
+        return error.MissingConversationModels;
+    }
+}
+
+fn requirePsycheModels(cfg: config_mod.Config) !void {
+    if (!std.mem.eql(u8, cfg.psyche_mode, "on")) return;
+    if (cfg.psyche_roster.entries.len == 0 and std.mem.trim(u8, cfg.psyche_models, " \r\n\t").len == 0) {
+        return error.MissingPsycheModels;
+    }
+}
+
 fn mcpHeadlessCapabilities() chat.CapabilitySet {
     return .{
         .stored_memory_read = true,
         .stored_memory_write = true,
-        .introspection = true,
         .time_lookup = true,
         .power_status = true,
         .storage_fullness = true,
@@ -364,10 +439,14 @@ const UnsupportedHostServices = struct {
     }
 
     fn speaker(self: *UnsupportedHostServices) speaker_mod.Speaker {
-        return .{ .ctx = self, .playFileFn = playFile };
+        return .{ .ctx = self, .playFileFn = playFile, .playFileBackgroundFn = playFileBackground };
     }
 
     fn playFile(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
+        return error.UnsupportedHostCapability;
+    }
+
+    fn playFileBackground(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
         return error.UnsupportedHostCapability;
     }
 

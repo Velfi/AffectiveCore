@@ -5,6 +5,7 @@ pub const SeedEntryKind = enum {
     core_value,
     operating_tendency,
     want,
+    goal,
     superego_principle,
 
     pub fn tag(self: SeedEntryKind) []const u8 {
@@ -12,6 +13,7 @@ pub const SeedEntryKind = enum {
             .core_value => "core_value",
             .operating_tendency => "seed_operating_tendency",
             .want => "self_want",
+            .goal => "self_goal",
             .superego_principle => "superego_principle",
         };
     }
@@ -21,6 +23,7 @@ pub const SeedEntryKind = enum {
             .core_value => "core value",
             .operating_tendency => "operating tendency",
             .want => "want",
+            .goal => "goal",
             .superego_principle => "superego principle",
         };
     }
@@ -42,6 +45,7 @@ const Section = enum {
     core_values,
     operating_tendencies,
     wants,
+    goals,
     superego_principles,
 };
 
@@ -58,6 +62,7 @@ pub fn parseSeedMarkdown(allocator: std.mem.Allocator, markdown: []const u8) !Se
     var core_count: usize = 0;
     var tendency_count: usize = 0;
     var want_count: usize = 0;
+    var goal_count: usize = 0;
     var principle_count: usize = 0;
 
     var lines = std.mem.splitScalar(u8, markdown, '\n');
@@ -82,6 +87,8 @@ pub fn parseSeedMarkdown(allocator: std.mem.Allocator, markdown: []const u8) !Se
                 .operating_tendencies
             else if (std.ascii.eqlIgnoreCase(heading, "Wants"))
                 .wants
+            else if (std.ascii.eqlIgnoreCase(heading, "Goals"))
+                .goals
             else if (std.ascii.eqlIgnoreCase(heading, "Superego Principles") or std.ascii.eqlIgnoreCase(heading, "Principles"))
                 .superego_principles
             else
@@ -90,7 +97,7 @@ pub fn parseSeedMarkdown(allocator: std.mem.Allocator, markdown: []const u8) !Se
         }
 
         switch (section) {
-            .core_values, .operating_tendencies, .wants, .superego_principles => {
+            .core_values, .operating_tendencies, .wants, .goals, .superego_principles => {
                 if (!std.mem.startsWith(u8, line, "- ")) return error.InvalidSeedBullet;
                 const text = std.mem.trim(u8, line[2..], " \r\t");
                 if (text.len == 0) return error.EmptySeedBullet;
@@ -98,6 +105,7 @@ pub fn parseSeedMarkdown(allocator: std.mem.Allocator, markdown: []const u8) !Se
                     .core_values => .core_value,
                     .operating_tendencies => .operating_tendency,
                     .wants => .want,
+                    .goals => .goal,
                     .superego_principles => .superego_principle,
                     .other => unreachable,
                 };
@@ -113,6 +121,10 @@ pub fn parseSeedMarkdown(allocator: std.mem.Allocator, markdown: []const u8) !Se
                     .want => blk: {
                         want_count += 1;
                         break :blk want_count;
+                    },
+                    .goal => blk: {
+                        goal_count += 1;
+                        break :blk goal_count;
                     },
                     .superego_principle => blk: {
                         principle_count += 1;

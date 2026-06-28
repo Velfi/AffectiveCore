@@ -27,7 +27,7 @@ const camera_mod = ports.camera;
 const speaker_mod = ports.speaker;
 const input_mod = ports.input;
 const button_mod = ports.button;
-const command_log_mod = ports.command_log;
+const event_log_mod = ports.event_log;
 const facial_expression = ports.facial_expression;
 const system_senses_mod = ports.system_senses;
 const time_mod = @import("time.zig");
@@ -42,7 +42,7 @@ const process = ports.process;
 
 const Brain = brain_mod.Brain;
 const BrainDeps = brain_mod.BrainDeps;
-const CommandBatchResult = brain_mod.CommandBatchResult;
+const ActionPressureBatchResult = brain_mod.ActionPressureBatchResult;
 const ConversationTurnResult = brain_mod.ConversationTurnResult;
 const ConversationSpeakerContext = brain_mod.Brain.ConversationSpeakerContext;
 const QuietHours = brain_mod.Brain.QuietHours;
@@ -69,6 +69,38 @@ pub fn isNotableChange(change_summary: []const u8) bool {
     if (std.ascii.startsWithIgnoreCase(change, "no visible change")) return false;
     if (std.ascii.startsWithIgnoreCase(change, "nothing changed")) return false;
     return true;
+}
+
+pub fn normalizeMatchText(out: []u8, text: []const u8) []const u8 {
+    var len: usize = 0;
+    var previous_space = true;
+    for (text) |ch| {
+        if (len >= out.len) break;
+        const lower: u8 = if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
+        if ((lower >= 'a' and lower <= 'z') or (lower >= '0' and lower <= '9')) {
+            out[len] = lower;
+            len += 1;
+            previous_space = false;
+        } else if (!previous_space) {
+            out[len] = ' ';
+            len += 1;
+            previous_space = true;
+        }
+    }
+    if (len > 0 and out[len - 1] == ' ') len -= 1;
+    return out[0..len];
+}
+
+pub fn textSubstantiallyMatches(a: []const u8, b: []const u8) bool {
+    var a_buf: [512]u8 = undefined;
+    var b_buf: [512]u8 = undefined;
+    const na = normalizeMatchText(&a_buf, a);
+    const nb = normalizeMatchText(&b_buf, b);
+    if (na.len == 0 or nb.len == 0) return false;
+    if (std.mem.eql(u8, na, nb)) return true;
+    if (na.len >= 12 and std.mem.indexOf(u8, nb, na) != null) return true;
+    if (nb.len >= 12 and std.mem.indexOf(u8, na, nb) != null) return true;
+    return false;
 }
 
 pub const MediaKind = enum {
@@ -161,32 +193,29 @@ pub fn endsWithIgnoreCase(text: []const u8, suffix: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text[text.len - suffix.len ..], suffix);
 }
 
-pub const CommandMemoryPolicy = struct {
-    source: schema.ExperienceSource,
-    kind: schema.ExperienceKind,
-    retention: schema.ExperienceRetention,
+pub const ActionMemoryPolicy = struct {
+    source: schema.MemoryExperienceSource,
+    kind: schema.MemoryExperienceKind,
+    retention: schema.MemoryExperienceRetention,
 };
 
-pub fn commandMemoryPolicy(command: chat_mod.ChatCommandType) ?CommandMemoryPolicy {
-    return switch (command) {
+pub fn actionMemoryPolicy(action: chat_mod.ActionProposalType) ?ActionMemoryPolicy {
+    return switch (action) {
         .take_picture, .describe_image, .compare_images, .recognize => .{ .source = .environment, .kind = .perception, .retention = .summarize },
-        .set_reminder => .{ .source = .brain, .kind = .reminder, .retention = .keep_episode },
+        .schedule_reminder => .{ .source = .brain, .kind = .reminder, .retention = .keep_episode },
         .send_email => .{ .source = .brain, .kind = .action, .retention = .keep_episode },
-        .ask_human, .imagine_image => .{ .source = .brain, .kind = .action, .retention = .keep_episode },
+        .imagine_image => .{ .source = .brain, .kind = .action, .retention = .keep_episode },
         else => null,
     };
 }
 
-pub fn commandTypeFromName(name: []const u8) ?chat_mod.ChatCommandType {
-    inline for (@typeInfo(chat_mod.ChatCommandType).@"enum".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @field(chat_mod.ChatCommandType, field.name);
-    }
-    return null;
+pub fn actionTypeFromName(name: []const u8) ?chat_mod.ActionProposalType {
+    return @import("capability_synonyms.zig").resolveAction(name);
 }
 
-pub fn idMonitorSeverityThreshold(text: []const u8) schema.RuntimeEventSeverity {
-    inline for (@typeInfo(schema.RuntimeEventSeverity).@"enum".fields) |field| {
-        if (std.ascii.eqlIgnoreCase(text, field.name)) return @field(schema.RuntimeEventSeverity, field.name);
+pub fn idMonitorExperienceLogSeverityThreshold(text: []const u8) schema.ExperienceLogSeverity {
+    inline for (@typeInfo(schema.ExperienceLogSeverity).@"enum".fields) |field| {
+        if (std.ascii.eqlIgnoreCase(text, field.name)) return @field(schema.ExperienceLogSeverity, field.name);
     }
     return .concern;
 }
@@ -332,6 +361,7 @@ pub fn selfDirectiveTags(allocator: std.mem.Allocator, kind: Brain.SelfDirective
     const kind_tag = switch (kind) {
         .need => "self_need",
         .want => "self_want",
+        .goal => "self_goal",
     };
     if (!tagInSlice(out.items, kind_tag)) try out.append(allocator, try allocator.dupe(u8, kind_tag));
     return out.toOwnedSlice(allocator);
@@ -342,16 +372,57 @@ pub fn seedEntryTags(allocator: std.mem.Allocator, kind: seed_mod.SeedEntryKind,
     return cloneConstStringSlice(allocator, &[_][]const u8{ "self_model", "seed", kind.tag(), seed_tag });
 }
 
+pub fn inferWantGoalKind(text: []const u8) want_achievement_mod.WantGoalKind {
+    const maintenance_markers = [_][]const u8{ "maintain", "preserve", "keeping", "keep ", "uninterrupted", "quiet focused" };
+    for (maintenance_markers) |marker| {
+        if (std.ascii.indexOfIgnoreCase(text, marker) != null) return .maintenance;
+    }
+    return .achievement;
+}
+
+pub fn deriveWantFulfillmentCriterion(allocator: std.mem.Allocator, text: []const u8, goal_kind: want_achievement_mod.WantGoalKind) ![]const u8 {
+    if (goal_kind == .maintenance and (std.ascii.indexOfIgnoreCase(text, "quiet") != null or std.ascii.indexOfIgnoreCase(text, "focus") != null)) {
+        return try allocator.dupe(u8, "quiet focused work or deep work was sustained for a meaningful stretch without meaningful interruption");
+    }
+    if (goal_kind == .achievement and std.ascii.indexOfIgnoreCase(text, "connect") != null) {
+        return try allocator.dupe(u8, "distance, disconnection, loneliness, or feeling like roommates is explicitly addressed and materially reduced in this event");
+    }
+    if (goal_kind == .achievement and std.ascii.indexOfIgnoreCase(text, "creative") != null) {
+        return try allocator.dupe(u8, "substantive progress on a personal creative project was made in this period");
+    }
+    return switch (goal_kind) {
+        .maintenance => try std.fmt.allocPrint(allocator, "the state described by \"{s}\" is sustained for a meaningful period", .{text}),
+        .achievement => try std.fmt.allocPrint(allocator, "the gap described by \"{s}\" is materially closed in this event", .{text}),
+    };
+}
+
+pub fn wantFulfillmentCriterionForMemory(allocator: std.mem.Allocator, memory: schema.MemoryRecord) ![]const u8 {
+    if (memory.fulfillment_criterion.len > 0) return try allocator.dupe(u8, memory.fulfillment_criterion);
+    const goal_kind = inferWantGoalKind(memory.text);
+    return deriveWantFulfillmentCriterion(allocator, memory.text, goal_kind);
+}
+
+pub fn assignWantFulfillmentCriterion(self_allocator: std.mem.Allocator, memory: *schema.MemoryRecord) !void {
+    if (!tagInSlice(memory.tags, "self_want")) return;
+    const goal_kind = inferWantGoalKind(memory.text);
+    memory.fulfillment_criterion = try deriveWantFulfillmentCriterion(self_allocator, memory.text, goal_kind);
+}
+
 pub fn wantAchievementCandidates(allocator: std.mem.Allocator, memories: []const schema.MemoryRecord) ![]want_achievement_mod.WantCandidate {
     var out = std.ArrayList(want_achievement_mod.WantCandidate).empty;
     for (memories) |memory| {
         if (!tagInSlice(memory.tags, "self_want")) continue;
         if (tagInSlice(memory.tags, "pending_dream_reconciliation")) continue;
+        const goal_kind = inferWantGoalKind(memory.text);
+        const fulfillment_criterion = try wantFulfillmentCriterionForMemory(allocator, memory);
         try out.append(allocator, .{
             .memory_id = memory.memory_id,
             .text = memory.text,
             .interpretation = memoryInterpretation(memory),
+            .goal_kind = goal_kind,
+            .fulfillment_criterion = fulfillment_criterion,
             .salience = memory.salience,
+            .confidence = memory.confidence,
             .score = memory.score,
         });
     }
@@ -443,9 +514,10 @@ pub fn findMemoryWithTagForTest(memories: []const schema.MemoryRecord, tag: []co
     return null;
 }
 
-pub fn runtimeEventsContain(runtime_events: []const []const u8, needle: []const u8) bool {
-    for (runtime_events) |event| {
-        if (std.mem.indexOf(u8, event, needle) != null) return true;
+pub fn experienceEventsContain(experience_events: []const schema.ExperienceEvent, needle: []const u8) bool {
+    for (experience_events) |event| {
+        if (std.mem.indexOf(u8, event.kind, needle) != null) return true;
+        if (std.mem.indexOf(u8, event.payload, needle) != null) return true;
     }
     return false;
 }

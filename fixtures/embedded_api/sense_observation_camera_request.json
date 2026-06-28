@@ -1,0 +1,13 @@
+{
+  "api_version": 1,
+  "request_id": "fixture-sense-observation-camera-001",
+  "event": {
+    "type": "sense_observation",
+    "sense": "camera",
+    "observation": {
+      "path": "/tmp/affective-camera.jpg",
+      "mime_type": "image/jpeg",
+      "source": "affective_requested_capture"
+    }
+  }
+}
