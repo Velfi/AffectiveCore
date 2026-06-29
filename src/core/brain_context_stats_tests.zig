@@ -315,10 +315,43 @@ test "recordLlmCompletion aggregates subsystem totals" {
     try std.testing.expectEqual(@as(u64, 180), totals.request_bytes);
     try std.testing.expectEqual(@as(u64, 50), totals.response_bytes);
     try std.testing.expectEqual(@as(u64, 50), totals.max_response_bytes);
+    try std.testing.expectEqual(@as(u64, 0), totals.total_latency_ms);
     try std.testing.expectEqualStrings("conversation", state.last_llm_call.?.subsystem);
     try std.testing.expectEqualStrings("openai", state.last_llm_call.?.provider);
     try std.testing.expectEqualStrings("gpt-4.1-nano", state.last_llm_call.?.model);
     try std.testing.expectEqualStrings("standard", state.last_llm_call.?.effort_tier.?);
+}
+
+test "recordLlmCompletion aggregates latency totals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var state = brain_context_stats.State.init(allocator);
+    defer state.deinit();
+
+    try brain_context_stats.recordLlmCompletion(&state, .{
+        .subsystem = "conversation",
+        .provider = "openai",
+        .model = "gpt-4.1-nano",
+        .effort_tier = "standard",
+        .request_bytes = 100,
+        .response_bytes = 50,
+        .outcome = .success,
+        .latency_ms = 120,
+    }, 1000);
+    try brain_context_stats.recordLlmCompletion(&state, .{
+        .subsystem = "conversation",
+        .provider = "openai",
+        .model = "gpt-4.1-nano",
+        .effort_tier = "standard",
+        .request_bytes = 80,
+        .response_bytes = 0,
+        .outcome = .provider_error,
+        .latency_ms = 30,
+    }, 1001);
+
+    const totals = state.llm_subsystems.get("conversation").?;
+    try std.testing.expectEqual(@as(u64, 150), totals.total_latency_ms);
 }
 
 test "llm stats count each provider attempt not each logical completion" {
@@ -518,4 +551,81 @@ test "wired provider client records llm usage in readModelsSnapshot" {
     try std.testing.expectEqualStrings("gpt-4.1-nano", snapshot.llm_usage_model.last_call.?.model);
     try std.testing.expectEqualStrings("standard", snapshot.llm_usage_model.last_call.?.effort_tier.?);
     try std.testing.expectEqual(@as(usize, "wired completion".len), snapshot.llm_usage_model.last_call.?.response_bytes);
+}
+
+test "recordLastDispatch persists conversation snapshot" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fs_state = TestFileSystem{ .allocator = allocator };
+    defer fs_state.deinit();
+    const fs = fs_state.filesystem();
+    const path = "data/test/context_stats_last_dispatch.json";
+
+    var state = brain_context_stats.State.init(allocator);
+    defer state.deinit();
+    const sections = [_]context_composition.SectionStat{
+        .{ .name = "compact_memory.focus", .bytes = 120 },
+        .{ .name = "observations.present_moment", .bytes = 80 },
+    };
+    const report = context_composition.ContextCompositionReport{
+        .operation = "conversation_chat",
+        .total_bytes = 500,
+        .system_prompt_bytes = 100,
+        .compact_memory_bytes = 200,
+        .observations_bytes = 150,
+        .user_prompt_bytes = 400,
+        .user_prompt_tokens = 100,
+        .sections = &sections,
+    };
+    try brain_context_stats.recordComposition(&state, report, 900);
+    try brain_context_stats.recordLastDispatch(&state, "req-42", report, true, 900);
+    try brain_context_stats.save(allocator, fs, std.testing.io, path, &state);
+
+    var loaded = try brain_context_stats.load(allocator, fs, std.testing.io, path);
+    defer loaded.deinit();
+    const last = loaded.last_dispatch orelse return error.TestExpectedFailure;
+    try std.testing.expectEqualStrings("req-42", last.dispatch_id);
+    try std.testing.expectEqualStrings("conversation_chat", last.operation);
+    try std.testing.expectEqual(@as(usize, 100), last.user_prompt_tokens);
+    try std.testing.expect(last.budget_exceeded);
+    try std.testing.expectEqual(@as(usize, 2), last.sections.len);
+}
+
+test "recordLlmCompletion timing span includes llm_call_id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var io_threaded: std.Io.Threaded = .init_single_threaded;
+    defer io_threaded.deinit();
+
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = brain_test_support.makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.deps.io = io_threaded.io();
+
+    try brain.beginRequestTimings("req-llm-timing");
+    try brain.recordLlmCompletion(.{
+        .subsystem = "conversation",
+        .provider = "openai",
+        .model = "gpt-4.1-nano",
+        .effort_tier = "standard",
+        .request_bytes = 100,
+        .response_bytes = 50,
+        .outcome = .success,
+        .latency_ms = 42,
+        .llm_call_id = "llmcall_0",
+    });
+    var report = try brain.finishRequestTimings();
+    defer @import("request_timings.zig").deinitReport(allocator, &report);
+
+    var llm_spans: usize = 0;
+    for (report.spans) |span| {
+        if (!std.mem.eql(u8, span.kind, "llm")) continue;
+        llm_spans += 1;
+        try std.testing.expectEqualStrings("llmcall_0", span.llm_call_id.?);
+        try std.testing.expectEqual(@as(i64, 42), span.duration_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 1), llm_spans);
 }

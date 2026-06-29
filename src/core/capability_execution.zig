@@ -4,6 +4,8 @@ const ports = @import("ports.zig");
 const chat_mod = ports.chat;
 const maintenance = @import("maintenance.zig");
 const facial_expression = ports.facial_expression;
+const emote_mod = ports.emote;
+const display_budget_mod = @import("display_budget.zig");
 const interrupt_mod = @import("interrupt.zig");
 const helpers = @import("brain_helpers.zig");
 const brain_activity = @import("brain_activity.zig");
@@ -65,7 +67,9 @@ pub fn executeCapabilityAction(
             try self.logCapabilityResult(proposal, line);
         },
         .recognize => {
-            const line = if (self.recognitionAlreadyInObservations(observations.items))
+            const line = if (self.awaitedHostRequestMatches("camera", "recognize"))
+                try self.allocator.dupe(u8, "recognition_in_flight:\n- identify_skipped: true\n- note: recognize already awaiting host delivery.\n")
+            else if (self.recognitionAlreadyInObservations(observations.items))
                 try self.recognitionRecentObservationNote(observations.items)
             else
                 try self.recognizeForObservation();
@@ -113,7 +117,7 @@ pub fn executeCapabilityAction(
         .forget_memory => {
             const memory_id = proposal.memory_id orelse "";
             const forgotten = if (memory_id.len > 0) try self.deps.store.forgetMemoryRecord(memory_id) else false;
-            try self.recordExperienceLogEvent(.{
+            _ = try self.recordExperienceLogEvent(.{
                 .kind = .memory_mutation,
                 .source = "memory",
                 .title = "forget_memory",
@@ -315,6 +319,11 @@ pub fn executeCapabilityAction(
             try observations.appendSlice(self.allocator, shown);
             try self.logCapabilityResult(proposal, shown);
         },
+        .emote => {
+            const shown = try showEmote(self, proposal);
+            try observations.appendSlice(self.allocator, shown);
+            try self.logCapabilityResult(proposal, shown);
+        },
         .unknown => {
             const line = try std.fmt.allocPrint(self.allocator, "unknown_action: ignored\n", .{});
             try observations.appendSlice(self.allocator, line);
@@ -324,15 +333,121 @@ pub fn executeCapabilityAction(
     return .ok;
 }
 
+pub fn proposalIncompleteReason(proposal: chat_mod.ActionProposal) ?[]const u8 {
+    return switch (proposal.action) {
+        .facial_expression => facialExpressionIncompleteReason(proposal),
+        .emote => emoteIncompleteReason(proposal),
+        .set_focus => if (std.mem.trim(u8, proposal.text orelse "", " \r\n\t").len == 0) "missing focus text" else null,
+        .set_fact => setFactIncompleteReason(proposal),
+        else => null,
+    };
+}
+
+pub fn proposalIncompleteReasonForBrain(self: *Brain, proposal: chat_mod.ActionProposal) ?[]const u8 {
+    if (proposalIncompleteReason(proposal)) |reason| return reason;
+    return switch (proposal.action) {
+        .facial_expression => facialExpressionCatalogIncompleteReason(self, proposal),
+        else => null,
+    };
+}
+
+fn setFactIncompleteReason(proposal: chat_mod.ActionProposal) ?[]const u8 {
+    const key = std.mem.trim(u8, proposal.name orelse "", " \r\n\t");
+    const value = std.mem.trim(u8, proposal.text orelse proposal.query orelse "", " \r\n\t");
+    if (key.len == 0) return "missing fact key (name)";
+    if (value.len == 0) return "missing fact value (text)";
+    return null;
+}
+
+fn emoteIncompleteReason(proposal: chat_mod.ActionProposal) ?[]const u8 {
+    if (proposal.duration_ms) |duration| {
+        if (duration > emote_mod.max_duration_ms) return "duration_ms exceeds maximum";
+    }
+    const text = proposal.text orelse "";
+    if (std.mem.trim(u8, text, " \r\n\t").len == 0) return "missing emote text";
+    return null;
+}
+
+fn facialExpressionIncompleteReason(proposal: chat_mod.ActionProposal) ?[]const u8 {
+    if (proposal.duration_ms) |duration| {
+        if (duration > facial_expression.max_duration_ms) return "duration_ms exceeds maximum";
+    }
+    const eyes_present = std.mem.trim(u8, proposal.eyes orelse "", " \r\n\t").len > 0;
+    const mouth_present = std.mem.trim(u8, proposal.mouth orelse "", " \r\n\t").len > 0;
+    if (eyes_present or mouth_present) return null;
+    if (proposal.text != null and std.mem.trim(u8, proposal.text.?, " \r\n\t").len > 0) return null;
+    return "missing eyes and mouth sprite names";
+}
+
+fn facialExpressionCatalogIncompleteReason(self: *Brain, proposal: chat_mod.ActionProposal) ?[]const u8 {
+    const catalog = self.facialExpressionCatalogView() orelse return "missing facial expression catalog";
+    return facial_expression.proposalCatalogIncompleteReason(
+        proposal.eyes,
+        proposal.mouth,
+        proposal.text,
+        proposal.duration_ms,
+        catalog,
+    );
+}
+
 pub fn showFacialExpression(self: *Brain, proposal: chat_mod.ActionProposal) ![]const u8 {
     const output = self.deps.facial_expression_output orelse return error.MissingFacialExpressionOutput;
-    const eyes = proposal.eyes orelse return error.MissingFacialExpressionEyes;
-    const mouth = proposal.mouth orelse return error.MissingFacialExpressionMouth;
-    const duration_ms = try facial_expression.normalizeDuration(proposal.duration_ms);
-    try output.show(.{ .eyes = eyes, .mouth = mouth, .duration_ms = duration_ms });
+    const expression = try resolveFacialExpression(self, proposal);
+    try self.validateFacialExpression(expression);
+    try display_budget_mod.tryConsume(&self.display_budget, self.now_seconds, expression.duration_ms);
+    try output.show(expression);
     return std.fmt.allocPrint(
         self.allocator,
         "facial_expression_shown: eyes={s} mouth={s} duration_ms={d}\n",
-        .{ eyes, mouth, duration_ms },
+        .{ expression.eyes, expression.mouth, expression.duration_ms },
     );
+}
+
+pub fn showEmote(self: *Brain, proposal: chat_mod.ActionProposal) ![]const u8 {
+    const output = self.deps.emote_output orelse return error.MissingEmoteOutput;
+    const raw = proposal.text orelse return error.MissingEmoteText;
+    const text = try emote_mod.normalizeText(self.allocator, raw);
+    defer self.allocator.free(text);
+    const duration_ms = try emote_mod.normalizeDuration(proposal.duration_ms);
+    try display_budget_mod.tryConsume(&self.display_budget, self.now_seconds, duration_ms);
+    const display_text = try std.fmt.allocPrint(self.allocator, "*{s}*", .{text});
+    defer self.allocator.free(display_text);
+    try output.show(.{ .text = text, .display_text = display_text, .duration_ms = duration_ms });
+    return std.fmt.allocPrint(
+        self.allocator,
+        "emote_shown: text={s} duration_ms={d}\n",
+        .{ text, duration_ms },
+    );
+}
+
+fn resolveFacialExpression(self: *Brain, proposal: chat_mod.ActionProposal) !facial_expression.Expression {
+    const catalog = self.facialExpressionCatalogView() orelse return error.MissingFacialExpressionCatalog;
+    const resolved = try facial_expression.resolveFromProposal(
+        proposal.eyes,
+        proposal.mouth,
+        proposal.text,
+        proposal.duration_ms,
+        catalog,
+    );
+    return .{
+        .eyes = resolved.eyes,
+        .mouth = resolved.mouth,
+        .duration_ms = resolved.duration_ms,
+    };
+}
+
+test "set_fact incomplete proposals are rejected before execution" {
+    try std.testing.expectEqualStrings(
+        "missing fact key (name)",
+        proposalIncompleteReason(.{ .action = .set_fact, .text = "value" }).?,
+    );
+    try std.testing.expectEqualStrings(
+        "missing fact value (text)",
+        proposalIncompleteReason(.{ .action = .set_fact, .name = "speech_output_issue" }).?,
+    );
+    try std.testing.expect(proposalIncompleteReason(.{
+        .action = .set_fact,
+        .name = "speech_output_issue",
+        .text = "user cannot hear speech",
+    }) == null);
 }

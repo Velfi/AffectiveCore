@@ -24,25 +24,6 @@ pub const IntentResult = struct {
     value: ?[]const u8 = null,
 };
 
-pub const IntentService = struct {
-    ctx: *anyopaque,
-    classifyFn: *const fn (*anyopaque, std.mem.Allocator, IntentContext, []const u8) anyerror!IntentResult,
-
-    pub fn classify(self: IntentService, allocator: std.mem.Allocator, context: IntentContext, text: []const u8) !IntentResult {
-        return self.classifyFn(self.ctx, allocator, context, text);
-    }
-};
-
-pub const TestIntentService = struct {
-    pub fn service(self: *TestIntentService) IntentService {
-        return .{ .ctx = self, .classifyFn = classify };
-    }
-
-    fn classify(_: *anyopaque, allocator: std.mem.Allocator, context: IntentContext, text: []const u8) !IntentResult {
-        return classifyHeuristic(allocator, context, text);
-    }
-};
-
 pub fn classifyHeuristic(allocator: std.mem.Allocator, context: IntentContext, text: []const u8) !IntentResult {
     const trimmed = std.mem.trim(u8, text, " \r\n\t.!?");
     if (trimmed.len == 0) return .{ .action = .unknown };

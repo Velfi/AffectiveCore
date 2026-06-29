@@ -93,15 +93,11 @@ pub fn appendAssociativeRecallObservation(self: *Brain, out: *std.ArrayList(u8),
     const trimmed = std.mem.trim(u8, query, " \t\r\n");
     if (trimmed.len == 0) return;
     const memories = try self.deps.store.loadMemoryRecords(self.allocator);
-    const results = try vector_index.search(self.allocator, memories, trimmed, &[_][]const u8{}, associative_recall_limit);
+    const results = try vector_index.search(self.allocator, self.deps.embedding_service, memories, trimmed, &[_][]const u8{}, associative_recall_limit);
     if (results.len == 0) return;
     try out.appendSlice(self.allocator, "associative_recall_possibilities:\n");
     for (results) |result| {
         const memory = memories[result.memory_index];
-        try out.print(
-            self.allocator,
-            "- {s}: {s} (similarity={d:.2})\n",
-            .{ memory.memory_id, helpers.memoryInterpretation(memory), result.similarity },
-        );
+        try out.print(self.allocator, "- {s} similarity={d:.2}\n", .{ memory.memory_id, result.similarity });
     }
 }

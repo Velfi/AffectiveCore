@@ -68,6 +68,7 @@ pub const OpenLoopKind = enum {
     camera,
     deferred_input,
     reminder,
+    process,
 };
 
 pub const OpenLoop = struct {

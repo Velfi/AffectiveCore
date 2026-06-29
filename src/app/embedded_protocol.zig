@@ -2,10 +2,13 @@ const std = @import("std");
 
 const event_log_mod = @import("../platform/common/event_log.zig");
 const facial_expression = @import("../platform/common/facial_expression.zig");
+const emote_mod = @import("../core/port_emote.zig");
 const mise_en_scene_mod = @import("../core/port_mise_en_scene.zig");
 const speaker_mod = @import("../platform/common/speaker.zig");
 const speech_mod = @import("../api/speech_client.zig");
 const chat = @import("../api/chat_client.zig");
+const request_timings = @import("../core/request_timings.zig");
+const context_dispatch_report = @import("../core/context_dispatch_report.zig");
 
 pub const HostEvent = struct {
     id: ?[]const u8 = null,
@@ -59,12 +62,20 @@ pub const HostEvent = struct {
         try jw.objectField("visibility");
         try jw.write(self.visibility orelse "public");
         try jw.objectField("presentation");
-        try jw.write(if (std.mem.eql(u8, self.type, "expression")) "chat" else if (std.mem.eql(u8, self.type, "mise_en_scene")) "status" else "log");
+        try jw.write(presentationForEventType(self.type));
         try jw.objectField("type");
         try jw.write(self.type);
         try jw.objectField("payload");
         try self.writePayload(jw);
         try jw.endObject();
+    }
+
+    fn presentationForEventType(event_type: []const u8) []const u8 {
+        if (std.mem.eql(u8, event_type, "expression")) return "chat";
+        if (std.mem.eql(u8, event_type, "mise_en_scene")) return "status";
+        if (std.mem.eql(u8, event_type, "capability_request")) return "chat";
+        if (std.mem.eql(u8, event_type, "developer_log")) return "log";
+        return "log";
     }
 
     fn stableID(self: HostEvent) []const u8 {
@@ -85,6 +96,9 @@ pub const HostEvent = struct {
         } else if (std.mem.eql(u8, self.type, "mise_en_scene")) {
             try jw.objectField("mise_en_scene");
             try self.writeMiseEnScenePayload(jw);
+        } else if (std.mem.eql(u8, self.type, "developer_log")) {
+            try jw.objectField("developer_log");
+            try self.writeDeveloperLogPayload(jw);
         } else {
             try jw.objectField("control");
             try self.writeControlPayload(jw);
@@ -173,6 +187,14 @@ pub const HostEvent = struct {
         try jw.endObject();
     }
 
+    fn writeDeveloperLogPayload(self: HostEvent, jw: anytype) !void {
+        try jw.beginObject();
+        try writeOptionalString(jw, "kind", self.kind);
+        try writeOptionalString(jw, "title", self.title);
+        try writeOptionalString(jw, "body", self.body orelse self.text);
+        try jw.endObject();
+    }
+
     fn writeMiseEnScenePayload(self: HostEvent, jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("name");
@@ -201,45 +223,6 @@ pub const HostManifest = struct {
     max_event_text_bytes: usize = 768,
     raw_ref_ttl_seconds: i64 = 24 * 60 * 60,
 };
-
-pub fn defaultMacosManifestJson() []const u8 {
-    return
-    \\{
-    \\  "platform": "macos",
-    \\  "storage_provider": "file_backed_migration",
-    \\  "capabilities": [
-    \\    "speech_input",
-    \\    "text_input",
-    \\    "poke_sequence",
-    \\    "short_touch",
-    \\    "long_touch",
-    \\    "speech_output",
-    \\    "event_envelope",
-    \\    "event_drain",
-    \\    "uploaded_media_read",
-    \\    "stored_memory_read",
-    \\    "stored_memory_write",
-    \\    "stored_image_read",
-    \\    "camera_capture",
-    \\    "provider_vision_completion",
-    \\    "identity_recognition",
-    \\    "time_lookup",
-    \\    "power_status",
-    \\    "storage_fullness",
-    \\    "database_stats",
-    \\    "reminder_io",
-    \\    "image_generation",
-    \\    "face_picture_update",
-    \\    "local_process_io",
-    \\    "facial_expression_output"
-    \\  ],
-    \\  "feature_flags": {
-    \\    "streaming_events": true,
-    \\    "logical_store": false
-    \\  }
-    \\}
-    ;
-}
 
 pub fn parseHostManifest(allocator: std.mem.Allocator, json: []const u8) !HostManifest {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
@@ -275,7 +258,7 @@ fn applyCapability(capabilities: *chat.CapabilitySet, name: []const u8) !void {
     if (std.mem.eql(u8, name, "camera_capture")) capabilities.live_camera = true else if (std.mem.eql(u8, name, "button_activation") or std.mem.eql(u8, name, "short_touch") or std.mem.eql(u8, name, "poke_sequence")) capabilities.button_activation = true else if (std.mem.eql(u8, name, "button_hold_state") or std.mem.eql(u8, name, "long_touch")) capabilities.button_hold_state = true else if (std.mem.eql(u8, name, "provider_vision_completion")) {
         capabilities.visual_description = true;
         capabilities.visual_comparison = true;
-    } else if (std.mem.eql(u8, name, "face_identification") or std.mem.eql(u8, name, "identity_recognition") or std.mem.eql(u8, name, "recognition")) capabilities.identity_recognition = true else if (std.mem.eql(u8, name, "memory_read") or std.mem.eql(u8, name, "stored_memory_read")) capabilities.stored_memory_read = true else if (std.mem.eql(u8, name, "memory_write") or std.mem.eql(u8, name, "stored_memory_write")) capabilities.stored_memory_write = true else if (std.mem.eql(u8, name, "stored_image_read")) capabilities.stored_image_read = true else if (std.mem.eql(u8, name, "time_lookup")) capabilities.time_lookup = true else if (std.mem.eql(u8, name, "orientation_read") or std.mem.eql(u8, name, "orientation_query")) capabilities.orientation_query = true else if (std.mem.eql(u8, name, "power_status")) capabilities.power_status = true else if (std.mem.eql(u8, name, "storage_fullness")) capabilities.storage_fullness = true else if (std.mem.eql(u8, name, "database_stats")) capabilities.database_stats = true else if (std.mem.eql(u8, name, "speech_output")) capabilities.speech_output = true else if (std.mem.eql(u8, name, "text_input") or std.mem.eql(u8, name, "speech_input")) capabilities.user_input = true else if (std.mem.eql(u8, name, "reminder_read") or std.mem.eql(u8, name, "reminder_write") or std.mem.eql(u8, name, "reminder_io") or std.mem.eql(u8, name, "notification_schedule")) capabilities.reminder_io = true else if (std.mem.eql(u8, name, "provider_image_generation") or std.mem.eql(u8, name, "image_generation")) capabilities.image_generation = true else if (std.mem.eql(u8, name, "face_enrollment") or std.mem.eql(u8, name, "face_picture_update")) capabilities.face_picture_update = true else if (std.mem.eql(u8, name, "email_delivery")) capabilities.email_delivery = true else if (std.mem.eql(u8, name, "local_process_io")) capabilities.local_process_io = true else if (std.mem.eql(u8, name, "uploaded_media_read") or std.mem.eql(u8, name, "media_uploaded")) capabilities.uploaded_media_read = true else if (std.mem.eql(u8, name, "audio_classification")) capabilities.audio_classification = true else if (std.mem.eql(u8, name, "audio_transcription")) capabilities.audio_transcription = true else if (std.mem.eql(u8, name, "video_inspection")) capabilities.video_inspection = true else if (std.mem.eql(u8, name, "facial_expression_output")) capabilities.facial_expression_output = true else if (std.mem.eql(u8, name, "motion_gesture_read") or std.mem.eql(u8, name, "microphone_capture") or std.mem.eql(u8, name, "provider_text_completion") or std.mem.eql(u8, name, "file_import") or std.mem.eql(u8, name, "file_export") or std.mem.eql(u8, name, "import_brain") or std.mem.eql(u8, name, "export_brain") or std.mem.eql(u8, name, "event_envelope") or std.mem.eql(u8, name, "event_drain") or std.mem.eql(u8, name, "sense_catalog") or std.mem.eql(u8, name, "sense_status") or std.mem.eql(u8, name, "sense_observation") or std.mem.eql(u8, name, "mailbox_read") or std.mem.eql(u8, name, "brain_mode_read")) {} else return error.UnknownHostCapability;
+    } else if (std.mem.eql(u8, name, "face_identification") or std.mem.eql(u8, name, "identity_recognition") or std.mem.eql(u8, name, "recognition")) capabilities.identity_recognition = true else if (std.mem.eql(u8, name, "memory_read") or std.mem.eql(u8, name, "stored_memory_read")) capabilities.stored_memory_read = true else if (std.mem.eql(u8, name, "memory_write") or std.mem.eql(u8, name, "stored_memory_write")) capabilities.stored_memory_write = true else if (std.mem.eql(u8, name, "stored_image_read")) capabilities.stored_image_read = true else if (std.mem.eql(u8, name, "time_lookup")) capabilities.time_lookup = true else if (std.mem.eql(u8, name, "orientation_read") or std.mem.eql(u8, name, "orientation_query")) capabilities.orientation_query = true else if (std.mem.eql(u8, name, "power_status")) capabilities.power_status = true else if (std.mem.eql(u8, name, "storage_fullness")) capabilities.storage_fullness = true else if (std.mem.eql(u8, name, "database_stats")) capabilities.database_stats = true else if (std.mem.eql(u8, name, "speech_output")) capabilities.speech_output = true else if (std.mem.eql(u8, name, "text_input") or std.mem.eql(u8, name, "speech_input")) capabilities.user_input = true else if (std.mem.eql(u8, name, "reminder_read") or std.mem.eql(u8, name, "reminder_write") or std.mem.eql(u8, name, "reminder_io") or std.mem.eql(u8, name, "notification_schedule")) capabilities.reminder_io = true else if (std.mem.eql(u8, name, "provider_image_generation") or std.mem.eql(u8, name, "image_generation")) capabilities.image_generation = true else if (std.mem.eql(u8, name, "face_enrollment") or std.mem.eql(u8, name, "face_picture_update")) capabilities.face_picture_update = true else if (std.mem.eql(u8, name, "email_delivery")) capabilities.email_delivery = true else if (std.mem.eql(u8, name, "local_process_io")) capabilities.local_process_io = true else if (std.mem.eql(u8, name, "uploaded_media_read") or std.mem.eql(u8, name, "media_uploaded")) capabilities.uploaded_media_read = true else if (std.mem.eql(u8, name, "audio_classification")) capabilities.audio_classification = true else if (std.mem.eql(u8, name, "audio_transcription")) capabilities.audio_transcription = true else if (std.mem.eql(u8, name, "video_inspection")) capabilities.video_inspection = true else if (std.mem.eql(u8, name, "facial_expression_output")) capabilities.facial_expression_output = true else if (std.mem.eql(u8, name, "introspection")) capabilities.introspection = true else if (std.mem.eql(u8, name, "motion_gesture_read") or std.mem.eql(u8, name, "microphone_capture") or std.mem.eql(u8, name, "provider_text_completion") or std.mem.eql(u8, name, "file_import") or std.mem.eql(u8, name, "file_export") or std.mem.eql(u8, name, "import_brain") or std.mem.eql(u8, name, "export_brain") or std.mem.eql(u8, name, "event_envelope") or std.mem.eql(u8, name, "event_drain") or std.mem.eql(u8, name, "sense_catalog") or std.mem.eql(u8, name, "sense_status") or std.mem.eql(u8, name, "sense_observation") or std.mem.eql(u8, name, "mailbox_read") or std.mem.eql(u8, name, "brain_mode_read")) {} else return error.UnknownHostCapability;
 }
 
 fn cloneObjectMap(allocator: std.mem.Allocator, object: std.json.ObjectMap) std.mem.Allocator.Error!std.json.ObjectMap {
@@ -345,6 +328,7 @@ test "embedded host manifest maps declared capabilities" {
     try std.testing.expect(manifest.capabilities.visual_description);
     try std.testing.expect(manifest.capabilities.reminder_io);
     try std.testing.expect(manifest.capabilities.facial_expression_output);
+    try std.testing.expect(manifest.capabilities.introspection);
     try std.testing.expect(manifest.capabilities.live_camera);
 }
 
@@ -386,18 +370,20 @@ test "embedded host manifest accepts generic sense capabilities" {
     try std.testing.expect(manifest.capabilities.user_input);
 }
 
-test "embedded host manifest rejects unknown introspection capability" {
+test "embedded host manifest accepts introspection capability" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    try std.testing.expectError(error.UnknownHostCapability, parseHostManifest(allocator,
+    const manifest = try parseHostManifest(allocator,
         \\{
         \\  "platform": "macos",
         \\  "capabilities": ["text_input", "introspection"],
         \\  "feature_flags": {}
         \\}
-    ));
+    );
+    try std.testing.expect(manifest.capabilities.user_input);
+    try std.testing.expect(manifest.capabilities.introspection);
 }
 
 test "host effect collector emits mise en scene from output port" {
@@ -427,6 +413,22 @@ test "host effect collector emits mise en scene payload" {
     try std.testing.expectEqualStrings("green", events[0].theme_color.?);
 }
 
+test "host effect collector emits public emote expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var collector = HostEffectCollector.init(arena.allocator());
+    try collector.appendEmote("waves", 3000);
+
+    const events = collector.items();
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("expression", events[0].type);
+    try std.testing.expectEqualStrings("emote", events[0].modality.?);
+    try std.testing.expectEqualStrings("public", events[0].visibility.?);
+    try std.testing.expectEqualStrings("brain", events[0].role.?);
+    try std.testing.expectEqualStrings("*waves*", events[0].text.?);
+    try std.testing.expectEqual(@as(u32, 3000), events[0].duration_ms.?);
+}
+
 test "host effect collector emits public expressions for text and face output" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -435,7 +437,8 @@ test "host effect collector emits public expressions for text and face output" {
     try collector.appendFacialExpression(.{ .eyes = "focused", .mouth = "smile_closed" });
 
     const events = collector.items();
-    try std.testing.expectEqualStrings("state", events[0].type);
+    try std.testing.expectEqualStrings("developer_log", events[0].type);
+    try std.testing.expectEqualStrings("brain", events[0].kind.?);
     try std.testing.expectEqualStrings("expression", events[1].type);
     try std.testing.expectEqualStrings("text", events[1].modality.?);
     try std.testing.expectEqualStrings("public", events[1].visibility.?);
@@ -484,7 +487,7 @@ pub const HostEffectCollector = struct {
         const owned_title = try self.allocator.dupe(u8, title);
         const owned_body = try self.allocator.dupe(u8, body);
         try self.events.append(self.allocator, .{
-            .type = "state",
+            .type = "developer_log",
             .kind = owned_kind,
             .title = owned_title,
             .body = owned_body,
@@ -502,12 +505,6 @@ pub const HostEffectCollector = struct {
                 .role = "user",
                 .title = title,
                 .text = body,
-            });
-        } else if (std.mem.eql(u8, normalized_kind, "state")) {
-            try self.events.append(self.allocator, .{
-                .type = "state",
-                .state = owned_title,
-                .text = owned_body,
             });
         }
     }
@@ -536,6 +533,17 @@ pub const HostEffectCollector = struct {
             .eyes = try self.allocator.dupe(u8, expression.eyes),
             .mouth = try self.allocator.dupe(u8, expression.mouth),
             .duration_ms = expression.duration_ms,
+        });
+    }
+
+    pub fn appendEmote(self: *HostEffectCollector, text: []const u8, duration_ms: u32) !void {
+        const display_text = try std.fmt.allocPrint(self.allocator, "*{s}*", .{text});
+        defer self.allocator.free(display_text);
+        try self.appendExpression(.{
+            .modality = "emote",
+            .role = "brain",
+            .text = display_text,
+            .duration_ms = duration_ms,
         });
     }
 
@@ -616,6 +624,10 @@ pub const HostEffectCollector = struct {
         return .{ .ctx = self, .showFn = showFacialExpressionFromContext };
     }
 
+    pub fn emoteOutput(self: *HostEffectCollector) emote_mod.Output {
+        return .{ .ctx = self, .showFn = showEmoteFromContext };
+    }
+
     pub fn miseEnSceneOutput(self: *HostEffectCollector) mise_en_scene_mod.Output {
         return .{ .ctx = self, .applyFn = applyMiseEnSceneFromContext };
     }
@@ -646,6 +658,11 @@ pub const HostEffectCollector = struct {
         try self.appendFacialExpression(expression);
     }
 
+    fn showEmoteFromContext(ctx: *anyopaque, emote: emote_mod.Emote) !void {
+        const self: *HostEffectCollector = @ptrCast(@alignCast(ctx));
+        try self.appendEmote(emote.text, emote.duration_ms);
+    }
+
     fn applyMiseEnSceneFromContext(ctx: *anyopaque, name: []const u8, theme_color: ?[]const u8) !void {
         const self: *HostEffectCollector = @ptrCast(@alignCast(ctx));
         try self.appendMiseEnScene(name, theme_color);
@@ -658,6 +675,8 @@ pub fn successEnvelopeAlloc(
     events: []const HostEvent,
     result: anytype,
     budget: anytype,
+    timings: request_timings.Report,
+    context: ?context_dispatch_report.Report,
 ) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, .{
         .request_id = request_id,
@@ -665,6 +684,8 @@ pub fn successEnvelopeAlloc(
         .events = events,
         .result = result,
         .budget = budget,
+        .timings = timings,
+        .context = context,
     }, .{ .whitespace = .indent_2 });
 }
 
@@ -675,6 +696,8 @@ pub fn errorEnvelopeAlloc(
     message: []const u8,
     recoverable: bool,
     budget: anytype,
+    timings: request_timings.Report,
+    context: ?context_dispatch_report.Report,
 ) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, .{
         .request_id = request_id,
@@ -686,5 +709,7 @@ pub fn errorEnvelopeAlloc(
             .recoverable = recoverable,
         },
         .budget = budget,
+        .timings = timings,
+        .context = context,
     }, .{ .whitespace = .indent_2 });
 }

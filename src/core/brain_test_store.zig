@@ -7,11 +7,11 @@ const interrupt_mod = @import("interrupt.zig");
 const ports = @import("ports.zig");
 const schema = ports.schema;
 const store_mod = ports.store;
-const intent_mod = ports.intent;
 const openai = ports.openai;
 const chat_mod = ports.chat;
 const audio_mod = ports.audio;
 const want_achievement_mod = ports.want_achievement;
+const persona_directive_mod = ports.persona_directive;
 const camera_mod = ports.camera;
 const input_mod = ports.input;
 const event_log_mod = ports.event_log;
@@ -52,6 +52,7 @@ pub const TestStore = struct {
     activity_history: std.ArrayList(schema.ActivityRecord),
     brain_mode: schema.BrainMode = .waking,
     want_detector: want_achievement_mod.ScriptedWantAchievementDetector,
+    persona_synthesizer: persona_directive_mod.ScriptedPersonaDirectiveSynthesizer,
     retain_prefix: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) TestStore {
@@ -82,6 +83,13 @@ pub const TestStore = struct {
             .activity_stack = .empty,
             .activity_history = .empty,
             .want_detector = .{},
+            .persona_synthesizer = .{
+                .directive = .{
+                    .persona = "You are a thoughtful companion learning to ask before acting certain.",
+                    .short_term = "Keep clarifying uncertain recognition and stay present with greetings.",
+                    .long_term = "Figure out who you are while staying honest about uncertainty.",
+                },
+            },
         };
     }
 
@@ -152,8 +160,14 @@ pub const TestStore = struct {
             .loadActivityStackFn = loadActivityStack,
             .appendActivityHistoryFn = appendActivityHistory,
             .loadActivityHistoryFn = loadActivityHistory,
+            .beginDeferredPersistFn = beginDeferredPersist,
+            .endDeferredPersistFn = endDeferredPersist,
         };
     }
+
+    pub fn beginDeferredPersist(_: *anyopaque) !void {}
+
+    pub fn endDeferredPersist(_: *anyopaque) !void {}
 
     pub fn upsertBelief(ctx: *anyopaque, belief: schema.Belief) !void {
         const self: *TestStore = @ptrCast(@alignCast(ctx));
@@ -258,8 +272,22 @@ pub const TestStore = struct {
 
     pub fn upsertDisposition(ctx: *anyopaque, disposition: schema.Disposition) !void {
         const self: *TestStore = @ptrCast(@alignCast(ctx));
-        for (self.dispositions.items, 0..) |existing, i| if (std.mem.eql(u8, existing.disposition_id, disposition.disposition_id)) { self.dispositions.items[i] = disposition; return; };
+        for (self.dispositions.items, 0..) |existing, i| {
+            if (std.mem.eql(u8, existing.disposition_id, disposition.disposition_id)) {
+                freeDispositionOwned(self.allocator, existing);
+                self.dispositions.items[i] = disposition;
+                return;
+            }
+        }
         try self.dispositions.append(self.allocator, disposition);
+    }
+
+    fn freeDispositionOwned(allocator: std.mem.Allocator, disposition: schema.Disposition) void {
+        allocator.free(disposition.disposition_id);
+        allocator.free(disposition.context_pattern);
+        allocator.free(disposition.action_tendency);
+        for (disposition.source_event_ids) |event_id| allocator.free(event_id);
+        for (disposition.source_dream_ids) |dream_id| allocator.free(dream_id);
     }
 
     pub fn loadDispositions(ctx: *anyopaque, _: std.mem.Allocator) ![]schema.Disposition { const self: *TestStore = @ptrCast(@alignCast(ctx)); return self.dispositions.items; }

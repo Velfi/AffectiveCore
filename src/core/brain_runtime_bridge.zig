@@ -24,7 +24,9 @@ const LearningCapabilityRecordedPayload = actors.payloads.LearningCapabilityReco
 const LearningCorrectionRecordedPayload = actors.payloads.LearningCorrectionRecordedPayload;
 const memory_types = actors.memory.types;
 const context_composition = @import("context_composition.zig");
+const vector_index = @import("vector_index.zig");
 const process_goal_resolver = @import("process_goal_resolver.zig");
+const process_runtime_mod = @import("process_runtime.zig");
 
 const no_events = [_]brain_event.BrainEvent{};
 
@@ -487,14 +489,14 @@ fn registerTurnProposals(turn_ctx: *RuntimeTurnContext, allocator: std.mem.Alloc
         try turn_ctx.proposals.append(allocator, .{
             .proposal_id = proposal_id,
             .proposal = registered,
-            .payload = proposalPayload(proposal_id, registered),
+            .payload = proposalPayload(proposal_id, registered, turn_ctx.source),
         });
     }
 }
 
-fn proposalPayload(proposal_id: []const u8, proposal: chat_mod.ActionProposal) ProposalEventPayload {
+fn proposalPayload(proposal_id: []const u8, proposal: chat_mod.ActionProposal, source: RuntimeSource) ProposalEventPayload {
     const body_text = proposal.text orelse proposal.query orelse proposal.name orelse @tagName(proposal.action);
-    const strength = proposalStrength(proposal);
+    const strength = proposalStrength(proposal, source);
     const urgency = proposalUrgency(proposal);
     const risk = proposalRisk(proposal);
     return .{
@@ -531,8 +533,9 @@ fn proposalPayload(proposal_id: []const u8, proposal: chat_mod.ActionProposal) P
     };
 }
 
-fn proposalStrength(proposal: chat_mod.ActionProposal) f32 {
-    const base: f32 = if (proposal.origin == .interaction) 0.80 else 0.62;
+fn proposalStrength(proposal: chat_mod.ActionProposal, source: RuntimeSource) f32 {
+    var base: f32 = if (proposal.origin == .interaction) 0.80 else 0.62;
+    if (source == .conversation and proposal.action == .say) base = 0.88;
     const multiplier: f32 = switch (proposal.scale) {
         .full => 1.0,
         .medium => 0.75,
@@ -718,8 +721,17 @@ fn runtimeLanguageMindActorHandle(ctx: *anyopaque, event: brain_event.BrainEvent
             turn_ctx.observations.items,
         );
         defer handle_ctx.allocator.free(composition_context);
+        var original_pressures = std.ArrayList(chat_mod.ActionProposal).empty;
+        defer {
+            for (original_pressures.items) |proposal| chat_mod.freeActionProposal(handle_ctx.allocator, proposal);
+            original_pressures.deinit(handle_ctx.allocator);
+        }
+        for (turn.action_pressures) |proposal| {
+            try original_pressures.append(handle_ctx.allocator, try chat_mod.cloneActionProposal(handle_ctx.allocator, proposal));
+        }
         var expanded_turn = turn;
         try process_goal_resolver.expandChatTurn(self, &expanded_turn, composition_context);
+        try process_runtime_mod.logTurnDebug(self, turn_ctx.turn_index, expanded_turn, original_pressures.items);
         coerceConversationOrigins(turn_ctx, expanded_turn.action_pressures);
         try actor.emitProposals(turn_ctx.now_ms, expanded_turn.action_pressures);
         turn_ctx.chat_turn = expanded_turn;
@@ -1161,7 +1173,7 @@ fn runtimeMemoryReconciliationActorHandle(ctx: *anyopaque, event: brain_event.Br
     });
     defer parsed.deinit();
     if (parsed.value.source_event_ids.len == 0) return error.MemoryCandidateMissingSourceEventIds;
-    _ = try actors.memory.MemoryReconciliationActor.reconcileCandidate(&actor_context, .{
+    const candidate = actors.memory.types.MemoryCandidate{
         .candidate_id = parsed.value.candidate_id,
         .key = parsed.value.key,
         .proposition = parsed.value.proposition,
@@ -1171,8 +1183,42 @@ fn runtimeMemoryReconciliationActorHandle(ctx: *anyopaque, event: brain_event.Br
         .salience = parsed.value.salience,
         .source_event_ids = parsed.value.source_event_ids,
         .tags = parsed.value.tags,
-    });
+    };
+    const reconciliation = try actors.memory.MemoryReconciliationActor.reconcileCandidate(&actor_context, candidate);
+    try promoteReconciledCandidateToSearchableMemory(self, candidate, reconciliation);
     return no_events[0..];
+}
+
+fn promoteReconciledCandidateToSearchableMemory(
+    self: *Brain,
+    candidate: memory_types.MemoryCandidate,
+    reconciliation: memory_types.ReconciliationResult,
+) !void {
+    switch (reconciliation.action) {
+        .reject, .contradict => return,
+        else => {},
+    }
+    const belief_id = reconciliation.belief_id orelse return;
+    const memory_id = try std.fmt.allocPrint(self.allocator, "belief_mem_{s}", .{belief_id});
+    defer self.allocator.free(memory_id);
+    const existing = try self.deps.store.loadMemoryRecords(self.allocator);
+    for (existing) |record| {
+        if (std.mem.eql(u8, record.memory_id, memory_id)) return;
+    }
+    var record = try self.createMemoryRecord(candidate.proposition, candidate.tags);
+    self.allocator.free(record.memory_id);
+    record.memory_id = try self.allocator.dupe(u8, memory_id);
+    record.status = .active;
+    record.scope = if (std.mem.eql(u8, candidate.key, "thought")) .short_term else .long_term;
+    record.confidence = candidate.confidence;
+    record.salience = candidate.salience;
+    record.interpretation = try std.fmt.allocPrint(
+        self.allocator,
+        "reconciled {s}: {s}",
+        .{ @tagName(candidate.kind), candidate.proposition },
+    );
+    record.vector = try vector_index.embedQuery(self.allocator, self.deps.embedding_service, candidate.proposition, candidate.tags);
+    try self.deps.store.saveMemoryRecord(record);
 }
 
 fn runtimeMemoryConsolidationActorId(_: *anyopaque) []const u8 {

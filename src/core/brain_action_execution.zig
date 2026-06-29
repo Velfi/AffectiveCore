@@ -11,9 +11,7 @@ const ports = @import("ports.zig");
 const schema = ports.schema;
 const store_mod = ports.store;
 const graph_store = ports.graph_store;
-const intent_mod = ports.intent;
 const openai = ports.openai;
-const greeting_client = ports.greeting;
 const speech_mod = ports.speech;
 const chat_mod = ports.chat;
 const skills_mod = ports.skills;
@@ -70,7 +68,7 @@ pub fn interruptPoint(self: *Brain, observations: *std.ArrayList(u8)) !?interrup
     const stimulus = (try source.poll(self.allocator)) orelse return null;
     const line = try std.fmt.allocPrint(self.allocator, "interrupt_stimulus: {s}\n", .{@tagName(stimulus.kind)});
     try observations.appendSlice(self.allocator, line);
-    try self.recordExperienceLogEvent(.{
+    _ = try self.recordExperienceLogEvent(.{
         .kind = .autonomy,
         .source = "interrupt",
         .title = "interrupt_stimulus",
@@ -98,7 +96,7 @@ pub fn serviceDueMaintenanceInterrupt(self: *Brain, observations: *std.ArrayList
     else
         try std.fmt.allocPrint(self.allocator, "interrupt_reminder: {s}\n", .{task.capability_spec});
     try observations.appendSlice(self.allocator, line);
-    try self.recordExperienceLogEvent(.{
+    _ = try self.recordExperienceLogEvent(.{
         .kind = .reminder,
         .source = "maintenance",
         .title = if (speech_intent != null) "timer_fired" else "interrupt_reminder",
@@ -125,6 +123,28 @@ pub fn handleInterruptStimulus(self: *Brain, stimulus: interrupt_mod.Stimulus) a
         .held_input => try self.handleHoldActivation(),
         .conversation => try self.handleConversationTurn(),
     }
+}
+
+fn recordActionTimingSpan(self: *Brain, action: chat_mod.ActionProposalType, action_id: []const u8, started_ms: i64) !void {
+    if (!self.request_timings.active) return;
+    const io = self.deps.io orelse return;
+    const duration_ms = std.Io.Clock.real.now(io).toMilliseconds() - started_ms;
+    const step_ctx = self.currentTimingStepContext();
+    const process_id = if (self.active_process) |active_process| try self.allocator.dupe(u8, active_process.id) else null;
+    const step_id = if (step_ctx.step_id) |id| try self.allocator.dupe(u8, id) else null;
+    try self.recordRequestSpan(.{
+        .span_id = try self.requestTimingsAllocSpanId(),
+        .kind = try self.allocator.dupe(u8, "action"),
+        .label = try self.allocator.dupe(u8, @tagName(action)),
+        .duration_ms = duration_ms,
+        .dispatch_id = try self.ownedTimingDispatchId(),
+        .activity_id = try self.ownedTimingActivityId(),
+        .process_id = process_id,
+        .step_id = step_id,
+        .step_index = step_ctx.step_index,
+        .action_id = try self.allocator.dupe(u8, action_id),
+        .action = try self.allocator.dupe(u8, @tagName(action)),
+    });
 }
 
 pub fn executeActionProposals(self: *Brain, proposals: []chat_mod.ActionProposal, observations: *std.ArrayList(u8)) !ActionPressureBatchResult {
@@ -172,7 +192,7 @@ pub fn executeActionProposals(self: *Brain, proposals: []chat_mod.ActionProposal
             .index = proposal_index,
             .proposal = proposal,
             .pressure = action_pressure,
-            .policy_suppression = try shouldSuppressIdentityRiskAction(self, proposal),
+            .policy_suppression = try shouldSuppressAutonomyPolicyAction(self, proposal) orelse try shouldSuppressIdentityRiskAction(self, proposal),
         });
     }
     var governor_state = maintenance.AutonomyState{
@@ -193,6 +213,11 @@ pub fn executeActionProposals(self: *Brain, proposals: []chat_mod.ActionProposal
                 .limited_max_capacity = self.cfg.autonomy_limited_max_capacity,
                 .full_max_capacity = self.cfg.autonomy_full_max_capacity,
             },
+        );
+        maintenance.replenishCapacity(
+            &governor_state,
+            brain_autonomy.autonomyReplenishRatePerSecond(self.cfg),
+            self.now_seconds,
         );
         persisted_state = true;
     }
@@ -224,6 +249,7 @@ pub fn executeActionProposals(self: *Brain, proposals: []chat_mod.ActionProposal
             const reason = item.policy_suppression orelse (verdict.suppressed_reason orelse "below governor threshold");
             const line = try std.fmt.allocPrint(self.allocator, "action_suppressed: {s}: {s}\n", .{ skills_mod.name(item.proposal.action), reason });
             try observations.appendSlice(self.allocator, line);
+            try self.logActionSuppressed(item.proposal.action, reason);
             _ = try self.suppressActionPressure(item.pressure, reason);
             self.traceActionPressure("action_pressures.action.suppressed", item.index, item.proposal.action);
         }
@@ -233,9 +259,18 @@ pub fn executeActionProposals(self: *Brain, proposals: []chat_mod.ActionProposal
         const verdict = evaluated[index];
         if (item.policy_suppression != null or !verdict.passed) continue;
         const proposal = verdict.proposal;
+        if (proposal.origin == .autonomy and maintenance.autonomyActionCooldownActive(governor_state, self.now_seconds)) {
+            const line = try std.fmt.allocPrint(self.allocator, "action_suppressed: {s}: autonomy action cooldown\n", .{skills_mod.name(proposal.action)});
+            try observations.appendSlice(self.allocator, line);
+            try self.logActionSuppressed(proposal.action, "autonomy action cooldown");
+            _ = try self.suppressActionPressure(item.pressure, "autonomy action cooldown");
+            self.traceActionPressure("action_pressures.action.suppressed", item.index, proposal.action);
+            continue;
+        }
         if (proposal.origin == .autonomy and !maintenance.autonomyBudgetAvailable(governor_state)) {
             const line = try std.fmt.allocPrint(self.allocator, "action_suppressed: {s}: autonomy overdrawn\n", .{skills_mod.name(proposal.action)});
             try observations.appendSlice(self.allocator, line);
+            try self.logActionSuppressed(proposal.action, "autonomy overdrawn");
             _ = try self.suppressActionPressure(item.pressure, "autonomy overdrawn");
             self.traceActionPressure("action_pressures.action.suppressed", item.index, proposal.action);
             continue;
@@ -253,6 +288,12 @@ pub fn executeActionProposals(self: *Brain, proposals: []chat_mod.ActionProposal
             capability_input,
             item.pressure.causal_parent_ids,
         );
+        const action_started_ms: ?i64 = if (self.deps.io) |io| std.Io.Clock.real.now(io).toMilliseconds() else null;
+        defer if (action_started_ms) |started_ms| {
+            recordActionTimingSpan(self, proposal.action, capability_request.request_id, started_ms) catch |err| {
+                self.traceError("request_timings.action", err);
+            };
+        };
         var capability_finished = false;
         errdefer |err| {
             if (error_descriptions.isDeferredControlFlow(err)) {
@@ -287,8 +328,46 @@ pub fn executeActionProposals(self: *Brain, proposals: []chat_mod.ActionProposal
             }
             continue;
         }
+        if (capability_execution.proposalIncompleteReasonForBrain(self, proposal)) |reason| {
+            const hint = skills_mod.failureHint(proposal.action);
+            const line = if (hint.len > 0)
+                try std.fmt.allocPrint(self.allocator, "skill_failed: {s}: incomplete: {s}\nresolution: {s}\n", .{ skills_mod.name(proposal.action), reason, hint })
+            else
+                try std.fmt.allocPrint(self.allocator, "skill_failed: {s}: incomplete: {s}\n", .{ skills_mod.name(proposal.action), reason });
+            try observations.appendSlice(self.allocator, line);
+            try self.logCapabilityResult(proposal, line);
+            _ = try self.recordCapabilityResult(capability_request, .unavailable, "", reason);
+            capability_finished = true;
+            self.traceActionPressure("action_pressures.action.incomplete", item.index, proposal.action);
+            if (try interruptPoint(self, observations)) |stimulus| {
+                return .{
+                    .spoken_text = spoken_text,
+                    .ended_with_speech = ended_with_speech,
+                    .interrupted_by = stimulus,
+                    .selected_primary_action = selected_primary_action,
+                };
+            }
+            continue;
+        }
         const observation_start_len = observations.items.len;
-        const flow = try capability_execution.executeCapabilityAction(self, proposal, item.index, observations, &spoken_text, interruptPoint);
+        const flow = capability_execution.executeCapabilityAction(self, proposal, item.index, observations, &spoken_text, interruptPoint) catch |err| {
+            if (!capability_finished) {
+                _ = self.recordCapabilityResult(capability_request, .failed, "", error_descriptions.detail(err)) catch {};
+                capability_finished = true;
+            }
+            try recordSkillFailure(self, proposal, observations, err);
+            self.traceActionPressureError("action_pressures.action.error", item.index, proposal.action, err);
+            if (!error_descriptions.isRecoverableSkillFailure(err)) return @errorCast(err);
+            if (try interruptPoint(self, observations)) |stimulus| {
+                return .{
+                    .spoken_text = spoken_text,
+                    .ended_with_speech = ended_with_speech,
+                    .interrupted_by = stimulus,
+                    .selected_primary_action = selected_primary_action,
+                };
+            }
+            continue;
+        };
         switch (flow) {
             .ok, .next_action => {},
             .interrupt => |stimulus| return .{
@@ -310,8 +389,8 @@ pub fn executeActionProposals(self: *Brain, proposals: []chat_mod.ActionProposal
         }
         executed_any = true;
         autonomy_governor.applyExecutedProposal(&governor_state, verdict);
+        if (proposal.origin == .autonomy) governor_state.last_autonomy_action_at = self.now_seconds;
         if (proposal.action == .say) ended_with_speech = true;
-        if (proposal.action == .facial_expression and proposal.origin == .autonomy) self.last_autonomous_facial_expression_at = self.now_seconds;
         self.traceActionPressure("action_pressures.action.done", item.index, proposal.action);
         if (try interruptPoint(self, observations)) |stimulus| {
             return .{
@@ -431,6 +510,16 @@ pub fn actionIsCallable(self: *Brain, action: chat_mod.ActionProposalType) !bool
 pub fn actionProposalsEndWithSpeech(proposals: []const chat_mod.ActionProposal) bool {
     if (proposals.len == 0) return false;
     return proposals[proposals.len - 1].action == .say;
+}
+
+fn shouldSuppressAutonomyPolicyAction(self: *Brain, proposal: chat_mod.ActionProposal) !?[]const u8 {
+    if (proposal.origin != .autonomy) return null;
+    if (skills_mod.autonomyAllowed(proposal.action, self.cfg.autonomy_mode)) return null;
+    return try std.fmt.allocPrint(
+        self.allocator,
+        "{s} is not allowed for autonomy mode {s}",
+        .{ skills_mod.name(proposal.action), self.cfg.autonomy_mode },
+    );
 }
 
 fn shouldSuppressIdentityRiskAction(self: *Brain, proposal: chat_mod.ActionProposal) !?[]const u8 {

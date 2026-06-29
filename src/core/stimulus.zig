@@ -12,6 +12,7 @@ pub const Kind = enum {
     database,
     interrupt,
     reminder,
+    reaction,
 };
 
 pub const Input = struct {

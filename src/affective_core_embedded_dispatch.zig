@@ -8,6 +8,8 @@ const embedded = @import("affective_core_embedded.zig");
 const embedded_ops = @import("affective_core_embedded_ops.zig");
 const error_descriptions = @import("core/error_descriptions.zig");
 const brain_mod = @import("core/brain.zig");
+const brain_process = @import("core/brain_process.zig");
+const request_timings = @import("core/request_timings.zig");
 
 const AffectiveCoreEmbedded = embedded.AffectiveCoreEmbedded;
 
@@ -95,39 +97,84 @@ pub fn emptyBudget(ctx: *AffectiveCoreEmbedded) context_gate.BudgetReport {
 }
 
 pub fn dispatchJson(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8 {
-    ctx.http_transport.last_error = null;
+    defer ctx.resetDispatchScratch();
+    ctx.clearHttpTransportLastError();
+    ctx.wireDispatchScratchToLlmClients();
     ctx.brain.clearChatParseFailure();
     const meta = parseDispatchRequestMeta(request_json);
     logDispatchStart(meta.event_type, meta.request_id, request_json.len);
+    try ctx.brain.beginRequestTimings(meta.request_id);
+    defer ctx.brain.resetRequestTimings();
     const output = dispatchJsonImpl(ctx, request_json) catch |err| {
         const detail_owned = error_descriptions.formatFailureDetail(std.heap.page_allocator, err, ctx.brain.chatParseFailureBody()) catch null;
         const detail: []const u8 = detail_owned orelse error_descriptions.name(err);
         defer if (detail_owned != null) std.heap.page_allocator.free(detail);
         logDispatchResult(meta.event_type, meta.request_id, "failed", 0, detail);
-        return err;
+        var timings = try finishDispatchTimings(ctx);
+        defer deinitDispatchTimingsReport(ctx, &timings);
+        return embedded_protocol.errorEnvelopeAlloc(
+            std.heap.page_allocator,
+            meta.request_id,
+            "runtime_error",
+            detail,
+            false,
+            emptyBudget(ctx),
+            timings,
+            ctx.brain.dispatchContextReportView(),
+        );
     };
     const summary = summarizeDispatchOutput(output);
     logDispatchResult(meta.event_type, meta.request_id, summary.status, output.len, summary.detail);
     return output;
 }
 
+pub fn finishDispatchTimings(ctx: *AffectiveCoreEmbedded) !request_timings.Report {
+    return ctx.brain.finishRequestTimings();
+}
+
+pub fn deinitDispatchTimingsReport(ctx: *AffectiveCoreEmbedded, report: *request_timings.Report) void {
+    request_timings.deinitReport(ctx.brain.allocator, report);
+}
+
+fn errorEnvelopeWithTimings(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    code: []const u8,
+    message: []const u8,
+    recoverable: bool,
+    budget: context_gate.BudgetReport,
+) ![]u8 {
+    var timings = try finishDispatchTimings(ctx);
+    defer deinitDispatchTimingsReport(ctx, &timings);
+    return embedded_protocol.errorEnvelopeAlloc(
+        std.heap.page_allocator,
+        request_id,
+        code,
+        message,
+        recoverable,
+        budget,
+        timings,
+        ctx.brain.dispatchContextReportView(),
+    );
+}
+
 fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8 {
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, request_json, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, ctx.dispatchScratch(), request_json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) {
-        return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, "", "invalid_request", "dispatch request must be a JSON object", false, emptyBudget(ctx));
+        return try errorEnvelopeWithTimings(ctx, "", "invalid_request", "dispatch request must be a JSON object", false, emptyBudget(ctx));
     }
     const root = parsed.value.object;
     const request_id = getStringFromObject(root, "request_id") orelse "";
     const event = root.get("event") orelse {
-        return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "missing event", false, emptyBudget(ctx));
+        return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing event", false, emptyBudget(ctx));
     };
     if (event != .object) {
-        return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "event must be a JSON object", false, emptyBudget(ctx));
+        return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "event must be a JSON object", false, emptyBudget(ctx));
     }
     const event_object = event.object;
     const event_type = getStringFromObject(event_object, "type") orelse {
-        return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "missing event.type", false, emptyBudget(ctx));
+        return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing event.type", false, emptyBudget(ctx));
     };
 
     embedded.clearHostEffects(ctx);
@@ -146,10 +193,18 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
         });
     }
     if (std.mem.eql(u8, event_type, "host_capability_manifest")) {
-        const capability_count = try embedded_ops.hostCapabilityManifest(ctx, event);
+        const manifest = try embedded_ops.hostCapabilityManifest(ctx, event);
         return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
             .kind = "host_capability_manifest",
-            .capability_count = capability_count,
+            .capability_count = manifest.capability_count,
+            .manifest_timings = manifest.manifest_timings,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "refresh_facial_expression_catalog")) {
+        const catalog = try embedded_ops.refreshFacialExpressionCatalog(ctx);
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "refresh_facial_expression_catalog",
+            .catalog = catalog,
         });
     }
     if (std.mem.eql(u8, event_type, "send_experience_event")) {
@@ -161,17 +216,34 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
     }
     if (std.mem.eql(u8, event_type, "user_text")) {
         const text = getStringFromObject(event_object, "text") orelse {
-            return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "missing text", false, emptyBudget(ctx));
+            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing text", false, emptyBudget(ctx));
         };
         const result = app_core.userTextOutcome(try ctx.brain.handleConversationText(try embedded_ops.tryTypedSpeech(ctx, text), .{ .request_id = request_id }));
         return try encodeUserTextOutcome(ctx, request_id, event_type, result);
+    }
+    if (std.mem.eql(u8, event_type, "emoji_reaction")) {
+        const emoji = getStringFromObject(event_object, "emoji") orelse {
+            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing emoji", false, emptyBudget(ctx));
+        };
+        const utterance_text = getStringFromObject(event_object, "utterance_text") orelse {
+            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing utterance_text", false, emptyBudget(ctx));
+        };
+        const speaker_label = getStringFromObject(event_object, "speaker_label") orelse "";
+        const utterance_event_id = getStringFromObject(event_object, "utterance_event_id") orelse "";
+        const result = app_core.userTextOutcome(try ctx.brain.handleEmojiReaction(.{
+            .emoji = emoji,
+            .utterance_text = utterance_text,
+            .speaker_label = speaker_label,
+            .utterance_event_id = utterance_event_id,
+        }));
+        return try encodeSenseObservationOutcome(ctx, request_id, event_type, result);
     }
     if (std.mem.eql(u8, event_type, "interrupt")) {
         const text = getStringFromObject(event_object, "text") orelse "";
         const reason = getStringFromObject(event_object, "reason") orelse "user_interrupt";
         const interrupted_action = getStringFromObject(event_object, "interrupted_action") orelse "unknown";
         const canceled_count = getIntegerFromObject(event_object, "canceled_queued_action_count") orelse 0;
-        const metadata = try std.fmt.allocPrint(ctx.allocator(), "reason={s} interrupted_action={s} canceled_queued_action_count={d} text={s}", .{
+        const metadata = try std.fmt.allocPrint(ctx.dispatchScratch(), "reason={s} interrupted_action={s} canceled_queued_action_count={d} text={s}", .{
             reason,
             interrupted_action,
             canceled_count,
@@ -186,7 +258,13 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
             .curiosity = 0.35,
             .metadata = metadata,
         });
-        const detail = try std.fmt.allocPrint(ctx.allocator(), "interrupt: {s}", .{metadata});
+        try ctx.brain.handleUserInterruptFromHost(.{
+            .reason = reason,
+            .interrupted_action = interrupted_action,
+            .preview_text = text,
+            .canceled_queued_action_count = canceled_count,
+        });
+        const detail = try std.fmt.allocPrint(ctx.dispatchScratch(), "interrupt: {s}", .{metadata});
         return try encodeDetailResult(ctx, request_id, event_type, detail);
     }
     if (std.mem.eql(u8, event_type, "short_touch")) {
@@ -196,10 +274,12 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
             }
             return try encodeErrorResult(ctx, request_id, event_type, "short_touch_failed", err);
         };
-        embedded_ops.runStimulusAutonomy(ctx) catch |err| switch (err) {
-            error.MissingAutonomyPlanner, error.MissingPsycheService, error.LocalDateUnavailable, error.ContextBudgetExceeded => {},
-            else => return try encodeErrorResult(ctx, request_id, event_type, "stimulus_autonomy_failed", err),
-        };
+        if (!result.ended_with_speech) {
+            embedded_ops.runStimulusAutonomy(ctx) catch |err| switch (err) {
+                error.MissingAutonomyPlanner, error.MissingPsycheService, error.LocalDateUnavailable, error.ContextBudgetExceeded => {},
+                else => return try encodeErrorResult(ctx, request_id, event_type, "stimulus_autonomy_failed", err),
+            };
+        }
         return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
             .kind = "activation",
             .activation = "short_touch",
@@ -213,10 +293,12 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
             }
             return try encodeErrorResult(ctx, request_id, event_type, "long_touch_failed", err);
         };
-        embedded_ops.runStimulusAutonomy(ctx) catch |err| switch (err) {
-            error.MissingAutonomyPlanner, error.MissingPsycheService, error.LocalDateUnavailable, error.ContextBudgetExceeded => {},
-            else => return try encodeErrorResult(ctx, request_id, event_type, "stimulus_autonomy_failed", err),
-        };
+        if (!result.ended_with_speech) {
+            embedded_ops.runStimulusAutonomy(ctx) catch |err| switch (err) {
+                error.MissingAutonomyPlanner, error.MissingPsycheService, error.LocalDateUnavailable, error.ContextBudgetExceeded => {},
+                else => return try encodeErrorResult(ctx, request_id, event_type, "stimulus_autonomy_failed", err),
+            };
+        }
         return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
             .kind = "activation",
             .activation = "long_touch",
@@ -224,7 +306,7 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
         });
     }
     if (std.mem.eql(u8, event_type, "poke_sequence")) {
-        const pulse_summary = try pokeSequencePulseSummary(ctx.allocator(), event_object);
+        const pulse_summary = try pokeSequencePulseSummary(ctx.dispatchScratch(), event_object);
         embedded.clearHostEffects(ctx);
         _ = try ctx.brain.observeSenseStimulus(.{
             .kind = .poke_sequence,
@@ -245,23 +327,24 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
         return try encodeDetailResult(ctx, request_id, event_type, try senseCatalogSummary(ctx, event_object));
     }
     if (std.mem.eql(u8, event_type, "sense_status")) {
+        try applySenseStatus(ctx, event_object);
         return try encodeDetailResult(ctx, request_id, event_type, try senseStatusSummary(ctx, event_object));
     }
     if (std.mem.eql(u8, event_type, "sense_observation")) {
         const sense = getStringFromObject(event_object, "sense") orelse "";
         const observation_value = event_object.get("observation") orelse {
-            return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "missing sense observation", false, emptyBudget(ctx));
+            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing sense observation", false, emptyBudget(ctx));
         };
         if (observation_value != .object) {
-            return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "sense observation must be an object", false, emptyBudget(ctx));
+            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "sense observation must be an object", false, emptyBudget(ctx));
         }
         const observation = observation_value.object;
         if (std.mem.eql(u8, sense, "orientation")) {
             const posture = getStringFromObject(observation, "posture") orelse "unknown";
             const summary = getStringFromObject(observation, "summary") orelse "Orientation observed.";
             const confidence = getNumberFromObject(observation, "confidence") orelse 0;
-            const metadata = try std.fmt.allocPrint(ctx.allocator(), "posture={s} confidence={d:.2} summary={s}", .{ posture, confidence, summary });
-            const packet = try ctx.brain.observeSenseStimulus(.{
+            const metadata = try std.fmt.allocPrint(ctx.dispatchScratch(), "posture={s} confidence={d:.2} summary={s}", .{ posture, confidence, summary });
+            const stimulus = try ctx.brain.observeSenseStimulus(.{
                 .kind = .orientation,
                 .source = "affective_orientation",
                 .signature = posture,
@@ -270,17 +353,21 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
                 .curiosity = 0.12,
                 .metadata = metadata,
             });
-            if (try ctx.brain.reactToSalientSense(packet)) |conversation| {
+            const observation_line = try std.fmt.allocPrint(ctx.dispatchScratch(), "orientation: {s}", .{summary});
+            if (brain_process.activeConversationPresent(&ctx.brain)) {
+                try brain_process.recordSenseDuringConversation(&ctx.brain, "orientation", observation_line, stimulus.event_id);
+            }
+            if (try ctx.brain.reactToSalientSense(stimulus.packet)) |conversation| {
                 return try encodeSenseObservationOutcome(ctx, request_id, event_type, app_core.userTextOutcome(conversation));
             }
-            const detail = try std.fmt.allocPrint(ctx.allocator(), "orientation: {s}", .{summary});
+            const detail = try std.fmt.allocPrint(ctx.dispatchScratch(), "orientation: {s}", .{summary});
             return try encodeDetailResult(ctx, request_id, event_type, detail);
         }
         if (std.mem.eql(u8, sense, "motion_gesture")) {
             const gesture = getStringFromObject(observation, "gesture") orelse "unknown";
             const summary = getStringFromObject(observation, "summary") orelse "Motion gesture observed.";
             const confidence = getNumberFromObject(observation, "confidence") orelse 0;
-            const metadata = try std.fmt.allocPrint(ctx.allocator(), "gesture={s} confidence={d:.2} summary={s}", .{ gesture, confidence, summary });
+            const metadata = try std.fmt.allocPrint(ctx.dispatchScratch(), "gesture={s} confidence={d:.2} summary={s}", .{ gesture, confidence, summary });
             const packet = try ctx.brain.observeSenseStimulus(.{
                 .kind = .touch,
                 .source = "affective_motion_gesture",
@@ -290,21 +377,25 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
                 .curiosity = 0.25,
                 .metadata = metadata,
             });
-            if (try ctx.brain.reactToSalientSense(packet)) |conversation| {
+            const observation_line = try std.fmt.allocPrint(ctx.dispatchScratch(), "motion_gesture: {s}", .{summary});
+            if (brain_process.activeConversationPresent(&ctx.brain)) {
+                try brain_process.recordSenseDuringConversation(&ctx.brain, "motion_gesture", observation_line, packet.event_id);
+            }
+            if (try ctx.brain.reactToSalientSense(packet.packet)) |conversation| {
                 return try encodeSenseObservationOutcome(ctx, request_id, event_type, app_core.userTextOutcome(conversation));
             }
-            const detail = try std.fmt.allocPrint(ctx.allocator(), "motion_gesture: {s}", .{summary});
+            const detail = try std.fmt.allocPrint(ctx.dispatchScratch(), "motion_gesture: {s}", .{summary});
             return try encodeDetailResult(ctx, request_id, event_type, detail);
         }
         if (std.mem.eql(u8, sense, "autonomy_replenish")) {
             const actions = getU32FromObject(observation, "actions") orelse {
-                return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "autonomy_replenish requires observation.actions as a positive integer", false, emptyBudget(ctx));
+                return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "autonomy_replenish requires observation.actions as a positive integer", false, emptyBudget(ctx));
             };
             if (actions == 0) {
-                return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "autonomy_replenish observation.actions must be at least 1", false, emptyBudget(ctx));
+                return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "autonomy_replenish observation.actions must be at least 1", false, emptyBudget(ctx));
             }
-            const applied_actions = try ctx.brain.runAutonomyReplenishFromPush(ctx.io(), actions);
-            const detail = try std.fmt.allocPrint(ctx.allocator(), "autonomy_replenish: requested={d} applied={d}", .{ actions, applied_actions });
+            const applied_points = try ctx.brain.runAutonomyReplenishFromPush(ctx.io(), actions);
+            const detail = try std.fmt.allocPrint(ctx.dispatchScratch(), "autonomy_replenish: requested={d} applied={d}", .{ actions, @as(u32, @intFromFloat(applied_points)) });
             return try encodeDetailResult(ctx, request_id, event_type, detail);
         }
         if (std.mem.eql(u8, sense, "camera")) {
@@ -314,11 +405,18 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
             const visual_result = try ctx.brain.handleHostVisualObservation(path, source, mime_type);
             return try encodeHostVisualObservationResult(ctx, request_id, event_type, visual_result);
         }
-        return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "unknown_sense", "unknown sense observation", false, emptyBudget(ctx));
+        return try errorEnvelopeWithTimings(ctx, request_id, "unknown_sense", "unknown sense observation", false, emptyBudget(ctx));
     }
     if (std.mem.eql(u8, event_type, "capability_status")) {
         try applyHostCapabilityStatus(ctx, request_id, event_object);
         return try encodeDetailResult(ctx, request_id, event_type, try hostCapabilityStatusSummary(ctx, event_object));
+    }
+    if (std.mem.eql(u8, event_type, "capability_status_batch")) {
+        const capability_count = try applyHostCapabilityStatusBatch(ctx, request_id, event_object);
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "capability_status_batch",
+            .capability_count = capability_count,
+        });
     }
     if (std.mem.eql(u8, event_type, "brain_mode")) {
         const mode = try embedded_ops.brainMode(ctx);
@@ -332,6 +430,22 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
         return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
             .kind = "read_models_snapshot",
             .read_models = snapshot,
+        });
+    }
+    if (std.mem.eql(u8, event_type, "chat_dry_run_prompt")) {
+        const text = getStringFromObject(event_object, "text") orelse {
+            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing text", false, emptyBudget(ctx));
+        };
+        const prompt = try ctx.brain.dryRunConversationPrompt(text);
+        defer {
+            ctx.brain.allocator.free(prompt.system_prompt);
+            ctx.brain.allocator.free(prompt.user_prompt);
+        }
+        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+            .kind = "chat_dry_run_prompt",
+            .dry_run = true,
+            .system_prompt = prompt.system_prompt,
+            .user_prompt = prompt.user_prompt,
         });
     }
     if (std.mem.eql(u8, event_type, "request_dream_time")) {
@@ -357,7 +471,7 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
     }
     if (std.mem.eql(u8, event_type, "raw_ref_lookup")) {
         const raw_ref = getStringFromObject(event_object, "raw_ref") orelse {
-            return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "invalid_request", "missing raw_ref", false, emptyBudget(ctx));
+            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing raw_ref", false, emptyBudget(ctx));
         };
         const bytes = lookupRawRef(ctx, raw_ref) catch |err| return try encodeErrorResult(ctx, request_id, event_type, "raw_ref_not_found", err);
         return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
@@ -389,7 +503,7 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
         ctx.brain.runAutonomyTick(ctx.io()) catch |err| return try encodeErrorResult(ctx, request_id, event_type, "autonomy_failed", err);
         return try encodeDetailResult(ctx, request_id, event_type, "autonomy_tick");
     }
-    return try embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, "unknown_event_type", "unknown embedded event type", false, emptyBudget(ctx));
+    return try errorEnvelopeWithTimings(ctx, request_id, "unknown_event_type", "unknown embedded event type", false, emptyBudget(ctx));
 }
 
 fn encodeDetailResult(
@@ -448,19 +562,37 @@ fn pokeSequenceMagnitude(event_object: std.json.ObjectMap) f32 {
 
 fn senseCatalogSummary(ctx: *AffectiveCoreEmbedded, event_object: std.json.ObjectMap) ![]const u8 {
     const senses = event_object.get("senses") orelse {
-        return try ctx.allocator().dupe(u8, "sense_catalog: count=0");
+        return try ctx.dispatchScratch().dupe(u8, "sense_catalog: count=0");
     };
     if (senses != .array) {
-        return try ctx.allocator().dupe(u8, "sense_catalog: count=0");
+        return try ctx.dispatchScratch().dupe(u8, "sense_catalog: count=0");
     }
-    return try std.fmt.allocPrint(ctx.allocator(), "sense_catalog: count={d}", .{senses.array.items.len});
+    return try std.fmt.allocPrint(ctx.dispatchScratch(), "sense_catalog: count={d}", .{senses.array.items.len});
 }
 
 fn senseStatusSummary(ctx: *AffectiveCoreEmbedded, event_object: std.json.ObjectMap) ![]const u8 {
     const sense = getStringFromObject(event_object, "sense") orelse getStringFromObject(event_object, "sense_id") orelse "unknown";
     const status = getStringFromObject(event_object, "status") orelse "unknown";
     const reason = getStringFromObject(event_object, "reason") orelse "";
-    return try std.fmt.allocPrint(ctx.allocator(), "sense_status: {s}={s} reason={s}", .{ sense, status, reason });
+    return try std.fmt.allocPrint(ctx.dispatchScratch(), "sense_status: {s}={s} reason={s}", .{ sense, status, reason });
+}
+
+fn applySenseStatus(ctx: *AffectiveCoreEmbedded, event_object: std.json.ObjectMap) !void {
+    const sense = getStringFromObject(event_object, "sense") orelse getStringFromObject(event_object, "sense_id") orelse return;
+    const status = getStringFromObject(event_object, "status") orelse return;
+    const reason = getStringFromObject(event_object, "reason") orelse "";
+    const elapsed_raw = getIntegerFromObject(event_object, "elapsed_ms") orelse @as(i64, @intCast(getU32FromObject(event_object, "latency_ms") orelse 0));
+    const elapsed_ms: u32 = @intCast(@max(elapsed_raw, 0));
+    const purpose = if (std.mem.eql(u8, sense, "camera"))
+        (if (ctx.brain.awaited_host_request) |req| req.purpose else "recognize")
+    else if (std.mem.eql(u8, sense, "orientation"))
+        "sample"
+    else
+        return;
+    try @import("core/host_capability_activation.zig").recordHostSensePullOutcome(&ctx.brain, sense, purpose, status, reason, elapsed_ms);
+    if (std.mem.eql(u8, status, "timed_out")) {
+        _ = ctx.brain.fulfillAwaitedHostRequestIfMatches(sense, purpose);
+    }
 }
 
 fn applyHostCapabilityStatus(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_object: std.json.ObjectMap) !void {
@@ -469,7 +601,7 @@ fn applyHostCapabilityStatus(ctx: *AffectiveCoreEmbedded, request_id: []const u8
     const availability = getStringFromObject(event_object, "availability") orelse "unavailable";
     try ctx.brain.recordCapabilityStatus(.{
         .capability_id = capability,
-        .host_id = getStringFromObject(event_object, "host_id") orelse try ctx.allocator().dupe(u8, ctx.brain.currentHostId()),
+        .host_id = getStringFromObject(event_object, "host_id") orelse try ctx.dispatchScratch().dupe(u8, ctx.brain.currentHostId()),
         .permission = embedded_ops.permissionFromString(getStringFromObject(event_object, "permission") orelse "unknown"),
         .availability = embedded_ops.availabilityFromString(availability),
         .quality = getF32FromObject(event_object, "quality") orelse 0.0,
@@ -486,9 +618,9 @@ fn applyHostCapabilityStatus(ctx: *AffectiveCoreEmbedded, request_id: []const u8
         const pending_request_id = getStringFromObject(event_object, "request_id") orelse request_id;
         const reason = getStringFromObject(event_object, "unavailable_reason") orelse "host capability pending";
         ctx.pending_camera_permission = .{
-            .request_id = try ctx.allocator().dupe(u8, pending_request_id),
+            .request_id = try ctx.dispatchScratch().dupe(u8, pending_request_id),
             .pending_since_unix_ms = getIntegerFromObject(event_object, "pending_since_unix_ms") orelse 0,
-            .reason = try ctx.allocator().dupe(u8, reason),
+            .reason = try ctx.dispatchScratch().dupe(u8, reason),
         };
         return;
     }
@@ -498,12 +630,25 @@ fn applyHostCapabilityStatus(ctx: *AffectiveCoreEmbedded, request_id: []const u8
     }
 }
 
+fn applyHostCapabilityStatusBatch(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_object: std.json.ObjectMap) !usize {
+    const statuses_value = event_object.get("statuses") orelse return error.MissingCapabilityStatuses;
+    if (statuses_value != .array) return error.ExpectedCapabilityStatusArray;
+    try ctx.brain.deps.store.beginDeferredPersist();
+    errdefer ctx.brain.deps.store.endDeferredPersist() catch @panic("capability status batch deferred persist end failed");
+    for (statuses_value.array.items) |item| {
+        if (item != .object) return error.ExpectedCapabilityStatusObject;
+        try applyHostCapabilityStatus(ctx, request_id, item.object);
+    }
+    try ctx.brain.deps.store.endDeferredPersist();
+    return statuses_value.array.items.len;
+}
+
 fn hostCapabilityStatusSummary(ctx: *AffectiveCoreEmbedded, event_object: std.json.ObjectMap) ![]const u8 {
     const capability = getStringFromObject(event_object, "capability_id") orelse "unknown";
     const status = getStringFromObject(event_object, "availability") orelse "unknown";
     const elapsed = getIntegerFromObject(event_object, "pending_elapsed_ms") orelse 0;
     const reason = getStringFromObject(event_object, "unavailable_reason") orelse "";
-    return try std.fmt.allocPrint(ctx.allocator(), "capability_status: {s}={s} pending_elapsed_ms={d} reason={s}", .{ capability, status, elapsed, reason });
+    return try std.fmt.allocPrint(ctx.dispatchScratch(), "capability_status: {s}={s} pending_elapsed_ms={d} reason={s}", .{ capability, status, elapsed, reason });
 }
 
 pub fn encodeUserTextOutcome(
@@ -558,24 +703,79 @@ pub fn encodeStructuredDispatchResult(
     event_type: []const u8,
     value: anytype,
 ) ![]u8 {
+    try ensureAwaitedHostSenseRequestEvent(ctx);
     stampAwaitedHostSenseTimeouts(ctx);
     const activity_id = ctx.brain.activeActivityId() orelse "";
-    const compacted_events = try context_gate.compactEvents(ctx.allocator(), ctx.brain.now_seconds, request_id, activity_id, embedded.hostEvents(ctx), ctx.context_budget);
+    const compacted_events = try context_gate.compactEvents(ctx.dispatchScratch(), ctx.brain.now_seconds, request_id, activity_id, embedded.hostEvents(ctx), ctx.context_budget);
     try persistRawRefs(ctx, compacted_events.raw_refs);
     const envelope_events = try filterSuppressedEvents(ctx, compacted_events.events);
 
-    const value_json = try std.json.Stringify.valueAlloc(ctx.allocator(), value, .{});
-    defer ctx.allocator().free(value_json);
-    const budget = try context_gate.budgetWithResult(ctx.allocator(), compacted_events.budget, value_json.len, &.{}, false);
+    const value_json = try std.json.Stringify.valueAlloc(ctx.dispatchScratch(), value, .{});
+    defer ctx.dispatchScratch().free(value_json);
+    const budget = try context_gate.budgetWithResult(ctx.dispatchScratch(), compacted_events.budget, value_json.len, &.{}, false);
+    var timings = try finishDispatchTimings(ctx);
+    defer deinitDispatchTimingsReport(ctx, &timings);
     const output = try embedded_protocol.successEnvelopeAlloc(std.heap.page_allocator, request_id, envelope_events, .{
         .event_type = event_type,
         .value = value,
-    }, budget);
-    if (output.len > ctx.context_budget.max_envelope_bytes) {
-        std.heap.page_allocator.free(output);
-        return try minimalEnvelope(ctx, request_id, event_type, "compacted envelope exceeded max_bytes");
+    }, budget, timings, ctx.brain.dispatchContextReportView());
+    if (output.len <= ctx.context_budget.max_envelope_bytes) return output;
+    std.heap.page_allocator.free(output);
+
+    const slim_budget = context_gate.BudgetReport{
+        .max_bytes = ctx.context_budget.max_envelope_bytes,
+        .used_bytes = value_json.len,
+        .compacted = true,
+        .dropped_event_count = envelope_events.len,
+        .raw_refs = &.{},
+    };
+    const slim = try embedded_protocol.successEnvelopeAlloc(std.heap.page_allocator, request_id, &[_]embedded_protocol.HostEvent{}, .{
+        .event_type = event_type,
+        .value = value,
+    }, slim_budget, request_timings.empty_report, null);
+    if (slim.len <= ctx.context_budget.max_envelope_bytes) return slim;
+    std.heap.page_allocator.free(slim);
+
+    const message = try std.fmt.allocPrint(
+        ctx.dispatchScratch(),
+        "dispatch result value_bytes={d} exceeded max_envelope_bytes={d}",
+        .{ value_json.len, ctx.context_budget.max_envelope_bytes },
+    );
+    defer ctx.dispatchScratch().free(message);
+    return try embedded_protocol.errorEnvelopeAlloc(
+        std.heap.page_allocator,
+        request_id,
+        "envelope_too_large",
+        message,
+        false,
+        slim_budget,
+        timings,
+        null,
+    );
+}
+
+/// When a host pull is still pending (restored activity or a deduped recognize retry),
+/// the host still needs a `sense_request` event in the envelope. Capture only emits one
+/// on the first pull attempt; re-emit here when awaiting state outlives that attempt.
+fn ensureAwaitedHostSenseRequestEvent(ctx: *AffectiveCoreEmbedded) !void {
+    const req = ctx.brain.awaited_host_request orelse return;
+    const effects = ctx.host_effects orelse return;
+    for (effects.events.items) |event| {
+        if (!std.mem.eql(u8, event.type, "sense_request")) continue;
+        const sense = event.sense orelse continue;
+        if (std.mem.eql(u8, sense, req.sense)) return;
     }
-    return output;
+    const body = try std.fmt.allocPrint(
+        ctx.dispatchScratch(),
+        "The frontend should fulfill host pull sense {s} for purpose {s}.",
+        .{ req.sense, req.purpose },
+    );
+    defer ctx.dispatchScratch().free(body);
+    if (std.mem.eql(u8, req.sense, "camera")) {
+        try effects.appendCaptureRequested("webcam photo", body);
+    } else {
+        try effects.appendSenseRequested(req.sense, req.sense, body);
+    }
 }
 
 fn stampAwaitedHostSenseTimeouts(ctx: *AffectiveCoreEmbedded) void {
@@ -595,40 +795,23 @@ pub fn filterSuppressedEvents(ctx: *AffectiveCoreEmbedded, events: []const embed
     var filtered = std.ArrayList(embedded_protocol.HostEvent).empty;
     for (events) |event| {
         if (!awaiting_camera and std.mem.eql(u8, event.type, "sense_request") and event.sense != null and std.mem.eql(u8, event.sense.?, "camera")) continue;
-        try filtered.append(ctx.allocator(), event);
+        try filtered.append(ctx.dispatchScratch(), event);
     }
-    return try filtered.toOwnedSlice(ctx.allocator());
+    return try filtered.toOwnedSlice(ctx.dispatchScratch());
 }
 
 fn encodeErrorResult(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_type: []const u8, code: []const u8, err: anyerror) ![]u8 {
     _ = event_type;
-    const detail = try error_descriptions.formatFailureDetail(ctx.allocator(), err, ctx.brain.chatParseFailureBody());
-    defer ctx.allocator().free(detail);
-    const message = try std.fmt.allocPrint(ctx.allocator(), "{s}: {s}", .{ error_descriptions.name(err), detail });
-    defer ctx.allocator().free(message);
-    return embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, code, message, false, emptyBudget(ctx));
-}
-
-fn minimalEnvelope(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_type: []const u8, detail: []const u8) ![]u8 {
-    const budget = context_gate.BudgetReport{
-        .max_bytes = ctx.context_budget.max_envelope_bytes,
-        .used_bytes = detail.len,
-        .compacted = true,
-        .dropped_event_count = embedded.hostEvents(ctx).len,
-        .raw_refs = &.{},
-    };
-    return embedded_protocol.successEnvelopeAlloc(std.heap.page_allocator, request_id, &[_]embedded_protocol.HostEvent{}, .{
-        .event_type = event_type,
-        .value = .{
-            .kind = event_type,
-            .detail = detail,
-        },
-    }, budget);
+    const detail = try error_descriptions.formatFailureDetail(ctx.dispatchScratch(), err, ctx.brain.chatParseFailureBody());
+    defer ctx.dispatchScratch().free(detail);
+    const message = try std.fmt.allocPrint(ctx.dispatchScratch(), "{s}: {s}", .{ error_descriptions.name(err), detail });
+    defer ctx.dispatchScratch().free(message);
+    return errorEnvelopeWithTimings(ctx, request_id, code, message, false, emptyBudget(ctx));
 }
 
 pub fn persistRawRefs(ctx: *AffectiveCoreEmbedded, raw_refs: []const context_gate.RawRef) !void {
     for (raw_refs) |raw_ref| {
-        const path = try rawRefPath(ctx.allocator(), ctx.brain.cfg.brain_root, raw_ref.id);
+        const path = try rawRefPath(ctx.dispatchScratch(), ctx.brain.cfg.brain_root, raw_ref.id);
         try writeFilePath(ctx.io(), path, raw_ref.bytes);
     }
 }
@@ -636,8 +819,8 @@ pub fn persistRawRefs(ctx: *AffectiveCoreEmbedded, raw_refs: []const context_gat
 pub fn lookupRawRef(ctx: *AffectiveCoreEmbedded, raw_ref: []const u8) ![]const u8 {
     if (!validRawRef(raw_ref)) return error.InvalidRawRef;
     if (rawRefExpired(ctx, raw_ref)) return error.RawRefExpired;
-    const path = try rawRefPath(ctx.allocator(), ctx.brain.cfg.brain_root, raw_ref);
-    return readFileAllocPath(ctx.io(), path, ctx.allocator(), .limited(8 * 1024 * 1024));
+    const path = try rawRefPath(ctx.dispatchScratch(), ctx.brain.cfg.brain_root, raw_ref);
+    return readFileAllocPath(ctx.io(), path, ctx.dispatchScratch(), .limited(8 * 1024 * 1024));
 }
 
 fn rawRefPath(allocator: std.mem.Allocator, brain_root: []const u8, raw_ref: []const u8) ![]const u8 {

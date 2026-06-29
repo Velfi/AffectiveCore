@@ -33,7 +33,6 @@ const ScriptedRecallChatService = support.ScriptedRecallChatService;
 const ScriptedClarificationChatService = support.ScriptedClarificationChatService;
 const ScriptedHardErrorRecoveryChatService = support.ScriptedHardErrorRecoveryChatService;
 const HeardSpeechObservationChatService = support.HeardSpeechObservationChatService;
-const FailingIdentityClaimIntentService = support.FailingIdentityClaimIntentService;
 const ScriptedContinuingChatService = support.ScriptedContinuingChatService;
 const makeBrain = support.makeBrain;
 const addMara = support.addMara;
@@ -79,7 +78,7 @@ test "host change arc marks camera unavailable after detach" {
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
 
-    try brain.recordManifestStatuses("test-host", &[_][]const u8{ "take_picture", "recognize" });
+    _ = try brain.recordManifestStatuses("test-host", &[_][]const u8{ "take_picture", "recognize" });
     try brain.deps.store.upsertCapabilityStatus(.{
         .capability_id = "live_camera",
         .host_id = "test-host",

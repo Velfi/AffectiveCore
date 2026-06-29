@@ -11,16 +11,15 @@ const ports = @import("ports.zig");
 const schema = ports.schema;
 const store_mod = ports.store;
 const graph_store = ports.graph_store;
-const intent_mod = ports.intent;
+const chat_mod = @import("port_chat.zig");
 const openai = ports.openai;
-const greeting_client = ports.greeting;
 const speech_mod = ports.speech;
-const chat_mod = ports.chat;
 const skills_mod = ports.skills;
 const email_mod = ports.email;
 const autonomy_mod = ports.autonomy;
 const psyche_client = ports.psyche;
 const want_achievement_mod = ports.want_achievement;
+const persona_directive_mod = ports.persona_directive;
 const image_mod = ports.image;
 const audio_mod = ports.audio;
 const camera_mod = ports.camera;
@@ -43,8 +42,12 @@ const helpers = @import("brain_helpers.zig");
 const experience_pipeline = @import("experience_pipeline.zig");
 const experience_kinds = @import("experience_kinds.zig");
 const experiential_observations = @import("experiential_observations.zig");
+const present_moment = @import("present_moment.zig");
 const context_composition = @import("context_composition.zig");
+const context_salience = @import("context_salience.zig");
 const memory_selection_mod = @import("memory_selection.zig");
+const brain_autonomy = @import("brain_autonomy.zig");
+const process_recipe_memory = @import("process_recipe_memory.zig");
 
 const Brain = brain_mod.Brain;
 const BrainDeps = brain_mod.BrainDeps;
@@ -92,7 +95,7 @@ pub fn saveFlexibleIdentityReconciliation(self: *Brain, connection_text: []const
     memory.valence = 0.45;
     memory.interpretation = try std.fmt.allocPrint(self.allocator, "reconciled flexible self-model material: {s}", .{connection_text});
     try self.deps.store.saveMemoryRecord(memory);
-    try self.recordExperienceLogEvent(.{
+    _ = try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "brain",
         .title = "flexible_identity_reconciliation",
@@ -222,55 +225,112 @@ fn appendFocusBlock(self: *Brain, out: *std.ArrayList(u8)) !void {
 }
 
 pub fn buildConversationMemory(self: *Brain) ![]const u8 {
-    return buildConversationMemoryWithSpeaker(self, null, null, null);
+    return buildConversationMemoryWithSpeaker(self, null, null, null, .heard_speech);
 }
 
-pub fn buildConversationMemoryWithSpeaker(
+fn appendMemoryBlock(
+    allocator: std.mem.Allocator,
+    blocks: *std.ArrayList(context_composition.ContextBlock),
+    kind: context_salience.MemoryKind,
+    text: []const u8,
+    stimulus: chat_mod.StimulusKind,
+    contact_open: bool,
+    order: *usize,
+    count: ?usize,
+) !void {
+    if (text.len == 0) return;
+    try blocks.append(allocator, .{
+        .kind = .{ .memory = kind },
+        .text = try allocator.dupe(u8, text),
+        .rank = context_salience.memoryRank(kind, stimulus, contact_open),
+        .protected = context_salience.isMemoryProtected(kind),
+        .order_index = order.*,
+        .count = count,
+    });
+    order.* += 1;
+}
+
+fn appendKnownProcessesMemoryBlock(brain: *Brain, out: *std.ArrayList(u8)) !void {
+    try process_recipe_memory.appendKnownProcessesMemoryBlock(brain, out);
+}
+
+fn captureMemorySection(
+    allocator: std.mem.Allocator,
+    blocks: *std.ArrayList(context_composition.ContextBlock),
+    kind: context_salience.MemoryKind,
+    stimulus: chat_mod.StimulusKind,
+    contact_open: bool,
+    order: *usize,
+    count: ?usize,
+    build: *const fn (*Brain, *std.ArrayList(u8)) anyerror!void,
+    brain: *Brain,
+) !void {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try build(brain, &buf);
+    try appendMemoryBlock(allocator, blocks, kind, buf.items, stimulus, contact_open, order, count);
+}
+
+pub fn buildConversationMemoryBlocks(
     self: *Brain,
     speaker_context: ?[]const u8,
-    sections_out: ?*std.ArrayList(context_composition.SectionStat),
     selection: ?memory_selection_mod.ResolvedMemorySelection,
-) ![]const u8 {
+    stimulus: chat_mod.StimulusKind,
+) ![]context_composition.ContextBlock {
+    const contact_open = present_moment.contactWindowOpen(self);
     const summaries = try self.deps.store.loadConversationSummaries(self.allocator);
-    var out = std.ArrayList(u8).empty;
-    var before: usize = 0;
+    var blocks = std.ArrayList(context_composition.ContextBlock).empty;
+    errdefer conversation_context_freeMemoryBlocks(self.allocator, blocks.items);
+    var order: usize = 0;
+    const allocator = self.allocator;
 
-    before = out.items.len;
-    try appendFocusBlock(self, &out);
-    try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "focus", null);
+    {
+        const persona = try self.personaDirectiveConversationSummary();
+        try appendMemoryBlock(allocator, &blocks, .persona_directive, persona, stimulus, contact_open, &order, null);
+    }
+    try captureMemorySection(allocator, &blocks, .focus, stimulus, contact_open, &order, null, appendFocusBlock, self);
 
     if (speaker_context) |context| {
-        before = out.items.len;
-        try out.appendSlice(self.allocator, context);
-        try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "speaker", null);
+        try appendMemoryBlock(allocator, &blocks, .speaker, context, stimulus, contact_open, &order, null);
     }
 
-    before = out.items.len;
-    try out.appendSlice(self.allocator, try self.selfFactsConversationSummary());
-    try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "self_facts", null);
-
-    before = out.items.len;
-    try out.appendSlice(self.allocator, try self.deps.graph.summary(self.allocator, 8));
-    try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "relationship_graph", null);
-
-    before = out.items.len;
-    try out.appendSlice(self.allocator, try self.activeNeedsSummary());
-    try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "needs", null);
-
-    before = out.items.len;
-    try experiential_observations.appendDayArcToMemory(self, &out);
-    try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "day_arc", null);
+    {
+        const self_facts = try self.selfFactsConversationSummary();
+        try appendMemoryBlock(allocator, &blocks, .self_facts, self_facts, stimulus, contact_open, &order, null);
+    }
+    {
+        const graph = try self.deps.graph.summary(allocator, 8);
+        try appendMemoryBlock(allocator, &blocks, .relationship_graph, graph, stimulus, contact_open, &order, null);
+    }
+    {
+        const needs = try self.activeNeedsSummary();
+        try appendMemoryBlock(allocator, &blocks, .needs, needs, stimulus, contact_open, &order, null);
+    }
+    try captureMemorySection(allocator, &blocks, .known_processes, stimulus, contact_open, &order, null, appendKnownProcessesMemoryBlock, self);
+    {
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(allocator);
+        try experiential_observations.appendDayArcToMemory(self, &buf);
+        try appendMemoryBlock(allocator, &blocks, .day_arc, buf.items, stimulus, contact_open, &order, null);
+    }
 
     if (selection) |resolved| {
-        before = out.items.len;
-        try memory_selection_mod.appendMemorySelectionToMemory(self.allocator, &out, resolved);
-        try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "relevant_memories", resolved.entries.len);
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(allocator);
+        try memory_selection_mod.appendMemorySelectionToMemory(
+            allocator,
+            &buf,
+            resolved,
+            self.cfg.capacity.memory_context_bytes_max,
+        );
+        try appendMemoryBlock(allocator, &blocks, .relevant_memories, buf.items, stimulus, contact_open, &order, resolved.entries.len);
     }
 
-    const memories = try self.deps.store.loadMemoryRecords(self.allocator);
+    const memories = try self.deps.store.loadMemoryRecords(allocator);
     var prng = std.Random.DefaultPrng.init(helpers.contextShuffleSeed(self.now_seconds, summaries.len));
     if (memories.len > 0) {
-        before = out.items.len;
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(allocator);
         var long_count: usize = 0;
         var short_count: usize = 0;
         for (memories) |memory| {
@@ -279,48 +339,100 @@ pub fn buildConversationMemoryWithSpeaker(
                 .short_term => short_count += 1,
             }
         }
-        try out.print(self.allocator, "Memory index: {d} long-term, {d} short-term. Use typed memory read models and explicit recall events when details are needed.\n", .{ long_count, short_count });
+        try buf.print(allocator, "Memory index: {d} long-term, {d} short-term. Use typed memory read models and explicit recall events when details are needed.\n", .{ long_count, short_count });
         var memory_tags = std.ArrayList([]const u8).empty;
+        defer memory_tags.deinit(allocator);
         for (memories) |memory| {
             for (memory.tags) |tag| {
                 if (memory_tags.items.len >= 32 or helpers.tagInSlice(memory_tags.items, tag)) continue;
-                try memory_tags.append(self.allocator, tag);
+                try memory_tags.append(allocator, tag);
             }
         }
         prng.random().shuffle([]const u8, memory_tags.items);
-        try out.appendSlice(self.allocator, "Available memory tags:");
+        try buf.appendSlice(allocator, "Available memory tags:");
         for (memory_tags.items) |tag| {
-            try out.print(self.allocator, " {s}", .{tag});
+            try buf.print(allocator, " {s}", .{tag});
         }
-        try out.appendSlice(self.allocator, "\n");
-        try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "memory_index", memories.len);
+        try buf.appendSlice(allocator, "\n");
+        try appendMemoryBlock(allocator, &blocks, .memory_index, buf.items, stimulus, contact_open, &order, memories.len);
     }
 
-    if (summaries.len == 0) return out.toOwnedSlice(self.allocator);
-
-    before = out.items.len;
-    try out.appendSlice(self.allocator, "Recent conversation summaries (chronological):\n");
-    const summary_window = self.cfg.capacity.conversation_summaries_in_context_max;
-    const start = if (summaries.len > summary_window) summaries.len - summary_window else 0;
-    for (summaries[start..]) |summary| {
-        const age_seconds = std.fmt.parseInt(i64, summary.time, 10) catch self.now_seconds;
-        const seconds_ago = @max(@as(i64, 0), self.now_seconds - age_seconds);
-        try out.print(
-            self.allocator,
-            "- ({d}s ago) USER: \"{s}\"\n  BRAIN: \"{s}\"\n",
-            .{ seconds_ago, summary.user_summary, summary.brain_summary },
-        );
+    if (summaries.len > 0) {
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "Recent conversation summaries (chronological):\n");
+        const summary_window = present_moment.conversationSummaryCap(self);
+        const start = if (summaries.len > summary_window) summaries.len - summary_window else 0;
+        for (summaries[start..]) |summary| {
+            const age_seconds = std.fmt.parseInt(i64, summary.time, 10) catch self.now_seconds;
+            const seconds_ago = @max(@as(i64, 0), self.now_seconds - age_seconds);
+            try buf.print(
+                allocator,
+                "- ({d}s ago) USER: \"{s}\"\n  BRAIN: \"{s}\"\n",
+                .{ seconds_ago, summary.user_summary, summary.brain_summary },
+            );
+        }
+        try appendMemoryBlock(allocator, &blocks, .conversation_summaries, buf.items, stimulus, contact_open, &order, summaries.len - start);
     }
-    try context_composition.noteSection(self.allocator, sections_out, before, out.items.len, "conversation_summaries", summaries.len - start);
-    return out.toOwnedSlice(self.allocator);
+
+    return try blocks.toOwnedSlice(allocator);
+}
+
+fn conversation_context_freeMemoryBlocks(allocator: std.mem.Allocator, blocks: []context_composition.ContextBlock) void {
+    for (blocks) |block| allocator.free(block.text);
+    if (blocks.len > 0) allocator.free(blocks);
+}
+
+pub fn buildConversationMemoryWithSpeaker(
+    self: *Brain,
+    speaker_context: ?[]const u8,
+    sections_out: ?*std.ArrayList(context_composition.SectionStat),
+    selection: ?memory_selection_mod.ResolvedMemorySelection,
+    stimulus: chat_mod.StimulusKind,
+) ![]const u8 {
+    const blocks = try buildConversationMemoryBlocks(self, speaker_context, selection, stimulus);
+    defer conversation_context_freeMemoryBlocks(self.allocator, blocks);
+    context_composition.sortBlocks(blocks);
+    const assembled = try context_composition.assembleBlocks(self.allocator, blocks);
+    if (sections_out) |sections| {
+        for (assembled.memory_sections) |section| {
+            try sections.append(self.allocator, section);
+        }
+        self.allocator.free(assembled.memory_sections);
+    } else {
+        for (assembled.memory_sections) |section| self.allocator.free(section.name);
+        self.allocator.free(assembled.memory_sections);
+    }
+    return assembled.memory;
 }
 
 pub fn formatConversationSummaryForMemory(allocator: std.mem.Allocator, user_summary: []const u8, brain_summary: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "You just heard USER say \"{s}\"\nI just said \"{s}\"",
-        .{ user_summary, brain_summary },
-    );
+    return formatTurnSummaryForMemory(allocator, .heard_speech, user_summary, brain_summary);
+}
+
+pub fn formatTurnSummaryForMemory(
+    allocator: std.mem.Allocator,
+    stimulus_kind: chat_mod.StimulusKind,
+    user_summary: []const u8,
+    brain_summary: []const u8,
+) ![]const u8 {
+    return switch (stimulus_kind) {
+        .heard_speech => std.fmt.allocPrint(
+            allocator,
+            "You just heard USER say \"{s}\"\nI just said \"{s}\"",
+            .{ user_summary, brain_summary },
+        ),
+        .reconsideration, .host_sense_delivery => std.fmt.allocPrint(
+            allocator,
+            "While we were talking, I noticed \"{s}\"\nI considered \"{s}\"",
+            .{ user_summary, brain_summary },
+        ),
+        .orchestration => std.fmt.allocPrint(
+            allocator,
+            "A salient event arrived: \"{s}\"\nI decided \"{s}\"",
+            .{ user_summary, brain_summary },
+        ),
+    };
 }
 
 pub fn setFact(self: *Brain, key_text: []const u8, value_text: []const u8, tags: []const []const u8) ![]const u8 {
@@ -375,7 +487,7 @@ pub fn setFact(self: *Brain, key_text: []const u8, value_text: []const u8, tags:
     );
     try self.deps.store.saveFactRecord(fact);
     const interpretation = try std.fmt.allocPrint(self.allocator, "fact {s}: {s}", .{ fact.key, fact.value });
-    try self.recordExperienceLogEvent(.{
+    _ = try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "brain",
         .title = "set_fact",
@@ -437,7 +549,7 @@ pub fn invalidateFact(self: *Brain, fact_id_text: []const u8, key_text: []const 
     const invalidated = try self.deps.store.invalidateFactRecord(id, now);
     if (!invalidated) return error.FactNotFound;
     const interpretation = try std.fmt.allocPrint(self.allocator, "invalidated fact {s}", .{id});
-    try self.recordExperienceLogEvent(.{
+    _ = try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "brain",
         .title = "invalidate_fact",
@@ -464,7 +576,7 @@ pub fn createMemoryRecord(self: *Brain, text: []const u8, tags: []const []const 
         .text = try self.allocator.dupe(u8, text),
         .original_text = try self.allocator.dupe(u8, text),
         .interpretation = try self.allocator.dupe(u8, text),
-        .vector = try vector_index.embedQuery(self.allocator, text, tags),
+        .vector = try vector_index.embedQuery(self.allocator, self.deps.embedding_service, text, tags),
         .confidence = 0.70,
         .valence = emotion.estimateValence(text),
         .salience = emotion.estimateSalience(text, tags),
@@ -475,6 +587,215 @@ pub fn createMemoryRecord(self: *Brain, text: []const u8, tags: []const []const 
         .access_count = 0,
         .score = 1,
     };
+}
+
+pub fn setPersonaVoiceLines(self: *Brain, lines: []const []const u8) !void {
+    for (self.persona_voice_lines) |line| self.allocator.free(line);
+    if (self.persona_voice_lines.len > 0) self.allocator.free(self.persona_voice_lines);
+    if (lines.len == 0) {
+        self.persona_voice_lines = &.{};
+        return;
+    }
+    const owned = try self.allocator.alloc([]const u8, lines.len);
+    for (lines, 0..) |line, index| {
+        owned[index] = try self.allocator.dupe(u8, line);
+    }
+    self.persona_voice_lines = owned;
+}
+
+pub fn clearPersonaDirective(self: *Brain) void {
+    if (self.persona_directive) |directive| {
+        directive.deinit(self.allocator);
+        self.persona_directive = null;
+    }
+}
+
+pub fn setPersonaDirective(self: *Brain, directive: persona_directive_mod.PersonaDirective) !void {
+    clearPersonaDirective(self);
+    self.persona_directive = try directive.dupe(self.allocator);
+}
+
+pub fn refreshPersonaDirectiveFromStore(self: *Brain) !void {
+    clearPersonaDirective(self);
+    const dreams = try self.deps.store.loadDreamTimeRecords(self.allocator);
+    var latest_ms: i64 = 0;
+    var latest: ?schema.DreamTimeRecord = null;
+    for (dreams) |dream| {
+        if (dream.created_at_ms < latest_ms) continue;
+        if (dream.persona.len == 0 or dream.short_term.len == 0 or dream.long_term.len == 0) continue;
+        latest_ms = dream.created_at_ms;
+        latest = dream;
+    }
+    if (latest) |dream| {
+        try setPersonaDirective(self, .{
+            .persona = dream.persona,
+            .short_term = dream.short_term,
+            .long_term = dream.long_term,
+        });
+    }
+}
+
+pub fn activePersonaDirective(self: *Brain) !persona_directive_mod.PersonaDirective {
+    if (self.persona_directive) |directive| return try directive.dupe(self.allocator);
+    return persona_directive_mod.PersonaDirective.defaults(self.allocator);
+}
+
+pub fn personaDirectiveConversationSummary(self: *Brain) ![]const u8 {
+    const directive = try activePersonaDirective(self);
+    defer directive.deinit(self.allocator);
+    const formatted = try directive.formatForMemory(self.allocator);
+    const persona_max_bytes: usize = 600;
+    if (formatted.len <= persona_max_bytes) return formatted;
+    defer self.allocator.free(formatted);
+    var end = persona_max_bytes;
+    while (end > 0 and formatted[end - 1] != '\n') end -= 1;
+    if (end == 0) return error.PersonaDirectiveSummaryTooLarge;
+    return self.allocator.dupe(u8, formatted[0..end]);
+}
+
+fn appendTaggedSeedMemories(
+    self: *Brain,
+    out: *std.ArrayList(u8),
+    section: []const u8,
+    tag: []const u8,
+) !void {
+    const memories = try self.deps.store.loadMemoryRecords(self.allocator);
+    try out.appendSlice(self.allocator, section);
+    var count: usize = 0;
+    for (memories) |memory| {
+        if (!helpers.tagInSlice(memory.tags, tag)) continue;
+        count += 1;
+        try out.print(self.allocator, "- {s}\n", .{memory.text});
+    }
+    if (count == 0) try out.appendSlice(self.allocator, "- none\n");
+}
+
+pub fn buildDreamPersonaSynthesisContext(
+    self: *Brain,
+    belief_proposition: []const u8,
+    disposition_tendency: []const u8,
+    reconciliation_count: usize,
+    residue: DreamPersonaResidue,
+) ![]const u8 {
+    const prior = try activePersonaDirective(self);
+    defer prior.deinit(self.allocator);
+    const prior_text = try prior.formatFieldLines(self.allocator);
+    defer self.allocator.free(prior_text);
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(self.allocator);
+    try out.appendSlice(self.allocator, "prior_persona_directive:\n");
+    try out.appendSlice(self.allocator, prior_text);
+    try out.appendSlice(self.allocator, "\nseed_voice:\n");
+    if (self.persona_voice_lines.len == 0) {
+        try out.appendSlice(self.allocator, "- none\n");
+    } else {
+        for (self.persona_voice_lines) |line| {
+            try out.print(self.allocator, "- {s}\n", .{line});
+        }
+    }
+
+    try appendTaggedSeedMemories(self, &out, "\nseed_core_values:\n", "core_value");
+    try appendTaggedSeedMemories(self, &out, "\nseed_operating_tendencies:\n", "seed_operating_tendency");
+
+    try out.appendSlice(self.allocator, "\nday_residue:\n");
+    try out.print(self.allocator, "- capability_failures_reviewed: {d}\n", .{residue.failure_capability_ids.len});
+    try out.print(self.allocator, "- contradiction_reconciliations: {d}\n", .{reconciliation_count});
+    for (residue.memory_interpretations) |interpretation| {
+        try out.print(self.allocator, "- {s}\n", .{interpretation});
+    }
+
+    const summaries = try self.deps.store.loadConversationSummaries(self.allocator);
+    const period_start_ms = try wakingPeriodStartMsForPersona(self);
+    try out.appendSlice(self.allocator, "\nconversation_summaries:\n");
+    var summary_count: usize = 0;
+    for (summaries) |summary| {
+        const age_seconds = std.fmt.parseInt(i64, summary.time, 10) catch self.now_seconds;
+        const summary_ms = age_seconds * 1000;
+        if (summary_ms < period_start_ms) continue;
+        summary_count += 1;
+        try out.print(
+            self.allocator,
+            "- USER: \"{s}\" BRAIN: \"{s}\"\n",
+            .{ summary.user_summary, summary.brain_summary },
+        );
+    }
+    if (summary_count == 0) try out.appendSlice(self.allocator, "- none\n");
+
+    const needs = try self.activeNeedsSummary();
+    defer self.allocator.free(needs);
+    try out.appendSlice(self.allocator, "\n");
+    try out.appendSlice(self.allocator, needs);
+
+    try out.appendSlice(self.allocator, "\ndream_outputs:\n");
+    try out.print(self.allocator, "- belief: {s}\n", .{belief_proposition});
+    try out.print(self.allocator, "- disposition: {s}\n", .{disposition_tendency});
+    return out.toOwnedSlice(self.allocator);
+}
+
+pub const DreamPersonaResidue = struct {
+    failure_capability_ids: []const []const u8,
+    memory_interpretations: []const []const u8,
+};
+
+fn wakingPeriodStartMsForPersona(self: *Brain) !i64 {
+    const dreams = try self.deps.store.loadDreamTimeRecords(self.allocator);
+    var latest_wake_ms: i64 = 0;
+    for (dreams) |dream| {
+        if (dream.created_at_ms > latest_wake_ms) latest_wake_ms = dream.created_at_ms;
+    }
+    if (latest_wake_ms > 0) return latest_wake_ms;
+
+    const now_ms = self.now_seconds * 1000;
+    const seconds_in_day: i64 = @mod(self.now_seconds, 86400);
+    return now_ms - seconds_in_day * 1000;
+}
+
+pub fn synthesizeDreamPersonaDirective(
+    self: *Brain,
+    belief_proposition: []const u8,
+    disposition_tendency: []const u8,
+    reconciliation_count: usize,
+    residue: DreamPersonaResidue,
+) !persona_directive_mod.PersonaDirective {
+    const base_context = try buildDreamPersonaSynthesisContext(self, belief_proposition, disposition_tendency, reconciliation_count, residue);
+    defer self.allocator.free(base_context);
+    const context = try appendDreamPersonaPsycheConsult(self, base_context);
+    defer self.allocator.free(context);
+    return self.deps.persona_directive_synthesizer.synthesize(self.allocator, context);
+}
+
+fn appendDreamPersonaPsycheConsult(self: *Brain, context: []const u8) ![]const u8 {
+    if (!(try brain_autonomy.psycheEnabled(self))) return self.allocator.dupe(u8, context);
+    const psyche = self.deps.psyche_service orelse return error.MissingPsycheService;
+    const io = self.deps.io orelse return error.MissingIo;
+    const state = (try brain_autonomy.autonomyStateForNeeds(self)) orelse return error.MissingAutonomyState;
+    const shared = try brain_autonomy.buildPsycheSharedContext(self, io, state);
+    defer self.allocator.free(shared);
+
+    var psyche_input = std.ArrayList(u8).empty;
+    defer psyche_input.deinit(self.allocator);
+    try psyche_input.appendSlice(self.allocator, shared);
+    try psyche_input.appendSlice(self.allocator, "\ndream_consolidation:\n");
+    try psyche_input.appendSlice(self.allocator, context);
+
+    const turns = try psyche.consultBoth(self.allocator, psyche_input.items);
+    const id_text = try psyche_client.formatIdTurn(self.allocator, turns.id);
+    defer self.allocator.free(id_text);
+    const superego_text = try psyche_client.formatSuperegoTurn(self.allocator, turns.superego);
+    defer self.allocator.free(superego_text);
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(self.allocator);
+    try out.appendSlice(self.allocator, context);
+    try out.appendSlice(self.allocator, "\npsyche_consult:\n");
+    try out.appendSlice(self.allocator, id_text);
+    try out.appendSlice(self.allocator, superego_text);
+    return out.toOwnedSlice(self.allocator);
+}
+
+pub fn personaConversationSummary(self: *Brain) ![]const u8 {
+    return personaDirectiveConversationSummary(self);
 }
 
 pub fn seedEntryMemory(self: *Brain, doc: seed_mod.SeedDocument, entry: seed_mod.SeedEntry) !schema.MemoryRecord {
@@ -501,7 +822,7 @@ pub fn seedEntryMemory(self: *Brain, doc: seed_mod.SeedDocument, entry: seed_mod
         .text = try self.allocator.dupe(u8, entry.text),
         .original_text = try self.allocator.dupe(u8, entry.text),
         .interpretation = try std.fmt.allocPrint(self.allocator, "seed {s} {s}: {s}", .{ doc.name, entry.kind.label(), entry.text }),
-        .vector = try vector_index.embedQuery(self.allocator, entry.text, tags),
+        .vector = try vector_index.embedQuery(self.allocator, self.deps.embedding_service, entry.text, tags),
         .confidence = 0.95,
         .valence = emotion.estimateValence(entry.text),
         .salience = salience,

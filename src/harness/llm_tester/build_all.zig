@@ -2,12 +2,10 @@ const std = @import("std");
 const scenario_mod = @import("scenario.zig");
 const chat_client = @import("../../api/chat_client.zig");
 const autonomy_client = @import("../../api/autonomy_client.zig");
-const greeting_client = @import("../../api/greeting_client.zig");
-const intent_client = @import("../../api/intent_client.zig");
 const extraction_client = @import("../../api/extraction_client.zig");
-const memory_selection_client = @import("../../api/memory_selection_client.zig");
 const psyche_client = @import("../../api/psyche_client.zig");
 const want_achievement_client = @import("../../api/want_achievement_client.zig");
+const persona_directive_client = @import("../../api/persona_directive_client.zig");
 const process_composition_client = @import("../../api/process_composition_client.zig");
 const openai_identity_client = @import("../../api/openai_identity_client.zig");
 
@@ -21,12 +19,10 @@ const ScenarioSource = struct {
 const sources = [_]ScenarioSource{
     .{ .name = "conversation", .loadFn = chat_client.llmTesterScenarios },
     .{ .name = "autonomy", .loadFn = autonomy_client.llmTesterScenarios },
-    .{ .name = "greeting", .loadFn = greeting_client.llmTesterScenarios },
-    .{ .name = "intent", .loadFn = intent_client.llmTesterScenarios },
     .{ .name = "memory_extraction", .loadFn = extraction_client.llmTesterScenarios },
-    .{ .name = "memory_selection", .loadFn = memory_selection_client.llmTesterScenarios },
     .{ .name = "psyche", .loadFn = psyche_client.llmTesterScenarios },
     .{ .name = "want_achievement", .loadFn = want_achievement_client.llmTesterScenarios },
+    .{ .name = "persona_directive", .loadFn = persona_directive_client.llmTesterScenarios },
     .{ .name = "process_composition", .loadFn = process_composition_client.llmTesterScenarios },
     .{ .name = "identity_comparison", .loadFn = openai_identity_client.llmTesterScenarios },
 };
@@ -119,7 +115,7 @@ test "buildAllScenarios covers every text subsystem with non-empty prompts" {
     const allocator = arena.allocator();
 
     const scenarios = try buildAllScenarios(allocator);
-    try std.testing.expect(scenarios.len >= 12);
+    try std.testing.expect(scenarios.len >= 9);
 
     var ids = std.StringHashMap(void).init(allocator);
     for (scenarios) |item| {

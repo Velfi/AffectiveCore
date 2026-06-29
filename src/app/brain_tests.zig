@@ -6,7 +6,6 @@ const http_transport_mod = @import("../api/http_transport.zig");
 const input_mod = @import("../platform/common/input.zig");
 const want_achievement_mod = @import("../core/port_want_achievement.zig");
 const memory_extraction_mod = @import("../core/port_memory_extraction.zig");
-const memory_selection_mod = @import("../core/port_memory_selection.zig");
 const brain_mod = @import("../core/brain.zig");
 
 const AppCore = app_core.AppCore;
@@ -67,9 +66,6 @@ fn testBrainHost(
         },
     } };
     host.brain.deps.memory_extraction_service = scripted_extraction.service();
-    const scripted_selection = try allocator.create(memory_selection_mod.ScriptedMemorySelectionService);
-    scripted_selection.* = .{ .summary = "No stored memories were relevant for this host test turn." };
-    host.brain.deps.memory_selection_service = scripted_selection.service();
     return host;
 }
 

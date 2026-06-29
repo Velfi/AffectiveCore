@@ -80,9 +80,9 @@ pub fn assignTouchStimulus(self: *Brain, touch_kind: []const u8) !Brain.TouchSti
         "attention_hint={s} chosen_look={any}",
         .{ touchAttentionHint(packet.attention_intensity, should_look), should_look },
     );
-    const stimulus_context = try self.recordSenseStimulusPacket(packet, suffix);
+    const recorded = try self.recordSenseStimulusPacket(packet, suffix);
     return .{
-        .stimulus_context = stimulus_context,
+        .stimulus_context = recorded.text,
         .curiosity_score = curiosity_score,
         .should_look = should_look,
         .packet = packet,

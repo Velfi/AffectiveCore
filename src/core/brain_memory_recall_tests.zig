@@ -31,7 +31,6 @@ const ScriptedRecallChatService = support.ScriptedRecallChatService;
 const ScriptedClarificationChatService = support.ScriptedClarificationChatService;
 const ScriptedHardErrorRecoveryChatService = support.ScriptedHardErrorRecoveryChatService;
 const HeardSpeechObservationChatService = support.HeardSpeechObservationChatService;
-const FailingIdentityClaimIntentService = support.FailingIdentityClaimIntentService;
 const ScriptedContinuingChatService = support.ScriptedContinuingChatService;
 const makeBrain = support.makeBrain;
 const addMara = support.addMara;
@@ -78,6 +77,7 @@ test "conversation memory avoids fixed bounded context presentation" {
             .brain_summary = try std.fmt.allocPrint(allocator, "brain_{d}", .{i}),
         });
     }
+    brain.last_conversation_effort_tier = .complex;
 
     const text = try brain.buildConversationMemory();
     try std.testing.expect(std.mem.indexOf(u8, text, "Memory index: 1 long-term, 1 short-term.") != null);
@@ -144,7 +144,7 @@ test "conversation memory includes speaker context only when supplied" {
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
 
     const without_speaker = try brain.buildConversationMemory();
-    const with_speaker = try brain.buildConversationMemoryWithSpeaker("Current speaker recognition: known; name=Mara; person_id=person_mara.\n", null, null);
+    const with_speaker = try brain.buildConversationMemoryWithSpeaker("Current speaker recognition: known; name=Mara; person_id=person_mara.\n", null, null, .heard_speech);
 
     try std.testing.expect(std.mem.indexOf(u8, without_speaker, "Current speaker recognition:") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_speaker, "Current speaker recognition: known; name=Mara") != null);
@@ -182,7 +182,7 @@ test "dry run conversation prompt is sectioned and non mutating" {
     try std.testing.expectEqual(summary_count, store.conversation_summaries.items.len);
     try std.testing.expectEqual(event_count, store.experience_events.items.len);
     try std.testing.expect(std.mem.indexOf(u8, prompt.user_prompt, "# Compact Memory\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt.user_prompt, "# User Input\nStimulus: \"what should you remember?\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt.user_prompt, "# User Input\nStimulus (heard speech): \"what should you remember?\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt.user_prompt, "# Observations\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt.user_prompt, "Memory index: 1 long-term, 0 short-term.") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt.user_prompt, "hidden_tag") != null);
@@ -285,7 +285,7 @@ test "recall lazily indexes old vectorless memories" {
 
     const text = try brain.recallMemories("concise preference", &[_][]const u8{"preference"});
     try std.testing.expect(std.mem.indexOf(u8, text, "memory_old") != null);
-    try std.testing.expectEqual(vector_index.dimensions, store.memories.items[0].vector.len);
+    try std.testing.expectEqual(brain.deps.embedding_service.dimensions(), store.memories.items[0].vector.len);
     try std.testing.expectEqual(@as(u32, 1), store.memories.items[0].access_count);
     try std.testing.expect(store.memories.items[0].score > 1);
     try std.testing.expect(store.impressions.items.len == 1);

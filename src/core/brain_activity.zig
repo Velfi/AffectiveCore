@@ -30,6 +30,10 @@ pub const ActivityOrchestration = enum {
 const max_activity_label_len: usize = 120;
 pub const ActivityStackOverflow = error.ActivityStackOverflow;
 
+pub fn isCaptureActivityContext(kind_label: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(kind_label, "Capture");
+}
+
 pub fn deriveActivityLabelsFromState(self: *Brain, anchor: []const u8) !DerivedActivityLabels {
     const kind_source = if (self.current_focus) |focus|
         focus.text
@@ -45,11 +49,20 @@ pub fn deriveActivityLabelsFromState(self: *Brain, anchor: []const u8) !DerivedA
 
 pub fn inferActivityKind(self: *Brain, orchestration: ActivityOrchestration) activity_mod.Kind {
     if (self.active_activity) |active| return active.kind;
+    return inferNewActivityKind(self, orchestration);
+}
+
+pub fn inferNewActivityKind(self: *Brain, orchestration: ActivityOrchestration) activity_mod.Kind {
     return switch (orchestration) {
         .user_speech => .conversation,
         .reminder => .waiting,
         .salient_sense => if (self.waiting_for != null) .waiting else .generic,
     };
+}
+
+pub fn activityIsInterruptibleWork(active: activity_mod.Active) bool {
+    if (active.kind != .conversation) return true;
+    return isCaptureActivityContext(active.kind_label);
 }
 
 fn truncateLabel(allocator: std.mem.Allocator, text: []const u8, max_len: usize) ![]const u8 {
@@ -163,10 +176,11 @@ pub fn ensureActiveActivity(
         }
         switch (orchestration) {
             .user_speech => {
-                if (active.kind != .conversation) {
-                    try replaceActivityGoal(self, anchor, "user speech superseded prior activity");
+                if (active.kind == .conversation and !isCaptureActivityContext(active.kind_label)) {
+                    return;
                 }
-                return;
+                try collapseActivityStack(self, "user speech superseded prior activity");
+                try supersedeActiveActivity(self);
             },
             .salient_sense, .reminder => try pushActiveOntoStack(self, @tagName(orchestration)),
         }
@@ -206,7 +220,7 @@ pub fn openActivity(
     self.active_activity = .{
         .id = id,
         .parent_id = if (parent_id) |parent| try self.allocator.dupe(u8, parent) else null,
-        .kind = inferActivityKind(self, orchestration),
+        .kind = inferNewActivityKind(self, orchestration),
         .kind_label = try self.allocator.dupe(u8, labels.kind_label),
         .status = .active,
         .goal = try self.allocator.dupe(u8, labels.goal),
@@ -390,6 +404,8 @@ pub fn replaceActivityGoal(self: *Brain, new_goal: []const u8, reason: []const u
     self.allocator.free(active.summary);
     active.summary = try self.allocator.dupe(u8, trimmed);
     active.kind = .conversation;
+    self.allocator.free(active.kind_label);
+    active.kind_label = try self.allocator.dupe(u8, "Conversation");
     active.updated_at_seconds = self.now_seconds;
     traceActivity(self, "activity.goal.replace", active.id, active.status, active.kind_label, trimmed, reason);
     try persistActiveActivityToStore(self);
@@ -437,9 +453,98 @@ pub fn applyTurnContinuation(
     }
 }
 
-pub fn appendTurnEvents(self: *Brain, user_text: []const u8, spoken_text: []const u8, turn: ?chat_mod.ChatTurn) !void {
+pub const TurnTimelineKind = enum {
+    heard_speech,
+    sense_reconsideration,
+    host_sense_delivery,
+    orchestration,
+    emoji_reaction,
+};
+
+fn turnTimelineTitle(kind: TurnTimelineKind) []const u8 {
+    return switch (kind) {
+        .heard_speech => "heard speech",
+        .sense_reconsideration => "sense reconsideration",
+        .host_sense_delivery => "host sense delivery",
+        .orchestration => "orchestration turn",
+        .emoji_reaction => "emoji reaction",
+    };
+}
+
+pub fn activeConversationPresent(self: *Brain) bool {
+    const active = self.active_activity orelse return false;
+    return active.status == .active and active.kind == .conversation;
+}
+
+pub fn recordSenseDuringConversation(
+    self: *Brain,
+    sense_kind: []const u8,
+    observation_line: []const u8,
+    source_event_id: []const u8,
+) !void {
     const active = &(self.active_activity orelse return);
-    try pushTimelineEvent(self, active, self.now_seconds, .observation, "user turn", user_text, null);
+    if (active.status != .active or active.kind != .conversation) return;
+
+    try pushTimelineEvent(
+        self,
+        active,
+        self.now_seconds,
+        .stimulus,
+        "sense during conversation",
+        observation_line,
+        if (source_event_id.len > 0) source_event_id else null,
+    );
+
+    const interpretation = try std.fmt.allocPrint(
+        self.allocator,
+        "During conversation about \"{s}\": {s} sense arrived.",
+        .{ active.goal, sense_kind },
+    );
+    defer self.allocator.free(interpretation);
+
+    try self.recordMemoryCandidateEvent(
+        .observation,
+        "environment",
+        "sense_during_conversation",
+        observation_line,
+        .environment,
+        .perception,
+        .summarize,
+        "conversation_cotemporal_sense",
+        observation_line,
+        interpretation,
+        &.{},
+        &[_][]const u8{ "conversation", "cotemporal", sense_kind },
+    );
+    active.updated_at_seconds = self.now_seconds;
+    try persistActiveActivityToStore(self);
+}
+
+pub fn appendTurnEvents(self: *Brain, user_text: []const u8, spoken_text: []const u8, turn: ?chat_mod.ChatTurn) !void {
+    try appendTurnEventsWithKind(self, timelineKindFromStimulus(self.conversation_turn_stimulus_kind), user_text, spoken_text, turn);
+}
+
+fn timelineKindFromStimulus(stimulus: chat_mod.StimulusKind) TurnTimelineKind {
+    return switch (stimulus) {
+        .heard_speech => .heard_speech,
+        .reconsideration => .sense_reconsideration,
+        .host_sense_delivery => .host_sense_delivery,
+        .orchestration => .orchestration,
+    };
+}
+
+pub fn appendTurnEventsWithKind(
+    self: *Brain,
+    timeline_kind: TurnTimelineKind,
+    anchor_text: []const u8,
+    spoken_text: []const u8,
+    turn: ?chat_mod.ChatTurn,
+) !void {
+    const active = &(self.active_activity orelse return);
+    const title = turnTimelineTitle(timeline_kind);
+    if (anchor_text.len > 0) {
+        try pushTimelineEvent(self, active, self.now_seconds, .observation, title, anchor_text, null);
+    }
     if (spoken_text.len > 0) {
         try pushTimelineEvent(self, active, self.now_seconds, .observation, "spoken response", spoken_text, null);
     }
@@ -594,6 +699,28 @@ pub fn completeActiveActivity(self: *Brain) !void {
 
 pub fn supersedeActiveActivity(self: *Brain) !void {
     try closeActiveActivity(self, .abandoned, "superseded");
+}
+
+pub fn dropActiveCheckpointForInterrupt(self: *Brain) !void {
+    const active = &(self.active_activity orelse return);
+    const checkpoint = active.checkpoint orelse return;
+    activity_mod.freeCheckpoint(self.allocator, checkpoint);
+    active.checkpoint = null;
+    if (active.status == .paused) {
+        active.status = .active;
+        active.paused_at_seconds = null;
+    }
+    active.updated_at_seconds = self.now_seconds;
+    try pushTimelineEvent(
+        self,
+        active,
+        self.now_seconds,
+        .observation,
+        "interrupt dropped checkpoint",
+        "User interrupt dropped host-wait checkpoint.",
+        null,
+    );
+    try persistActiveActivityToStore(self);
 }
 
 pub fn clearActiveActivity(self: *Brain) void {
@@ -844,6 +971,25 @@ fn deriveOpenLoops(self: *Brain, allocator: std.mem.Allocator) ![]activity_mod.O
             .kind = .deferred_input,
             .description = try allocator.dupe(u8, "deferred user speech while activity paused"),
             .since_seconds = self.now_seconds,
+        });
+    }
+    if (self.active_process) |process| {
+        const step = if (process.step_index < process.steps.len) process.steps[process.step_index] else null;
+        const description = try std.fmt.allocPrint(
+            allocator,
+            "process {s}: {s} step {d}/{d} ({s})",
+            .{
+                process.goal,
+                @tagName(process.state),
+                process.step_index + 1,
+                process.steps.len,
+                if (step) |current| @tagName(current.kind) else "done",
+            },
+        );
+        try loops.append(allocator, .{
+            .kind = .process,
+            .description = description,
+            .since_seconds = process.started_at,
         });
     }
     if (self.active_activity) |active| {

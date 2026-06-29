@@ -1,13 +1,12 @@
 const std = @import("std");
 const chat_mod = ports.chat;
-const intent_mod = ports.intent;
 const openai = ports.openai;
-const greeting_client = ports.greeting;
 const speech_mod = ports.speech;
 const email_mod = ports.email;
 const autonomy_mod = ports.autonomy;
 const psyche_client = ports.psyche;
 const want_achievement_mod = ports.want_achievement;
+const persona_directive_mod = ports.persona_directive;
 const process_goal_mod = ports.process_goal;
 const image_mod = ports.image;
 const audio_mod = ports.audio;
@@ -16,9 +15,10 @@ const speaker_mod = ports.speaker;
 const input_mod = ports.input;
 const event_log_mod = ports.event_log;
 const facial_expression = ports.facial_expression;
+const emote_mod = ports.emote;
 const mise_en_scene_mod = ports.mise_en_scene;
 const memory_extraction_mod = ports.memory_extraction;
-const memory_selection_mod = ports.memory_selection;
+const embedding_mod = ports.embedding;
 const orientation_mod = ports.orientation;
 const output_mod = ports.output;
 const system_senses_mod = ports.system_senses;
@@ -40,17 +40,16 @@ pub const BrainDeps = struct {
     recognizer: identity.IdentityRecognizer,
     face_picture_updater: ?identity.FacePictureUpdater = null,
     description_service: openai.DescriptionService,
-    greeting_service: greeting_client.GreetingService,
-    intent_service: intent_mod.IntentService,
     chat_service: chat_mod.ChatService,
+    embedding_service: embedding_mod.EmbeddingService,
     memory_extraction_service: ?memory_extraction_mod.MemoryExtractionService = null,
-    memory_selection_service: ?memory_selection_mod.MemorySelectionService = null,
     email_service: ?email_mod.EmailService = null,
     image_generation_service: image_mod.ImageGenerationService,
     audio_inspection_service: ?audio_mod.AudioInspectionService = null,
     autonomy_planner: ?autonomy_mod.AutonomyPlanner = null,
     psyche_service: ?psyche_client.PsycheService = null,
     want_achievement_detector: want_achievement_mod.WantAchievementDetector,
+    persona_directive_synthesizer: persona_directive_mod.PersonaDirectiveSynthesizer,
     process_composer: ?process_goal_mod.ProcessComposer = null,
     speech_service: speech_mod.SpeechService,
     speaker: speaker_mod.Speaker,
@@ -59,6 +58,7 @@ pub const BrainDeps = struct {
     graph: graph_store.GraphStore,
     event_log: ?event_log_mod.EventLog = null,
     facial_expression_output: ?facial_expression.Output = null,
+    emote_output: ?emote_mod.Output = null,
     mise_en_scene_output: ?mise_en_scene_mod.Output = null,
     orientation_query: ?orientation_mod.Query = null,
     output: ?output_mod.Output = null,

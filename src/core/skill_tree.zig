@@ -41,11 +41,13 @@ pub const IntrospectTarget = union(enum) {
     autonomy,
     focus,
     identity,
+    processes,
+    process: []const u8,
     unknown: []const u8,
 };
 
 pub const group_specs = [_]GroupSpec{
-    .{ .id = .speech, .name = "speech", .summary = "Outward speech, human questions, and silent facial expression." },
+    .{ .id = .speech, .name = "speech", .summary = "Outward speech, IRC-style emotes, and silent facial expression." },
     .{ .id = .vision, .name = "vision", .summary = "Camera capture, image description, comparison, and generation." },
     .{ .id = .people, .name = "people", .summary = "Face recognition enrollment, updates, and forgetting people." },
     .{ .id = .senses, .name = "senses", .summary = "Host time, orientation, power, storage, and database observations." },
@@ -61,7 +63,7 @@ pub const group_specs = [_]GroupSpec{
 
 pub fn groupFor(id: SkillId) SkillGroup {
     return switch (id) {
-        .say, .facial_expression => .speech,
+        .say, .emote, .facial_expression => .speech,
         .take_picture, .describe_image, .compare_images, .recognize, .imagine_image => .vision,
         .remember_person, .update_face_picture, .forget_person => .people,
         .get_time, .request_orientation, .get_power, .get_storage, .get_database_stats => .senses,
@@ -102,9 +104,18 @@ pub fn parseSkillName(name: []const u8) ?SkillId {
     return null;
 }
 
+fn stripIntrospectQueryPrefix(trimmed: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(trimmed, "query")) return "";
+    const prefix = "query=";
+    if (trimmed.len > prefix.len and std.ascii.eqlIgnoreCase(trimmed[0..prefix.len], prefix)) {
+        return std.mem.trim(u8, trimmed[prefix.len..], " \t\r\n");
+    }
+    return trimmed;
+}
+
 pub fn parseIntrospectQuery(query: ?[]const u8) IntrospectTarget {
     const raw = query orelse return .overview;
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const trimmed = stripIntrospectQueryPrefix(std.mem.trim(u8, raw, " \t\r\n"));
     if (trimmed.len == 0 or std.ascii.eqlIgnoreCase(trimmed, "overview")) return .overview;
 
     var parts = std.mem.splitScalar(u8, trimmed, '/');
@@ -133,6 +144,13 @@ pub fn parseIntrospectQuery(query: ?[]const u8) IntrospectTarget {
     if (std.ascii.eqlIgnoreCase(head, "autonomy")) return .autonomy;
     if (std.ascii.eqlIgnoreCase(head, "focus")) return .focus;
     if (std.ascii.eqlIgnoreCase(head, "identity")) return .identity;
+    if (std.ascii.eqlIgnoreCase(head, "processes")) return .processes;
+    if (std.ascii.eqlIgnoreCase(head, "process")) {
+        const goal_name = parts.next() orelse return .{ .unknown = trimmed };
+        const goal_trimmed = std.mem.trim(u8, goal_name, " \t\r\n");
+        if (goal_trimmed.len == 0) return .{ .unknown = trimmed };
+        return .{ .process = goal_trimmed };
+    }
     if (parseGroupName(head)) |group| return .{ .skills_group = group };
     if (parseSkillName(head)) |skill| return .{ .skill = skill };
     return .{ .unknown = trimmed };
@@ -255,6 +273,13 @@ test "parseIntrospectQuery accepts tree drill-down paths" {
         else => try std.testing.expect(false),
     }
     try std.testing.expect(parseIntrospectQuery("needs") == .needs);
+    try std.testing.expect(parseIntrospectQuery("processes") == .processes);
+    switch (parseIntrospectQuery("process/investigate_touch")) {
+        .process => |goal| try std.testing.expectEqualStrings("investigate_touch", goal),
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expect(parseIntrospectQuery("query=skills") == .skills_tree);
+    try std.testing.expect(parseIntrospectQuery("query=needs") == .needs);
     switch (parseIntrospectQuery("not-a-topic")) {
         .unknown => |topic| try std.testing.expectEqualStrings("not-a-topic", topic),
         else => try std.testing.expect(false),

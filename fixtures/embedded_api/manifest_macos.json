@@ -26,7 +26,8 @@
     "image_generation",
     "face_picture_update",
     "local_process_io",
-    "facial_expression_output"
+    "facial_expression_output",
+    "introspection"
   ],
   "feature_flags": {
     "streaming_events": true,

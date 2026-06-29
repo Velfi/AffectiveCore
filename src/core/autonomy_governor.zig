@@ -2,6 +2,7 @@ const std = @import("std");
 const ports = @import("ports.zig");
 const chat = ports.chat;
 const schema = ports.schema;
+const skills = ports.skills;
 const maintenance = @import("maintenance.zig");
 
 pub const Settings = struct {
@@ -58,8 +59,8 @@ fn evaluateOne(
     state: maintenance.AutonomyState,
     settings: Settings,
 ) !Evaluation {
-    const effort = effortCost(proposal, settings.autonomy_mode);
     if (proposal.origin == .interaction) {
+        const effort = skills.actionPointCost(proposal.action) catch 0;
         return .{
             .index = index,
             .proposal = proposal,
@@ -68,6 +69,7 @@ fn evaluateOne(
             .effort_cost = effort,
         };
     }
+    const effort = try effortCost(proposal);
     if (std.mem.eql(u8, settings.autonomy_mode, "off")) {
         return .{
             .index = index,
@@ -97,32 +99,8 @@ fn evaluateOne(
     };
 }
 
-fn effortCost(proposal: chat.ActionProposal, autonomy_mode: []const u8) f32 {
-    const base = switch (proposal.action) {
-        .facial_expression => 0.01,
-        .say => speechEffort(proposal.text orelse ""),
-        .introspect, .appraise_event, .feel_about, .think_about, .choose_attention, .set_focus, .clear_focus, .begin_subtask, .resume_parent => 0.12,
-        .schedule_reminder, .consolidate_memory, .imagine_image => 0.28,
-        .send_email => 0.30,
-        else => 0.16,
-    };
-    const origin_scale: f32 = if (proposal.origin == .interaction) 0.80 else 1.0;
-    const mode_scale: f32 = if (proposal.origin == .autonomy and std.mem.eql(u8, autonomy_mode, "limited")) 1.10 else 1.0;
-    return base * scaleMultiplier(proposal.scale) * origin_scale * mode_scale;
-}
-
-fn speechEffort(text: []const u8) f32 {
-    const chars: f32 = @floatFromInt(text.len);
-    if (chars <= 40.0) return 0.05;
-    return 0.10 + @min(chars, 220.0) / 160.0;
-}
-
-fn scaleMultiplier(scale: chat.ActionScale) f32 {
-    return switch (scale) {
-        .full => 1.0,
-        .medium => 0.5,
-        .tiny => 0.15,
-    };
+fn effortCost(proposal: chat.ActionProposal) !f32 {
+    return skills.actionAutonomyPointCost(proposal.action);
 }
 
 fn clamp01(value: f32) f32 {
@@ -145,8 +123,8 @@ test "governor suppresses autonomy when off" {
     }};
     const evaluated = try evaluateBatch(allocator, &proposals, &pressures, .{
         .sleeping = false,
-        .control_capacity = 0.7,
-        .max_capacity = 0.8,
+        .control_capacity = 40,
+        .max_capacity = 50,
     }, .{
         .autonomy_mode = "off",
         .limited_threshold_bias = 0.2,
@@ -157,6 +135,7 @@ test "governor suppresses autonomy when off" {
     });
     defer allocator.free(evaluated);
     try std.testing.expect(!evaluated[0].passed);
+    try std.testing.expectEqual(@as(f32, 3), evaluated[0].effort_cost);
 }
 
 test "governor suppresses autonomy when overdrawn" {
@@ -173,8 +152,8 @@ test "governor suppresses autonomy when overdrawn" {
     }};
     const evaluated = try evaluateBatch(allocator, &proposals, &pressures, .{
         .sleeping = false,
-        .control_capacity = -0.05,
-        .max_capacity = 0.8,
+        .control_capacity = -3,
+        .max_capacity = 50,
     }, .{
         .autonomy_mode = "full",
         .limited_threshold_bias = 0.0,
@@ -202,8 +181,8 @@ test "governor suppresses autonomy at zero capacity" {
     }};
     const evaluated = try evaluateBatch(allocator, &proposals, &pressures, .{
         .sleeping = false,
-        .control_capacity = 0.0,
-        .max_capacity = 0.8,
+        .control_capacity = 0,
+        .max_capacity = 50,
     }, .{
         .autonomy_mode = "full",
         .limited_threshold_bias = 0.0,
@@ -214,5 +193,5 @@ test "governor suppresses autonomy at zero capacity" {
     });
     defer allocator.free(evaluated);
     try std.testing.expect(!evaluated[0].passed);
-    try std.testing.expectEqualStrings("autonomy overdrawn", evaluated[0].suppressed_reason.?);
+    try std.testing.expectEqual(@as(f32, 1), evaluated[0].effort_cost);
 }

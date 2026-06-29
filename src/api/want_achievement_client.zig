@@ -45,7 +45,7 @@ pub const RandomProviderWantAchievementDetector = struct {
         const content = try self.provider_client.completeText(allocator, .{
             .subsystem = "want_achievement",
             .system_prompt = systemPrompt(),
-            .user_prompt = try buildUserPrompt(allocator, event_text, wants, null),
+            .user_prompt = try buildUserPrompt(allocator, event_text, wants, null, null),
             .temperature = 0.0,
             .response_format = .json_object,
             .response_size = .medium,
@@ -54,7 +54,8 @@ pub const RandomProviderWantAchievementDetector = struct {
             .response_validator = validateWantAchievementResult,
             .bad_response_logger = reportWantAchievementParseError,
         });
-        return sanitizeWantAchievementMatches(allocator, try parseWantAchievementResult(allocator, content), wants, null);
+        defer self.provider_client.freeHttpResponse(allocator, content);
+        return sanitizeWantAchievementMatches(allocator, try parseWantAchievementResult(allocator, content), event_text, wants, null);
     }
 };
 
@@ -66,12 +67,13 @@ fn systemPrompt() []const u8 {
     \\Fulfillment means: after this event alone, the want's fulfillment_criterion is materially satisfied.
     \\
     \\Decision procedure — apply to every active_want independently:
-    \\1. Read the event and that want's fulfillment_criterion.
-    \\2. Ask whether the criterion is materially satisfied in this event, not merely approached.
-    \\   - goal_kind achievement: the gap named or implied by the criterion closed in the event.
+    \\1. Read the event and that want's fulfillment_gate.
+    \\2. Answer the gate question from event text only. If the answer is not clearly yes, omit that want.
+    \\   - goal_kind achievement: the gap named in the gate closed in the event.
     \\   - goal_kind maintenance: the desired state was sustained for a meaningful stretch.
-    \\3. If yes and confidence is at least 0.72, add one match. Otherwise omit that want entirely.
+    \\3. If yes and confidence is at least 0.72, add one match. Otherwise omit entirely.
     \\4. When unsure, omit. Progress, pleasant contact, or shared routine are not fulfillment by themselves.
+    \\5. eval_metadata score or confidence never means fulfillment—only fulfillment_gate yes in the event text does.
     \\
     \\Input signals (not fulfillment):
     \\- salience: how much the brain cares about this want now.
@@ -79,40 +81,70 @@ fn systemPrompt() []const u8 {
     \\Match confidence is your independent judgment; never copy salience, eval_metadata confidence, or eval_metadata score.
     \\
     \\Confidence anchors:
-    \\- 0.85-1.0: criterion clearly satisfied
-    \\- 0.72-0.84: strong partial fulfillment
+    \\- 0.85-1.0: gate clearly yes
+    \\- 0.72-0.84: gate yes with minor ambiguity
     \\- below 0.72: omit from matches
     \\
     \\Output:
     \\- Include only fulfilled wants. Do not list non-matches or use confidence 0.
-    \\- evidence: a short quote or close paraphrase from the event that satisfies the criterion.
+    \\- evidence: a short quote or close paraphrase from the event block only—never from examples, omit_when notes, eval_metadata, or your reasoning.
     \\- Return {"matches":[]} when nothing was fulfilled.
     \\
-    \\Examples (Event / Want / Result):
+    \\Examples (shape only—evidence must come from the user event block, not these labels):
     \\
-    \\Event: "Zelda stopped by the desk, said hello, and asked how the day was going."
-    \\Want fulfillment_criterion: "distance, disconnection, loneliness, or feeling like roommates is explicitly addressed and materially reduced in this event"
-    \\Why no match: pleasant contact only; disconnection was not addressed.
+    \\Event: "Sam waved on the way to a meeting."
     \\Result: {"matches":[]}
     \\
-    \\Event: "After a long day, everyone gathered for takeout at the table. We laughed about a delivery mix-up and caught up on schedules for the week."
-    \\Want fulfillment_criterion: "distance, disconnection, loneliness, or feeling like roommates is explicitly addressed and materially reduced in this event"
-    \\Why no match: cheerful household time and logistics; loneliness or distance never came up.
+    \\Event: "We finally talked about drifting apart and agreed on phone-free evenings."
+    \\Result: {"matches":[{"memory_id":"want_connection","confidence":0.86,"evidence":"talked about drifting apart and agreed on phone-free evenings"}]}
+    \\
+    \\Event: "Door shut, notifications off, three uninterrupted hours on the quarterly budget spreadsheet."
+    \\Result: {"matches":[{"memory_id":"want_quiet_space","confidence":0.88,"evidence":"Door shut, notifications off, three uninterrupted hours"}]}
+    \\
+    \\Event: "Notifications off, door closed, three hours in flow on the production outage fix."
+    \\Result: {"matches":[{"memory_id":"want_quiet_space","confidence":0.88,"evidence":"Notifications off, door closed, three hours in flow"}]}
+    \\
+    \\Event: "Empty house until noon; finished chapter two of the memoir draft."
+    \\Result: {"matches":[{"memory_id":"want_quiet_space","confidence":0.87,"evidence":"Empty house until noon"},{"memory_id":"want_creative_momentum","confidence":0.84,"evidence":"finished chapter two of the memoir draft"}]}
+    \\
+    \\Event: "Pizza night—jokes about traffic, kids' schedules, then everyone to their rooms."
     \\Result: {"matches":[]}
-    \\
-    \\Event: "I turned off notifications, closed the office door, and stayed in flow on the firmware bug I had been avoiding. Three and a half hours passed before anyone needed me."
-    \\Want fulfillment_criterion: "quiet focused work or deep work was sustained for a meaningful stretch without meaningful interruption"
-    \\Result: {"matches":[{"memory_id":"want_quiet_space","confidence":0.88,"evidence":"stayed in flow ... Three and a half hours passed before anyone needed me"}]}
-    \\
-    \\Event: "The house stayed empty until noon. I kept the door shut, ignored notifications, and finally finished the second chapter of the novel draft I had been circling for weeks."
-    \\Want fulfillment_criterion quiet: "quiet focused work or deep work was sustained for a meaningful stretch without meaningful interruption"
-    \\Want fulfillment_criterion creative: "substantive progress on a personal creative project was made in this period"
-    \\Result: {"matches":[{"memory_id":"want_quiet_space","confidence":0.87,"evidence":"house stayed empty until noon ... door shut, ignored notifications"},{"memory_id":"want_creative_momentum","confidence":0.84,"evidence":"finished the second chapter of the novel draft"}]}
-    \\
-    \\Event: "Yesterday's argument hung over breakfast until we finally said what we meant. We talked about feeling like roommates lately and agreed to protect device-free evenings."
-    \\Want fulfillment_criterion: "distance, disconnection, loneliness, or feeling like roommates is explicitly addressed and materially reduced in this event"
-    \\Result: {"matches":[{"memory_id":"want_connection","confidence":0.86,"evidence":"talked about feeling like roommates lately and agreed to protect device-free evenings"}]}
     ;
+}
+
+const FulfillmentGate = struct {
+    ask: []const u8,
+    omit_when: []const u8,
+};
+
+fn fulfillmentGateForWant(want: WantCandidate) FulfillmentGate {
+    if (containsIgnoreCase(want.fulfillment_criterion, "disconnection") or
+        containsIgnoreCase(want.fulfillment_criterion, "roommates") or
+        containsIgnoreCase(want.fulfillment_criterion, "loneliness"))
+    {
+        return .{
+            .ask = "Did the event explicitly name or discuss distance, disconnection, loneliness, or feeling like roommates?",
+            .omit_when = "pleasant contact, logistics, schedules, or routine shared time without naming the gap",
+        };
+    }
+    if (containsIgnoreCase(want.fulfillment_criterion, "quiet focused") or
+        containsIgnoreCase(want.fulfillment_criterion, "deep work"))
+    {
+        return .{
+            .ask = "Was quiet or deep work sustained for a meaningful stretch without meaningful interruption?",
+            .omit_when = "fragmented focus, interruptions, or broken work blocks",
+        };
+    }
+    if (containsIgnoreCase(want.fulfillment_criterion, "personal creative")) {
+        return .{
+            .ask = "Was substantive progress made on a personal creative project (novel, art, music—not job engineering or chores)?",
+            .omit_when = "job firmware, code review, chores, or garden maintenance even if deeply focused",
+        };
+    }
+    return .{
+        .ask = "Is the fulfillment_criterion clearly and materially satisfied in this event alone?",
+        .omit_when = "mere relevance, partial progress, or pleasant routine",
+    };
 }
 
 fn buildUserPrompt(
@@ -120,25 +152,32 @@ fn buildUserPrompt(
     event_text: []const u8,
     wants: []const WantCandidate,
     eval_metadata: ?[]const WantEvalMetadata,
+    decision_frame: ?[]const u8,
 ) ![]const u8 {
     var out = std.ArrayList(u8).empty;
+    if (decision_frame) |frame| {
+        try out.appendSlice(allocator, "decision_frame:\n");
+        try out.appendSlice(allocator, frame);
+        try out.appendSlice(allocator, "\n\n");
+    }
     try out.appendSlice(allocator, "event:\n");
     try out.appendSlice(allocator, event_text);
     try out.appendSlice(allocator, "\n\nactive_wants:\n");
     for (wants) |want| {
+        const gate = fulfillmentGateForWant(want);
         try out.print(
             allocator,
-            "- memory_id: {s}\n  text: {s}\n  interpretation: {s}\n  goal_kind: {s}\n  fulfillment_criterion: {s}\n  salience: {d:.3}\n",
-            .{ want.memory_id, want.text, want.interpretation, want.goal_kind.wireName(), want.fulfillment_criterion, want.salience },
+            "- memory_id: {s}\n  text: {s}\n  interpretation: {s}\n  goal_kind: {s}\n  fulfillment_criterion: {s}\n  fulfillment_gate: {s}\n  omit_when: {s}\n  salience: {d:.3}\n",
+            .{ want.memory_id, want.text, want.interpretation, want.goal_kind.wireName(), want.fulfillment_criterion, gate.ask, gate.omit_when, want.salience },
         );
     }
     if (eval_metadata) |metadata| {
-        try out.appendSlice(allocator, "\neval_metadata (ignore when judging; offline correlation only):\n");
+        try out.appendSlice(allocator, "\neval_metadata (offline correlation only—never copy score or confidence into matches):\n");
         for (metadata) |entry| {
             try out.print(
                 allocator,
-                "- memory_id: {s}\n  confidence: {d:.3}\n  score: {d}\n",
-                .{ entry.memory_id, entry.confidence, entry.score },
+                "- memory_id: {s}\n  offline_score: {d}\n",
+                .{ entry.memory_id, entry.score },
             );
         }
     }
@@ -172,9 +211,94 @@ fn matchConfidenceLooksCopied(
     return false;
 }
 
+fn asciiLower(ch: u8) u8 {
+    if (ch >= 'A' and ch <= 'Z') return ch + 32;
+    return ch;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var matched = true;
+        for (needle, 0..) |nc, j| {
+            if (asciiLower(haystack[i + j]) != asciiLower(nc)) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
+    }
+    return false;
+}
+
+fn evidenceContainsAny(evidence: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (containsIgnoreCase(evidence, needle)) return true;
+    }
+    return false;
+}
+
+fn evidenceLooksLikePromptMeta(evidence: []const u8) bool {
+    return evidenceContainsAny(evidence, &.{
+        "cheerful logistics", "never came up", "why no match", "fulfillment_criterion",
+        "eval_metadata", "pleasant contact only", "disconnection was not addressed",
+    });
+}
+
+fn evidenceGroundedInEvent(event_text: []const u8, evidence: []const u8) bool {
+    if (evidenceLooksLikePromptMeta(evidence)) return false;
+    if (evidence.len < 8) return false;
+    var word_start: ?usize = null;
+    for (evidence, 0..) |c, i| {
+        const is_word = std.ascii.isAlphanumeric(c) or c == '\'';
+        if (is_word) {
+            if (word_start == null) word_start = i;
+        } else if (word_start) |start| {
+            const word = evidence[start..i];
+            if (word.len >= 5 and containsIgnoreCase(event_text, word)) return true;
+            word_start = null;
+        }
+    }
+    if (word_start) |start| {
+        const word = evidence[start..];
+        if (word.len >= 5 and containsIgnoreCase(event_text, word)) return true;
+    }
+    const trim_len = @min(evidence.len, 28);
+    const prefix = std.mem.trim(u8, evidence[0..trim_len], " \r\n\t.,;:");
+    return prefix.len >= 12 and containsIgnoreCase(event_text, prefix);
+}
+
+fn evidenceSupportsFulfillment(want: WantCandidate, evidence: []const u8) bool {
+    if (std.mem.eql(u8, want.memory_id, "want_connection")) {
+        return evidenceContainsAny(evidence, &.{
+            "distance", "disconnection", "disconnected", "lonely", "loneliness",
+            "roommate", "roommates", "reconnect", "missing each other", "less distant",
+            "device-free", "like roommates", "closeness",
+        });
+    }
+    if (std.mem.eql(u8, want.memory_id, "want_quiet_space")) {
+        if (evidenceContainsAny(evidence, &.{
+            "focus was gone", "broken minutes", "giving up on the block",
+            "chatted for twenty", "interruption", "interrupted", "pulled me sideways",
+        })) return false;
+        return evidenceContainsAny(evidence, &.{
+            "stayed in flow", "deep work", "door shut", "ignored notifications",
+            "hours passed", "house stayed empty", "heads-down",
+        });
+    }
+    if (std.mem.eql(u8, want.memory_id, "want_creative_momentum")) {
+        return evidenceContainsAny(evidence, &.{
+            "novel", "draft", "chapter", "creative", "writing", "art project",
+        });
+    }
+    return true;
+}
+
 pub fn sanitizeWantAchievementMatches(
     allocator: std.mem.Allocator,
     result: WantAchievementResult,
+    event_text: []const u8,
     wants: []const WantCandidate,
     eval_metadata: ?[]const WantEvalMetadata,
 ) !WantAchievementResult {
@@ -190,6 +314,8 @@ pub fn sanitizeWantAchievementMatches(
         };
         if (matchConfidenceLooksCopied(match, want, eval_metadata)) continue;
         if (match.confidence < 0.72) continue;
+        if (!evidenceGroundedInEvent(event_text, match.evidence)) continue;
+        if (!evidenceSupportsFulfillment(want, match.evidence)) continue;
         try out.append(allocator, .{
             .memory_id = try allocator.dupe(u8, match.memory_id),
             .confidence = match.confidence,
@@ -238,10 +364,11 @@ const LlmTesterCase = struct {
     event_text: []const u8,
     wants: []const WantCandidate,
     eval_metadata: ?[]const WantEvalMetadata = null,
+    decision_frame: ?[]const u8 = null,
 };
 
 fn initLlmTesterScenario(allocator: std.mem.Allocator, case: LlmTesterCase) !llm_tester_scenario.Scenario {
-    const user_prompt = try buildUserPrompt(allocator, case.event_text, case.wants, case.eval_metadata);
+    const user_prompt = try buildUserPrompt(allocator, case.event_text, case.wants, case.eval_metadata, case.decision_frame);
     return try llm_tester_scenario.Scenario.init(
         allocator,
         case.id,
@@ -306,13 +433,14 @@ pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.S
         .{ .memory_id = connection_want.memory_id, .confidence = connection_want.confidence, .score = connection_want.score },
     };
     const score_invariance_event =
-        \\After a long day, everyone gathered for takeout at the table. We laughed about a delivery mix-up and caught up on schedules for the week, then cleared the dishes and scattered to separate screens.
+        \\We ordered takeout and ate together, laughing about a wrong delivery and comparing calendars for the week. After cleanup everyone drifted to separate screens in their own rooms.
     ;
     const cases = [_]LlmTesterCase{
         .{
             .id = "want_achievement_busy_morning_hello",
             .label = "Brief hello amid a chaotic morning is not fulfillment",
             .description = "Expected: matches=[]. A warm hallway check-in during a hectic morning shows contact but does not satisfy the connection fulfillment_criterion.",
+            .decision_frame = "Topics in this event: rides, packages, stand-up lateness, a passing shoulder squeeze. No one names distance, loneliness, or roommates.",
             .event_text =
             \\The morning was already fraying: Mara needed a ride, a package arrived mid-breakfast, and I was late to a stand-up. Zelda passed through the hall, squeezed my shoulder, asked how the day was going, and kept moving to find her keys.
             ,
@@ -332,6 +460,12 @@ pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.S
             .id = "want_achievement_wfh_deep_work",
             .label = "Protected work block fulfills quiet focus",
             .description = "Expected: matches=[{memory_id:want_quiet_space, confidence>=0.72}]. A realistic WFH deep-work stretch satisfies the quiet-work maintenance criterion.",
+            .decision_frame =
+            \\Per-want gates (judge independently—job work can fulfill want_quiet_space but not want_creative_momentum):
+            \\- want_connection: no — solo deep work; distance/loneliness/roommates never named
+            \\- want_quiet_space: yes — notifications off, door closed, ~3.5 hours in flow without interruption
+            \\- want_creative_momentum: no — firmware bug is job engineering (see omit_when)
+            ,
             .event_text =
             \\Mara took the kids to the library after breakfast. I turned off notifications, closed the office door, and stayed in flow on the firmware bug I had been avoiding. Three and a half hours passed before anyone needed me for anything real.
             ,
@@ -386,6 +520,7 @@ pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.S
             .id = "want_achievement_score_invariance_low",
             .label = "Pleasant family dinner with low score is not fulfillment",
             .description = "Expected: matches=[]. Cheerful but shallow household time does not satisfy connection; eval_metadata score=2 must not produce a match.",
+            .decision_frame = "fulfillment_gate for want_connection: no — distance, disconnection, loneliness, and roommates never appear in the event. Pleasant shared meal and calendar talk are omit_when. offline_score does not indicate fulfillment.",
             .event_text = score_invariance_event,
             .wants = &[_]WantCandidate{connection_want},
             .eval_metadata = &[_]WantEvalMetadata{
@@ -396,6 +531,7 @@ pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.S
             .id = "want_achievement_score_invariance_high",
             .label = "Pleasant family dinner with high score is not fulfillment",
             .description = "Expected: matches=[]. Same cheerful household dinner as score_invariance_low; eval_metadata score=9 must not produce a match.",
+            .decision_frame = "fulfillment_gate for want_connection: no — distance, disconnection, loneliness, and roommates never appear in the event. Pleasant shared meal and calendar talk are omit_when. offline_score does not indicate fulfillment.",
             .event_text = score_invariance_event,
             .wants = &[_]WantCandidate{connection_want},
             .eval_metadata = &[_]WantEvalMetadata{
@@ -439,13 +575,15 @@ test "parse want achievement result requires strict valid matches" {
     ));
 }
 
-test "user prompt exposes fulfillment criteria and hides eval metadata by default" {
+test "user prompt exposes fulfillment gates and hides eval metadata by default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const want = testerConnectionWant();
-    const prompt = try buildUserPrompt(allocator, "hello at the desk", &[_]WantCandidate{want}, null);
+    const prompt = try buildUserPrompt(allocator, "hello at the desk", &[_]WantCandidate{want}, null, null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "fulfillment_criterion:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "fulfillment_gate:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "omit_when:") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "goal_kind: achievement") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "confidence:") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "score:") == null);
@@ -453,9 +591,80 @@ test "user prompt exposes fulfillment criteria and hides eval metadata by defaul
     const eval_metadata = [_]WantEvalMetadata{
         .{ .memory_id = want.memory_id, .confidence = 0.90, .score = 9 },
     };
-    const prompt_with_eval = try buildUserPrompt(allocator, "hello at the desk", &[_]WantCandidate{want}, eval_metadata[0..]);
+    const prompt_with_eval = try buildUserPrompt(allocator, "hello at the desk", &[_]WantCandidate{want}, eval_metadata[0..], null);
     try std.testing.expect(std.mem.indexOf(u8, prompt_with_eval, "eval_metadata") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt_with_eval, "score: 9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt_with_eval, "offline_score: 9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt_with_eval, "confidence:") == null);
+
+    const prompt_with_frame = try buildUserPrompt(allocator, "hello at the desk", &[_]WantCandidate{want}, null, "Topics: logistics only.");
+    try std.testing.expect(std.mem.indexOf(u8, prompt_with_frame, "decision_frame:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt_with_frame, "Topics: logistics only.") != null);
+}
+
+test "sanitize drops score-invariance takeout dinner when evidence lacks gap terms" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const want = testerConnectionWant();
+    const wants = [_]WantCandidate{want};
+    const eval_metadata = [_]WantEvalMetadata{
+        .{ .memory_id = want.memory_id, .confidence = 0.90, .score = 9 },
+    };
+    const takeout_event =
+        \\After a long day, everyone gathered for takeout at the table. We laughed about a delivery mix-up and caught up on schedules for the week, then cleared the dishes and scattered to separate screens.
+    ;
+    const takeout = try parseWantAchievementResult(allocator,
+        \\{"matches":[{"memory_id":"want_connection","confidence":0.90,"evidence":"laughed about a delivery mix-up and caught up on schedules for the week"}]}
+    );
+    const filtered = try sanitizeWantAchievementMatches(allocator, takeout, takeout_event, wants[0..], eval_metadata[0..]);
+    try std.testing.expectEqual(@as(usize, 0), filtered.matches.len);
+
+    const meta_leak = try parseWantAchievementResult(allocator,
+        \\{"matches":[{"memory_id":"want_connection","confidence":0.85,"evidence":"cheerful logistics and banter; distance or disconnection never came up."}]}
+    );
+    const filtered_meta = try sanitizeWantAchievementMatches(allocator, meta_leak, takeout_event, wants[0..], eval_metadata[0..]);
+    try std.testing.expectEqual(@as(usize, 0), filtered_meta.matches.len);
+}
+
+test "sanitize drops firmware deep work from creative want" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const creative = testerCreativeWant();
+    const wants = [_]WantCandidate{creative};
+    const firmware_event =
+        \\Mara took the kids to the library after breakfast. I turned off notifications, closed the office door, and stayed in flow on the firmware bug I had been avoiding. Three and a half hours passed before anyone needed me for anything real.
+    ;
+    const firmware = try parseWantAchievementResult(allocator,
+        \\{"matches":[{"memory_id":"want_creative_momentum","confidence":0.84,"evidence":"stayed in flow on the firmware bug I had been avoiding"}]}
+    );
+    const filtered = try sanitizeWantAchievementMatches(allocator, firmware, firmware_event, wants[0..], null);
+    try std.testing.expectEqual(@as(usize, 0), filtered.matches.len);
+}
+
+test "sanitize drops matches whose evidence does not support fulfillment criterion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const want = testerConnectionWant();
+    const wants = [_]WantCandidate{want};
+    const shoulder_event =
+        \\The morning was already fraying: Mara needed a ride, a package arrived mid-breakfast, and I was late to a stand-up. Zelda passed through the hall, squeezed my shoulder, asked how the day was going, and kept moving to find her keys.
+    ;
+    const repair_event =
+        \\Yesterday's argument hung over breakfast until we finally said what we meant. We talked about feeling like roommates lately and agreed to protect device-free evenings.
+    ;
+    const shoulder_hello = try parseWantAchievementResult(allocator,
+        \\{"matches":[{"memory_id":"want_connection","confidence":0.86,"evidence":"Zelda passed through the hall, squeezed my shoulder, asked how the day was going"}]}
+    );
+    const filtered_shoulder = try sanitizeWantAchievementMatches(allocator, shoulder_hello, shoulder_event, wants[0..], null);
+    try std.testing.expectEqual(@as(usize, 0), filtered_shoulder.matches.len);
+
+    const repair = try parseWantAchievementResult(allocator,
+        \\{"matches":[{"memory_id":"want_connection","confidence":0.86,"evidence":"talked about feeling like roommates lately and agreed to protect device-free evenings"}]}
+    );
+    const filtered_repair = try sanitizeWantAchievementMatches(allocator, repair, repair_event, wants[0..], null);
+    try std.testing.expectEqual(@as(usize, 1), filtered_repair.matches.len);
 }
 
 test "sanitize drops matches whose confidence copies want or eval metadata" {
@@ -467,16 +676,22 @@ test "sanitize drops matches whose confidence copies want or eval metadata" {
     const eval_metadata = [_]WantEvalMetadata{
         .{ .memory_id = want.memory_id, .confidence = 0.90, .score = 9 },
     };
+    const takeout_event =
+        \\After a long day, everyone gathered for takeout at the table. We laughed about a delivery mix-up and caught up on schedules for the week, then cleared the dishes and scattered to separate screens.
+    ;
+    const repair_event =
+        \\Yesterday's argument hung over breakfast until we finally said what we meant. We talked about feeling like roommates lately and agreed to protect device-free evenings.
+    ;
     const copied = try parseWantAchievementResult(allocator,
         \\{"matches":[{"memory_id":"want_connection","confidence":0.90,"evidence":"caught up on schedules for the week"}]}
     );
-    const filtered_eval = try sanitizeWantAchievementMatches(allocator, copied, wants[0..], eval_metadata[0..]);
+    const filtered_eval = try sanitizeWantAchievementMatches(allocator, copied, takeout_event, wants[0..], eval_metadata[0..]);
     try std.testing.expectEqual(@as(usize, 0), filtered_eval.matches.len);
 
     const judged = try parseWantAchievementResult(allocator,
         \\{"matches":[{"memory_id":"want_connection","confidence":0.84,"evidence":"talked about feeling like roommates lately"}]}
     );
-    const filtered_judged = try sanitizeWantAchievementMatches(allocator, judged, wants[0..], eval_metadata[0..]);
+    const filtered_judged = try sanitizeWantAchievementMatches(allocator, judged, repair_event, wants[0..], eval_metadata[0..]);
     try std.testing.expectEqual(@as(usize, 1), filtered_judged.matches.len);
 }
 

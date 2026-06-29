@@ -19,10 +19,16 @@ pub const SuperegoTurn = struct {
     reason: []const u8,
 };
 
+pub const PsycheTurns = struct {
+    id: IdTurn,
+    superego: SuperegoTurn,
+};
+
 pub const PsycheService = struct {
     ctx: *anyopaque,
     idFn: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!IdTurn,
     superegoFn: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!SuperegoTurn,
+    consultBothFn: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!PsycheTurns,
 
     pub fn consultId(self: PsycheService, allocator: std.mem.Allocator, shared_context: []const u8) !IdTurn {
         return self.idFn(self.ctx, allocator, shared_context);
@@ -30,6 +36,10 @@ pub const PsycheService = struct {
 
     pub fn consultSuperego(self: PsycheService, allocator: std.mem.Allocator, shared_context: []const u8) !SuperegoTurn {
         return self.superegoFn(self.ctx, allocator, shared_context);
+    }
+
+    pub fn consultBoth(self: PsycheService, allocator: std.mem.Allocator, shared_context: []const u8) !PsycheTurns {
+        return self.consultBothFn(self.ctx, allocator, shared_context);
     }
 };
 
@@ -42,23 +52,30 @@ pub const ScriptedPsycheService = struct {
     last_superego_context: []const u8 = "",
 
     pub fn service(self: *ScriptedPsycheService) PsycheService {
-        return .{ .ctx = self, .idFn = consultId, .superegoFn = consultSuperego };
+        return .{ .ctx = self, .idFn = consultId, .superegoFn = consultSuperego, .consultBothFn = consultBoth };
     }
 
     fn consultId(ctx: *anyopaque, allocator: std.mem.Allocator, shared_context: []const u8) !IdTurn {
-        _ = allocator;
         const self: *ScriptedPsycheService = @ptrCast(@alignCast(ctx));
         self.id_calls += 1;
-        self.last_id_context = shared_context;
+        if (self.last_id_context.len > 0) allocator.free(self.last_id_context);
+        self.last_id_context = try allocator.dupe(u8, shared_context);
         return self.id_turn;
     }
 
     fn consultSuperego(ctx: *anyopaque, allocator: std.mem.Allocator, shared_context: []const u8) !SuperegoTurn {
-        _ = allocator;
         const self: *ScriptedPsycheService = @ptrCast(@alignCast(ctx));
         self.superego_calls += 1;
-        self.last_superego_context = shared_context;
+        if (self.last_superego_context.len > 0) allocator.free(self.last_superego_context);
+        self.last_superego_context = try allocator.dupe(u8, shared_context);
         return self.superego_turn;
+    }
+
+    fn consultBoth(ctx: *anyopaque, allocator: std.mem.Allocator, shared_context: []const u8) !PsycheTurns {
+        return .{
+            .id = try consultId(ctx, allocator, shared_context),
+            .superego = try consultSuperego(ctx, allocator, shared_context),
+        };
     }
 };
 

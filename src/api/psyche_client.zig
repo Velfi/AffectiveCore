@@ -9,6 +9,7 @@ const llm_tester_scenario = @import("../harness/llm_tester/scenario.zig");
 
 pub const IdTurn = psyche_port.IdTurn;
 pub const SuperegoTurn = psyche_port.SuperegoTurn;
+pub const PsycheTurns = psyche_port.PsycheTurns;
 pub const PsycheService = psyche_port.PsycheService;
 pub const ScriptedPsycheService = psyche_port.ScriptedPsycheService;
 pub const formatIdTurn = psyche_port.formatIdTurn;
@@ -32,12 +33,40 @@ pub const RandomProviderPsycheService = struct {
     }
 
     pub fn service(self: *RandomProviderPsycheService) PsycheService {
-        return .{ .ctx = self, .idFn = consultId, .superegoFn = consultSuperego };
+        return .{ .ctx = self, .idFn = consultId, .superegoFn = consultSuperego, .consultBothFn = consultBoth };
+    }
+
+    fn consultBoth(ctx: *anyopaque, allocator: std.mem.Allocator, shared_context: []const u8) !PsycheTurns {
+        const self: *RandomProviderPsycheService = @ptrCast(@alignCast(ctx));
+        var items = [_]ai.TextBatchItem{
+            .{ .request = psycheTextRequest(self, "psyche_id", idSystemPrompt(), shared_context, idJsonSchema(), validateIdTurn) },
+            .{ .request = psycheTextRequest(self, "psyche_superego", superegoSystemPrompt(), shared_context, superegoJsonSchema(), validateSuperegoTurn) },
+        };
+        try self.provider_client.completeTextBatch(allocator, &items);
+        errdefer for (&items) |*item| {
+            if (item.content) |content| self.provider_client.freeHttpResponse(allocator, content);
+        };
+        const id_content = items[0].content orelse return error.MissingBatchResponse;
+        const superego_content = items[1].content orelse return error.MissingBatchResponse;
+        const id = parseIdTurn(allocator, id_content) catch |err| {
+            reportPsycheParseError("id", err, id_content);
+            return err;
+        };
+        const superego = parseSuperegoTurn(allocator, superego_content) catch |err| {
+            reportPsycheParseError("superego", err, superego_content);
+            return err;
+        };
+        for (&items) |*item| {
+            if (item.content) |content| self.provider_client.freeHttpResponse(allocator, content);
+            item.content = null;
+        }
+        return .{ .id = id, .superego = superego };
     }
 
     fn consultId(ctx: *anyopaque, allocator: std.mem.Allocator, shared_context: []const u8) !IdTurn {
         const self: *RandomProviderPsycheService = @ptrCast(@alignCast(ctx));
         const content = try self.callSelected(allocator, "psyche_id", idSystemPrompt(), shared_context, idJsonSchema(), validateIdTurn);
+        defer self.provider_client.freeHttpResponse(allocator, content);
         return parseIdTurn(allocator, content) catch |err| {
             reportPsycheParseError("id", err, content);
             return err;
@@ -47,6 +76,7 @@ pub const RandomProviderPsycheService = struct {
     fn consultSuperego(ctx: *anyopaque, allocator: std.mem.Allocator, shared_context: []const u8) !SuperegoTurn {
         const self: *RandomProviderPsycheService = @ptrCast(@alignCast(ctx));
         const content = try self.callSelected(allocator, "psyche_superego", superegoSystemPrompt(), shared_context, superegoJsonSchema(), validateSuperegoTurn);
+        defer self.provider_client.freeHttpResponse(allocator, content);
         return parseSuperegoTurn(allocator, content) catch |err| {
             reportPsycheParseError("superego", err, content);
             return err;
@@ -62,20 +92,31 @@ pub const RandomProviderPsycheService = struct {
         json_schema: []const u8,
         validator: *const fn (std.mem.Allocator, []const u8) anyerror!void,
     ) ![]const u8 {
-        return self.provider_client.completeText(allocator, .{
-            .subsystem = subsystem,
-            .system_prompt = system_prompt,
-            .user_prompt = user_prompt,
-            .temperature = 0.2,
-            .response_format = .json_object,
-            .response_size = .medium,
-            .reasoning_effort = self.reasoning_effort,
-            .json_schema = json_schema,
-            .response_validator = validator,
-            .bad_response_logger = reportPsycheProviderParseError,
-        });
+        return self.provider_client.completeText(allocator, psycheTextRequest(self, subsystem, system_prompt, user_prompt, json_schema, validator));
     }
 };
+
+fn psycheTextRequest(
+    self: *RandomProviderPsycheService,
+    subsystem: []const u8,
+    system_prompt: []const u8,
+    user_prompt: []const u8,
+    json_schema: []const u8,
+    validator: *const fn (std.mem.Allocator, []const u8) anyerror!void,
+) ai.TextRequest {
+    return .{
+        .subsystem = subsystem,
+        .system_prompt = system_prompt,
+        .user_prompt = user_prompt,
+        .temperature = 0.2,
+        .response_format = .json_object,
+        .response_size = .medium,
+        .reasoning_effort = self.reasoning_effort,
+        .json_schema = json_schema,
+        .response_validator = validator,
+        .bad_response_logger = reportPsycheProviderParseError,
+    };
+}
 
 fn idSystemPrompt() []const u8 {
     return
@@ -239,6 +280,73 @@ fn reportPsycheProviderParseError(subsystem: []const u8, provider: []const u8, m
         "\nPSYCHE PARSE ERROR\nSUBSYSTEM: {s}\nPROVIDER: {s}\nMODEL: {s}\nERROR: {s}\nEXPECTED: strict JSON matching the psyche schema\nRAW MODEL CONTENT:\n{s}\n\n",
         .{ subsystem, provider, model, @errorName(err), content },
     );
+}
+
+test "ScriptedPsycheService consultBoth returns id and superego turns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var psyche = ScriptedPsycheService{
+        .id_turn = .{
+            .top_need = "connection",
+            .urges = &[_][]const u8{"say hello"},
+            .random_thoughts = &[_][]const u8{},
+            .desired_action_bias = "think_about connection",
+            .salience = .medium,
+            .reason = "lonely",
+        },
+        .superego_turn = .{
+            .concerns = &[_][]const u8{"quiet hours"},
+            .vetoes = &[_][]const u8{},
+            .preferred_restraints = &[_][]const u8{},
+            .values_to_preserve = &[_][]const u8{"honesty"},
+            .salience = .high,
+            .reason = "protect boundaries",
+        },
+    };
+    const turns = try psyche.service().consultBoth(allocator, "shared interior state");
+    try std.testing.expectEqualStrings("connection", turns.id.top_need);
+    try std.testing.expectEqual(autonomy.Salience.high, turns.superego.salience);
+    try std.testing.expectEqual(@as(usize, 1), psyche.id_calls);
+    try std.testing.expectEqual(@as(usize, 1), psyche.superego_calls);
+}
+
+test "RandomProviderPsycheService consultBoth parses batched responses" {
+    if (comptime @import("builtin").single_threaded) return;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const PsycheHttpTransport = struct {
+        fn client(self: *@This()) http_transport.Client {
+            return .{ .ctx = self, .postJsonFn = postJson };
+        }
+
+        fn postJson(ctx: *anyopaque, alloc: std.mem.Allocator, request: http_transport.JsonPostRequest) ![]u8 {
+            _ = ctx;
+            if (std.mem.indexOf(u8, request.body, "psyche_id") != null) {
+                return try alloc.dupe(u8,
+                    \\{"top_need":"connection","urges":["hello"],"random_thoughts":[],"desired_action_bias":"think_about connection","salience":"medium","reason":"lonely"}
+                );
+            }
+            if (std.mem.indexOf(u8, request.body, "psyche_superego") != null) {
+                return try alloc.dupe(u8,
+                    \\{"concerns":["quiet hours"],"vetoes":[],"preferred_restraints":[],"values_to_preserve":["honesty"],"salience":"high","reason":"protect boundaries"}
+                );
+            }
+            return error.UnexpectedPsycheSubsystem;
+        }
+    };
+
+    var transport = PsycheHttpTransport{};
+    var io_threaded: std.Io.Threaded = .init_single_threaded;
+    defer io_threaded.deinit();
+    const roster = try llm_routing.parseRosterFromModelsSpec(allocator, "openai:gpt-4.1-nano");
+    var service = RandomProviderPsycheService.init(io_threaded.io(), transport.client(), roster, .auto, null);
+    const turns = try service.service().consultBoth(allocator, "shared interior state");
+    try std.testing.expectEqualStrings("connection", turns.id.top_need);
+    try std.testing.expectEqual(autonomy.Salience.high, turns.superego.salience);
 }
 
 test "parseIdTurn accepts required psyche fields" {

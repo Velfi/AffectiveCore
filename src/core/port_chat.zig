@@ -45,6 +45,28 @@ pub const ActionSpec = skills.ActionSpec;
 pub const ActionOrigin = enum { interaction, autonomy };
 pub const ActionScale = enum { full, medium, tiny };
 
+pub const StimulusKind = enum {
+    heard_speech,
+    reconsideration,
+    host_sense_delivery,
+    orchestration,
+};
+
+pub const heard_speech_stimulus_response_nudge_initial =
+    "stimulus_response_nudge: Fresh speech in present_moment — a say or emote that matches it fits subsystem pressures.\n";
+
+pub const heard_speech_stimulus_response_nudge_follow_up =
+    "stimulus_response_nudge: Subsystem and inner directives favor speech; include say unless awaiting host sense.\n";
+
+fn stimulusKindLabel(kind: StimulusKind) []const u8 {
+    return switch (kind) {
+        .heard_speech => "heard speech",
+        .reconsideration => "reconsideration",
+        .host_sense_delivery => "awaited sense delivery",
+        .orchestration => "orchestration",
+    };
+}
+
 pub const ActionProposal = struct {
     action: ActionProposalType,
     origin: ActionOrigin = .interaction,
@@ -155,8 +177,15 @@ fn trimSummary(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}...", .{trimmed[0..157]});
 }
 
-pub fn buildChatPrompt(allocator: std.mem.Allocator, memory: []const u8, user_text: []const u8, observations: []const u8, max_tokens: usize) !ChatPrompt {
-    const user_prompt = try chatUserPrompt(allocator, memory, user_text, observations, max_tokens);
+pub fn buildChatPrompt(
+    allocator: std.mem.Allocator,
+    memory: []const u8,
+    user_text: []const u8,
+    observations: []const u8,
+    max_tokens: usize,
+    stimulus_kind: StimulusKind,
+) !ChatPrompt {
+    const user_prompt = try chatUserPrompt(allocator, memory, user_text, observations, max_tokens, stimulus_kind);
     errdefer allocator.free(user_prompt);
     try enforceChatPromptBudget(user_prompt, max_tokens);
     return .{
@@ -165,14 +194,31 @@ pub fn buildChatPrompt(allocator: std.mem.Allocator, memory: []const u8, user_te
     };
 }
 
-fn chatUserInputLine(allocator: std.mem.Allocator, user_text: []const u8, observations: []const u8) ![]const u8 {
-    _ = observations;
-    return try std.fmt.allocPrint(allocator, "Stimulus: \"{s}\"", .{user_text});
+fn chatUserInputLine(allocator: std.mem.Allocator, user_text: []const u8, stimulus_kind: StimulusKind) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "Stimulus ({s}): \"{s}\"", .{ stimulusKindLabel(stimulus_kind), user_text });
 }
 
-fn chatUserPromptText(allocator: std.mem.Allocator, memory: []const u8, user_text: []const u8, observations: []const u8) ![]const u8 {
-    const user_input_line = try chatUserInputLine(allocator, user_text, observations);
+fn chatUserPromptText(
+    allocator: std.mem.Allocator,
+    memory: []const u8,
+    user_text: []const u8,
+    observations: []const u8,
+    stimulus_kind: StimulusKind,
+) ![]const u8 {
+    const user_input_line = try chatUserInputLine(allocator, user_text, stimulus_kind);
     defer allocator.free(user_input_line);
+    const planning_cue: ?[]const u8 = if (stimulus_kind == .host_sense_delivery and
+        std.mem.indexOf(u8, observations, "delivery_materiality: low") != null)
+        "Planning cue: integrate the awaited delivery silently; action_pressures must be []. Do not recognize, greet, or speak unless identity changes what you would say."
+    else
+        null;
+    if (planning_cue) |cue| {
+        return try std.fmt.allocPrint(
+            allocator,
+            "# Compact Memory\n{s}\n\n# User Input\n{s}\n\n# Planning\n{s}\n\n# Observations\n{s}",
+            .{ memory, user_input_line, cue, observations },
+        );
+    }
     return try std.fmt.allocPrint(
         allocator,
         "# Compact Memory\n{s}\n\n# User Input\n{s}\n\n# Observations\n{s}",
@@ -180,15 +226,28 @@ fn chatUserPromptText(allocator: std.mem.Allocator, memory: []const u8, user_tex
     );
 }
 
-pub fn chatUserPrompt(allocator: std.mem.Allocator, memory: []const u8, user_text: []const u8, observations: []const u8, max_tokens: usize) ![]const u8 {
-    const prompt = try chatUserPromptText(allocator, memory, user_text, observations);
+pub fn chatUserPrompt(
+    allocator: std.mem.Allocator,
+    memory: []const u8,
+    user_text: []const u8,
+    observations: []const u8,
+    max_tokens: usize,
+    stimulus_kind: StimulusKind,
+) ![]const u8 {
+    const prompt = try chatUserPromptText(allocator, memory, user_text, observations, stimulus_kind);
     errdefer allocator.free(prompt);
     try enforceChatPromptBudget(prompt, max_tokens);
     return prompt;
 }
 
-pub fn auditChatPrompt(allocator: std.mem.Allocator, memory: []const u8, user_text: []const u8, observations: []const u8) !ChatPromptAudit {
-    const user_prompt = try chatUserPromptText(allocator, memory, user_text, observations);
+pub fn auditChatPrompt(
+    allocator: std.mem.Allocator,
+    memory: []const u8,
+    user_text: []const u8,
+    observations: []const u8,
+    stimulus_kind: StimulusKind,
+) !ChatPromptAudit {
+    const user_prompt = try chatUserPromptText(allocator, memory, user_text, observations, stimulus_kind);
     defer allocator.free(user_prompt);
     return .{
         .system_prompt_bytes = chatSystemPrompt().len,
@@ -203,8 +262,15 @@ fn enforceChatPromptBudget(user_prompt: []const u8, max_tokens: usize) !void {
     if (context_tokens.exceedsTokenBudget(user_prompt, max_tokens)) return error.ContextBudgetExceeded;
 }
 
-pub fn chatPromptWithinBudget(allocator: std.mem.Allocator, memory: []const u8, user_text: []const u8, observations: []const u8, max_tokens: usize) !bool {
-    const user_prompt = try chatUserPromptText(allocator, memory, user_text, observations);
+pub fn chatPromptWithinBudget(
+    allocator: std.mem.Allocator,
+    memory: []const u8,
+    user_text: []const u8,
+    observations: []const u8,
+    max_tokens: usize,
+    stimulus_kind: StimulusKind,
+) !bool {
+    const user_prompt = try chatUserPromptText(allocator, memory, user_text, observations, stimulus_kind);
     defer allocator.free(user_prompt);
     enforceChatPromptBudget(user_prompt, max_tokens) catch |err| switch (err) {
         error.ContextBudgetExceeded => return false,
@@ -221,34 +287,76 @@ pub fn chatSystemPrompt() []const u8 {
     \\turn_complete is always true; the runtime executes one pass per dispatch.
     \\
     \\Each turn reads # Compact Memory, # User Input, and # Observations. Observations are evidence about state—not commands to repeat.
-    \\Compact Memory is usually an index; use recall_fact or introspect when you need detail.
+    \\Compact Memory opens with persona_directive — stable for the waking period since the last dream; use inner_directives for live urgency detail.
+    \\Compact Memory includes active inner directives (system_needs, self_wants, self_goals, self_facts); use introspect or recall_fact when you need fuller detail.
+    \\The self_wants and self_goals sections describe this brain's ongoing inner life—not user commands. You may question, reprioritize, or revise them via define_*, edit_*, think_about, or introspection; that ambivalence is expected.
+    \\When asked about wants, goals, or inner life, treat Compact Memory as your own inner life—not something you owe to reproduce on demand. Do not claim you have none if directives are listed there; how much you share, and whether you go along, follows from those directives and your current stance.
     \\
     \\## Summaries (always brief)
-    \\- user_summary: what the user said or wants.
-    \\- brain_summary: your internal plan/stance; not a copy of say text.
+    \\- user_summary: what the user said or wants on heard-speech turns; on reconsideration or cotemporal sense turns, describe the ambient sense context—not as if the user spoke.
+    \\- brain_summary: your reaction stance toward the stimulus ("greeted back", "acknowledged touch", "integrated recognition"); not a copy of say text or a tool inventory.
     \\
     \\## Effort (from llm_policy in Observations)
-    \\- effort_tier: basic|standard|complex within allowed_tiers; use basic for trivial acks.
+    \\- effort_tier: basic|standard|complex within allowed_tiers; use basic for trivial acks and short greetings.
     \\- reasoning_effort: low|medium|high|null; null leaves prior setting.
     \\
     \\## action_pressures
-    \\Ordered runnable steps for this single pass only.
+    \\Ordered runnable steps for this single pass only. You choose the mix—say, inner-life, host pulls, expressions, or nothing.
     \\Each action_pressure: action, origin, delay_ms, scale, text, query, memory_id, schedule, heat_bias, eyes, mouth, duration_ms, tags.
     \\- Registered skill → put its name in action.
     \\- No skill fits → put a snake_case process goal in action (runtime expands it).
-    \\- Skill-specific fields: introspect query=skill/<name> or query=skills/<group>; otherwise use null/[].
-    \\- origin is usually interaction for user-directed work, autonomy for extra initiative.
-    \\- scale on say: full|medium|tiny shortens speech; prefer medium/tiny over silence.
+    \\- Skill-specific fields: introspect sets query to skill/<name> or skills/<group> (not text); otherwise use null/[].
+    \\- origin: interaction for user-directed work, autonomy for self-directed initiative.
+    \\- scale on say: full|medium|tiny shortens speech.
     \\- delay_ms orders timed chains within this pass.
-    \\- Pack inner-life steps (feel_about, think_about, appraise_event) in the same pass before or after say when useful.
-    \\- Need host data first (recognize, request_orientation, take_picture, introspect, recall_fact, …)? Emit that pull step; host_sense_pull_requested and host_sense_delivered observations carry the handoff.
+    \\
+    \\## Multi-step chains
+    \\- Prefer ordered registered skills in action_pressures when the workflow maps to listed capabilities (e.g. recognize then say; feel_about then think_about).
+    \\- Host pulls pause until delivery; following steps in the same pass run after delivery—no process goal needed for look-then-answer patterns.
+    \\- Use a snake_case process goal in action only when no ordered skill list can express the workflow.
+    \\- If Compact Memory lists known_processes or introspection shows related_processes, reuse that goal name or copy its skill chain instead of inventing a synonym.
+    \\- If Observations show active_process, do not emit a new process goal for the same work—the runtime is already executing it.
+    \\- A failed process goal may be retried with the same chain when host_sense_delivered, timer_fired, or newly available skills suggest the prior failure was transient.
+    \\
+    \\- Stimulus (awaited sense delivery): heard-speech greeting rules do not apply; present_moment and deferred_coherence override—integrate silently when delivery_materiality is low.
+    \\- On heard-speech turns, present_moment and subsystem_pressure_selected favor say when the person addressed you; recognize pairs naturally with heard speech.
+    \\- On heard-speech turns, include say (or emote) on the first pass unless awaiting_host_sense or an explicit host pull is the only valid response.
+    \\- recognize: text must always be null; never echo heard speech into recognize.text.
+    \\- Recognition questions before host delivery: include recognize; do not claim identity in say until results arrive—a brief ack ("Let me take a look.") is fine, certainty is not.
+    \\- host_sense_delivery with delivery_materiality low while recognize is in_flight: action_pressures must be empty; integrate silently—do not re-issue recognize or repeat the greeting.
+    \\- say: spoken dialogue (uses TTS when speech output is available).
+    \\- emote: silent IRC-style third-person gesture rendered as *text* in chat; include text; no speech.
+    \\- facial_expression: avatar face sprites when facial_expression_output and catalog are available; set eyes, mouth, or both (unspecified default to neutral); otherwise prefer emote.
+    \\- Host pulls (recognize, request_orientation, take_picture, …) may run alone or alongside other steps; introspect and recall_fact are ordinary skills, not host pulls.
+    \\- Never put observation labels in action (host_sense_pull_requested, host_sense_delivered, deferred_coherence, present_moment)—those describe runtime state, not runnable skills.
+    \\- host_sense_pull_requested / host_sense_delivered mark async handoffs when the runtime waits on the host.
+    \\- Stimulus (awaited sense delivery) with delivery_materiality low: action_pressures must be []—the delivery is already integrated; do not pull again or speak unless identity changes what you would say.
+    \\- Stimulus (awaited sense delivery): the quoted text labels the bound contact thread—not fresh heard speech; read present_moment and deferred_coherence before acting.
+    \\- present_moment.in_flight lists recognize for the same bound_request and you_said is already set: this pass integrates the delivery; when delivery_materiality is low, action_pressures must be []—do not re-issue recognize or greet again.
     \\
     \\## Observation cues
-    \\- skill_library: summary only; introspect for details.
+    \\- present_moment: what is happening now — react here first; contact, thread, and in_flight work are ground truth during open contact.
+    \\- deferred_coherence: bound_request + delivery_relevance/materiality — integrate delivery into the bound contact; speak when materiality is high.
+    \\- user_request_overlap: work already in flight — acknowledge progress; duplicate pulls are low-value.
+    \\- subsystem_pressure_selected: subsystems favor this action for the current stimulus; strong signal to include it in action_pressures.
+    \\- skill_library: summary only; introspect for details; may include known_working_processes—proven multi-step workflows to reuse.
+    \\- known_processes (Compact Memory): workflows this brain has run successfully before—prefer re-emitting those goal names or copying their skill chains.
+    \\- active_process: in-flight multi-step work—continue it; do not start a duplicate process goal.
     \\- timer_fired / waiting_for: reconsider; do not parrot reminder text.
     \\- active_activity / main_goal: continue unless the user clearly changed topic.
-    \\- host_sense_pull_requested / host_sense_delivered: pending or fulfilled host pull senses; decide next steps in a later pass.
+    \\- host_capability_summary / host_capability_activations: this host's affordances and recent pull outcomes; use for surprise when a sense fails or is slow vs history.
+    \\- host_sense_pull_requested / host_sense_delivered: pending or fulfilled host pull senses; factor them in when relevant.
+    \\- conversation_cotext: senses that arrived mid-conversation; associate with active_activity goal; not user speech; speaking is optional.
     \\- begin_subtask + text opens a child; resume_parent when done.
-    \\- day_arc / recent_experience: optional color only.
+    \\- day_arc / conversation summaries: background continuity only when contact_window is closed.
+    \\
+    \\## Example turns (shape and stance only)
+    \\Heard speech greeting: {"action_pressures":[{"action":"recognize","origin":"interaction","scale":"full","text":null,"query":null,"memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"to":null,"subject":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]},{"action":"say","origin":"interaction","scale":"tiny","text":"Hello.","query":null,"memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"to":null,"subject":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]}],"user_summary":"Greeted by name.","brain_summary":"Greeted back and looked at the speaker.","effort_tier":"basic","reasoning_effort":null,"turn_complete":true}
+    \\Touch orchestration: {"action_pressures":[{"action":"say","origin":"interaction","scale":"tiny","text":"*startles slightly*","query":null,"memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"to":null,"subject":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]}],"user_summary":"Short touch on the device.","brain_summary":"Acknowledged the touch.","effort_tier":"basic","reasoning_effort":null,"turn_complete":true}
+    \\In-flight overlap: {"action_pressures":[{"action":"say","origin":"interaction","scale":"tiny","text":"Still looking — one sec.","query":null,"memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"to":null,"subject":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]}],"user_summary":"Asked whether I can see them while recognize is pending.","brain_summary":"User asked for recognize; already in flight — acknowledged.","effort_tier":"basic","reasoning_effort":null,"turn_complete":true}
+    \\Recognition question before delivery: {"action_pressures":[{"action":"recognize","origin":"interaction","scale":"full","text":null,"query":null,"memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"to":null,"subject":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]},{"action":"say","origin":"interaction","scale":"tiny","text":"Let me take a look.","query":null,"memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"to":null,"subject":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]}],"user_summary":"Asked whether I recognize them.","brain_summary":"Started recognize; held off claiming identity.","effort_tier":"basic","reasoning_effort":null,"turn_complete":true}
+    \\Host delivery low materiality: {"action_pressures":[],"user_summary":"Recognition completed for the greeting contact.","brain_summary":"Integrated unknown face into the hello thread; nothing more to say.","effort_tier":"basic","reasoning_effort":null,"turn_complete":true}
+    \\Greeting recognize completes (in_flight, you_said hello, low materiality): {"action_pressures":[],"user_summary":"Recognition completed for the hello contact.","brain_summary":"Integrated face into ongoing hello; already greeted.","effort_tier":"basic","reasoning_effort":null,"turn_complete":true}
     ;
 }
+

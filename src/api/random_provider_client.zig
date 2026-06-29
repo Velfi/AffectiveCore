@@ -4,10 +4,10 @@ const http_transport = @import("http_transport.zig");
 const http_log = @import("http_log.zig");
 const llm_routing = @import("../core/llm_routing.zig");
 const brain_context_stats = @import("../core/brain_context_stats.zig");
-
 pub const Provider = llm_routing.Provider;
 pub const EffortTier = llm_routing.EffortTier;
 pub const LlmQuality = llm_routing.LlmQuality;
+pub const LlmBatchUnavailable = http_transport.LlmBatchUnavailable;
 
 pub const ResponseFormat = enum {
     text,
@@ -34,6 +34,14 @@ pub const TextRequest = struct {
     bad_response_logger: ?*const fn ([]const u8, []const u8, []const u8, anyerror, []const u8) void = null,
 };
 
+pub const TextBatchItem = struct {
+    request: TextRequest,
+    /// Filled by completeTextBatch on success; caller frees via freeHttpResponse.
+    content: ?[]const u8 = null,
+    /// Wall time for this item's HTTP attempt (filled by batch coordinator).
+    latency_ms: u64 = 0,
+};
+
 pub const VisionRequest = struct {
     subsystem: []const u8,
     prompt: []const u8,
@@ -52,7 +60,22 @@ pub const ProviderModel = struct {
     model: []const u8,
 };
 
-const max_response_bytes: usize = 1024 * 1024;
+pub const max_response_bytes: usize = 1024 * 1024;
+
+pub const PreparedTextRequest = struct {
+    routed: TextRequest,
+    models_spec: []const u8,
+    primary_provider: []const u8,
+    primary_model: []const u8,
+    tier_name: []const u8,
+    reasoning_effort_name: ?[]const u8,
+    request_bytes: usize,
+
+    pub fn deinit(self: PreparedTextRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.models_spec);
+        allocator.free(self.primary_model);
+    }
+};
 
 pub const LlmStatsRecorder = struct {
     ctx: *anyopaque,
@@ -70,6 +93,9 @@ pub const RandomProviderClient = struct {
     llm_quality: LlmQuality,
     models_spec: []const u8,
     stats_recorder: ?LlmStatsRecorder = null,
+    /// When set, HTTP response bodies from `completeText` / `completeVision` are allocated here.
+    /// Free with `freeHttpResponse`, not the caller's persistent allocator.
+    http_response_allocator: ?std.mem.Allocator = null,
 
     pub fn init(io: std.Io, http: http_transport.Client, models_spec: []const u8) RandomProviderClient {
         return initConfigured(io, http, .{ .entries = &.{} }, .auto, models_spec);
@@ -93,6 +119,14 @@ pub const RandomProviderClient = struct {
         return initWithRoster(io, http, roster, quality, "");
     }
 
+    fn responseAllocator(self: *RandomProviderClient, allocator: std.mem.Allocator) std.mem.Allocator {
+        return self.http_response_allocator orelse allocator;
+    }
+
+    pub fn freeHttpResponse(self: *RandomProviderClient, allocator: std.mem.Allocator, content: []const u8) void {
+        self.responseAllocator(allocator).free(content);
+    }
+
     fn effectiveRoster(self: *RandomProviderClient, allocator: std.mem.Allocator) !llm_routing.LlmRoster {
         if (self.roster.entries.len > 0) return self.roster;
         return llm_routing.parseRosterFromModelsSpec(allocator, self.models_spec);
@@ -106,62 +140,80 @@ pub const RandomProviderClient = struct {
 
     /// Records one stats entry per HTTP attempt (see brain_context_stats module doc).
     pub fn completeText(self: *RandomProviderClient, allocator: std.mem.Allocator, request: TextRequest) ![]const u8 {
-        _ = self.io;
-        const models_spec = try self.resolvedModelsSpec(allocator, request.subsystem, request.effort_tier);
-        defer allocator.free(models_spec);
-        const tier = request.effort_tier orelse llm_routing.defaultEffortTierForSubsystem(request.subsystem);
-        const primary = try primaryResolvedModel(allocator, models_spec);
-        defer allocator.free(primary.model);
-        const reasoning_effort = llm_routing.clampReasoningEffort(self.llm_quality, request.reasoning_effort);
-        var routed = request;
-        routed.reasoning_effort = reasoning_effort;
-        const request_bytes = request.system_prompt.len + request.user_prompt.len;
-        const content = callHostLLMComplete(allocator, self.http, models_spec, routed) catch |err| {
+        return self.completeTextOnce(allocator, request);
+    }
+
+    pub fn completeTextBatch(self: *RandomProviderClient, allocator: std.mem.Allocator, items: []TextBatchItem) !void {
+        if (items.len == 0) return;
+        if (items.len == 1) {
+            items[0].content = try self.completeTextOnce(allocator, items[0].request);
+            return;
+        }
+        try @import("llm_batch_executor.zig").executeTextBatch(self, allocator, items);
+    }
+
+    pub fn completeTextOnce(self: *RandomProviderClient, allocator: std.mem.Allocator, request: TextRequest) ![]const u8 {
+        const started_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+        const response_alloc = self.responseAllocator(allocator);
+        const prepared = try prepareTextRequest(self, allocator, request);
+        defer prepared.deinit(allocator);
+
+        const content = callHostLLMComplete(response_alloc, self.http, prepared.models_spec, prepared.routed) catch |err| {
+            const latency_ms: u64 = @intCast(@max(std.Io.Clock.real.now(self.io).toMilliseconds() - started_ms, 0));
             self.recordLlmCompletion(.{
                 .subsystem = request.subsystem,
-                .provider = primary.provider,
-                .model = primary.model,
-                .effort_tier = @tagName(tier),
-                .reasoning_effort = if (reasoning_effort) |effort| @tagName(effort) else null,
-                .request_bytes = request_bytes,
+                .provider = prepared.primary_provider,
+                .model = prepared.primary_model,
+                .effort_tier = prepared.tier_name,
+                .reasoning_effort = prepared.reasoning_effort_name,
+                .request_bytes = prepared.request_bytes,
                 .response_bytes = 0,
                 .outcome = .provider_error,
+                .latency_ms = latency_ms,
             });
             return err;
         };
+        const success_latency_ms: u64 = @intCast(@max(std.Io.Clock.real.now(self.io).toMilliseconds() - started_ms, 0));
         if (request.response_validator) |validate| {
             validate(allocator, content) catch |err| {
                 if (request.bad_response_logger) |logBadResponse| logBadResponse(request.subsystem, "host", "host_llm_complete", err, content);
                 self.recordLlmCompletion(.{
                     .subsystem = request.subsystem,
-                    .provider = primary.provider,
-                    .model = primary.model,
-                    .effort_tier = @tagName(tier),
-                    .reasoning_effort = if (reasoning_effort) |effort| @tagName(effort) else null,
-                    .request_bytes = request_bytes,
+                    .provider = prepared.primary_provider,
+                    .model = prepared.primary_model,
+                    .effort_tier = prepared.tier_name,
+                    .reasoning_effort = prepared.reasoning_effort_name,
+                    .request_bytes = prepared.request_bytes,
                     .response_bytes = content.len,
                     .outcome = .validation_error,
+                    .latency_ms = success_latency_ms,
                 });
-                allocator.free(content);
+                response_alloc.free(content);
                 return err;
             };
         }
         self.recordLlmCompletion(.{
             .subsystem = request.subsystem,
-            .provider = primary.provider,
-            .model = primary.model,
-            .effort_tier = @tagName(tier),
-            .reasoning_effort = if (reasoning_effort) |effort| @tagName(effort) else null,
-            .request_bytes = request_bytes,
+            .provider = prepared.primary_provider,
+            .model = prepared.primary_model,
+            .effort_tier = prepared.tier_name,
+            .reasoning_effort = prepared.reasoning_effort_name,
+            .request_bytes = prepared.request_bytes,
             .response_bytes = content.len,
             .outcome = .success,
+            .latency_ms = success_latency_ms,
         });
         return content;
     }
 
+    pub fn recordLlmCompletionPublic(self: *RandomProviderClient, record: brain_context_stats.LlmCompletionRecord) void {
+        self.recordLlmCompletion(record);
+    }
+
     pub fn completeVision(self: *RandomProviderClient, allocator: std.mem.Allocator, request: VisionRequest) ![]const u8 {
-        _ = self.io;
         if (request.image_paths.len == 0) return error.NoImagesProvided;
+        const started_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+        const response_alloc = self.responseAllocator(allocator);
         const models_spec = try self.resolvedModelsSpec(allocator, request.subsystem, request.effort_tier);
         defer allocator.free(models_spec);
         const tier = request.effort_tier orelse llm_routing.defaultEffortTierForSubsystem(request.subsystem);
@@ -169,7 +221,8 @@ pub const RandomProviderClient = struct {
         defer allocator.free(primary.model);
         var request_bytes: usize = request.prompt.len;
         for (request.image_paths) |path| request_bytes += path.len;
-        const content = callHostVisionComplete(allocator, self.http, models_spec, request) catch |err| {
+        const content = callHostVisionComplete(response_alloc, self.http, models_spec, request) catch |err| {
+            const latency_ms: u64 = @intCast(@max(std.Io.Clock.real.now(self.io).toMilliseconds() - started_ms, 0));
             self.recordLlmCompletion(.{
                 .subsystem = request.subsystem,
                 .provider = primary.provider,
@@ -179,9 +232,11 @@ pub const RandomProviderClient = struct {
                 .request_bytes = request_bytes,
                 .response_bytes = 0,
                 .outcome = .provider_error,
+                .latency_ms = latency_ms,
             });
             return err;
         };
+        const latency_ms: u64 = @intCast(@max(std.Io.Clock.real.now(self.io).toMilliseconds() - started_ms, 0));
         self.recordLlmCompletion(.{
             .subsystem = request.subsystem,
             .provider = primary.provider,
@@ -191,6 +246,7 @@ pub const RandomProviderClient = struct {
             .request_bytes = request_bytes,
             .response_bytes = content.len,
             .outcome = .success,
+            .latency_ms = latency_ms,
         });
         return content;
     }
@@ -199,6 +255,65 @@ pub const RandomProviderClient = struct {
         if (self.stats_recorder) |recorder| recorder.record(record);
     }
 };
+
+pub fn prepareTextRequest(client: *RandomProviderClient, allocator: std.mem.Allocator, request: TextRequest) !PreparedTextRequest {
+    const models_spec = try client.resolvedModelsSpec(allocator, request.subsystem, request.effort_tier);
+    const tier = request.effort_tier orelse llm_routing.defaultEffortTierForSubsystem(request.subsystem);
+    const primary = try primaryResolvedModel(allocator, models_spec);
+    const reasoning_effort = llm_routing.clampReasoningEffort(client.llm_quality, request.reasoning_effort);
+    var routed = request;
+    routed.reasoning_effort = reasoning_effort;
+    return .{
+        .routed = routed,
+        .models_spec = models_spec,
+        .primary_provider = primary.provider,
+        .primary_model = primary.model,
+        .tier_name = @tagName(tier),
+        .reasoning_effort_name = if (reasoning_effort) |effort| @tagName(effort) else null,
+        .request_bytes = request.system_prompt.len + request.user_prompt.len,
+    };
+}
+
+/// HTTP + validation only; stats are recorded by the batch coordinator on the main thread.
+pub fn completeTextOnceForBatch(client: *RandomProviderClient, allocator: std.mem.Allocator, request: TextRequest) ![]const u8 {
+    const prepared = try prepareTextRequest(client, allocator, request);
+    defer prepared.deinit(allocator);
+    const content = try callHostLLMComplete(allocator, client.http, prepared.models_spec, prepared.routed);
+    if (request.response_validator) |validate| {
+        validate(allocator, content) catch |err| {
+            if (request.bad_response_logger) |logBadResponse| logBadResponse(request.subsystem, "host", "host_llm_complete", err, content);
+            allocator.free(content);
+            return err;
+        };
+    }
+    return content;
+}
+
+pub fn buildHostLLMCompleteBody(allocator: std.mem.Allocator, models_spec: []const u8, request: TextRequest) ![]const u8 {
+    const models_json = try providerModelsJson(allocator, models_spec);
+    defer allocator.free(models_json);
+    const reasoning_effort_json = if (request.reasoning_effort) |effort|
+        try jsonString(allocator, @tagName(effort))
+    else
+        "null";
+    defer if (request.reasoning_effort != null) allocator.free(reasoning_effort_json);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"subsystem\":{s},\"models\":{s},\"system_prompt\":{s},\"user_prompt\":{s},\"response_format\":{s},\"response_size\":{s},\"reasoning_effort\":{s},\"temperature\":{d:.3},\"max_tokens\":{d},\"json_schema\":{s}}}",
+        .{
+            try jsonString(allocator, request.subsystem),
+            models_json,
+            try jsonString(allocator, request.system_prompt),
+            try jsonString(allocator, request.user_prompt),
+            try jsonString(allocator, @tagName(request.response_format)),
+            try jsonString(allocator, @tagName(request.response_size)),
+            reasoning_effort_json,
+            request.temperature,
+            maxTokens(request.response_size),
+            try jsonString(allocator, request.json_schema),
+        },
+    );
+}
 
 pub fn parseProviderModels(allocator: std.mem.Allocator, spec: []const u8) ![]ProviderModel {
     const roster = try llm_routing.parseRosterFromModelsSpec(allocator, spec);
@@ -232,33 +347,16 @@ fn primaryResolvedModel(allocator: std.mem.Allocator, models_spec: []const u8) !
 }
 
 fn callHostLLMComplete(allocator: std.mem.Allocator, http: http_transport.Client, models_spec: []const u8, request: TextRequest) ![]const u8 {
-    const models_json = try providerModelsJson(allocator, models_spec);
-    const reasoning_effort_json = if (request.reasoning_effort) |effort|
-        try jsonString(allocator, @tagName(effort))
-    else
-        "null";
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "{{\"subsystem\":{s},\"models\":{s},\"system_prompt\":{s},\"user_prompt\":{s},\"response_format\":{s},\"response_size\":{s},\"reasoning_effort\":{s},\"temperature\":{d:.3},\"max_tokens\":{d},\"json_schema\":{s}}}",
-        .{
-            try jsonString(allocator, request.subsystem),
-            models_json,
-            try jsonString(allocator, request.system_prompt),
-            try jsonString(allocator, request.user_prompt),
-            try jsonString(allocator, @tagName(request.response_format)),
-            try jsonString(allocator, @tagName(request.response_size)),
-            reasoning_effort_json,
-            request.temperature,
-            maxTokens(request.response_size),
-            try jsonString(allocator, request.json_schema),
-        },
-    );
+    const body = try buildHostLLMCompleteBody(allocator, models_spec, request);
+    defer allocator.free(body);
     return postJson(allocator, http, "affective-host://llm/complete", &.{}, body);
 }
 
 fn callHostVisionComplete(allocator: std.mem.Allocator, http: http_transport.Client, models_spec: []const u8, request: VisionRequest) ![]const u8 {
     const models_json = try providerModelsJson(allocator, models_spec);
+    defer allocator.free(models_json);
     var image_paths = std.ArrayList(u8).empty;
+    defer image_paths.deinit(allocator);
     try image_paths.append(allocator, '[');
     for (request.image_paths, 0..) |path, i| {
         if (i > 0) try image_paths.append(allocator, ',');
@@ -280,6 +378,7 @@ fn callHostVisionComplete(allocator: std.mem.Allocator, http: http_transport.Cli
             try jsonString(allocator, request.json_schema),
         },
     );
+    defer allocator.free(body);
     return postJson(allocator, http, "affective-host://vision/complete", &.{}, body);
 }
 
@@ -290,6 +389,7 @@ fn providerModelsJson(allocator: std.mem.Allocator, models_spec: []const u8) ![]
         allocator.free(models);
     }
     var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
     try out.append(allocator, '[');
     for (models, 0..) |model, i| {
         if (i > 0) try out.append(allocator, ',');

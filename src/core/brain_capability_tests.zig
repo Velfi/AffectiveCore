@@ -28,7 +28,6 @@ const ScriptedRecallChatService = support.ScriptedRecallChatService;
 const ScriptedClarificationChatService = support.ScriptedClarificationChatService;
 const ScriptedHardErrorRecoveryChatService = support.ScriptedHardErrorRecoveryChatService;
 const HeardSpeechObservationChatService = support.HeardSpeechObservationChatService;
-const FailingIdentityClaimIntentService = support.FailingIdentityClaimIntentService;
 const ScriptedContinuingChatService = support.ScriptedContinuingChatService;
 const makeBrain = support.makeBrain;
 const addMara = support.addMara;
@@ -160,7 +159,7 @@ test "capability registry canonicalizes aliases and manifest statuses" {
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
 
-    try brain.recordManifestStatuses("ios-host", &[_][]const u8{ "text_reply", "RecognizeSubject" });
+    _ = try brain.recordManifestStatuses("ios-host", &[_][]const u8{ "text_reply", "RecognizeSubject" });
     try std.testing.expectEqual(@as(usize, 2), store.capability_statuses.items.len);
     try std.testing.expectEqualStrings("say", store.capability_statuses.items[0].capability_id);
     try std.testing.expectEqualStrings("recognize", store.capability_statuses.items[1].capability_id);

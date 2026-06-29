@@ -4,8 +4,9 @@ const files = @import("platform/common/files.zig");
 const support = @import("core/brain_test_support.zig");
 const want_achievement_mod = @import("core/port_want_achievement.zig");
 const memory_extraction_mod = @import("core/port_memory_extraction.zig");
-const memory_selection_mod = @import("core/port_memory_selection.zig");
 const schema = @import("core/port_schema.zig");
+const brain_facial_expression = @import("core/brain_facial_expression.zig");
+const brain_process = @import("core/brain_process.zig");
 
 const AffectiveCoreEmbeddedString = embedded.AffectiveCoreEmbeddedString;
 const AffectiveCoreEmbeddedConfig = embedded.AffectiveCoreEmbeddedConfig;
@@ -25,13 +26,80 @@ fn embeddedTestIo() std.Io {
     return embedded_test_io_threaded.io();
 }
 
+fn assertEnvelopeTimings(allocator: std.mem.Allocator, json_text: []const u8) !void {
+    const envelope = try std.json.parseFromSlice(std.json.Value, allocator, json_text, .{});
+    defer envelope.deinit();
+    const timings = envelope.value.object.get("timings") orelse return error.MissingTimings;
+    const timings_object = timings.object;
+    _ = timings_object.get("dispatch_id") orelse return error.MissingDispatchId;
+    _ = timings_object.get("total_ms") orelse return error.MissingTotalMs;
+    const spans = timings_object.get("spans") orelse return error.MissingSpans;
+    const span_items = spans.array.items;
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    for (span_items) |span_value| {
+        const span_object = span_value.object;
+        const span_id = span_object.get("span_id") orelse return error.MissingSpanId;
+        const gop = try seen.getOrPut(span_id.string);
+        if (gop.found_existing) return error.DuplicateSpanId;
+    }
+}
+
+const embedded_test_avatar_json =
+    \\{"canvas":{"width":512,"height":512},"layers":[],"eyeSprites":[{"frame":0,"row":0,"column":0,"name":"unfocused"},{"frame":0,"row":0,"column":1,"name":"neutral"},{"frame":0,"row":0,"column":2,"name":"stern"}],"mouthSprites":[{"frame":0,"row":0,"column":0,"name":"smirk"},{"frame":0,"row":0,"column":1,"name":"open"},{"frame":0,"row":0,"column":2,"name":"frown"}]}
+;
+
+const embedded_test_host_manifest =
+    \\{
+    \\  "platform": "ios",
+    \\  "capabilities": [
+    \\    "text_input",
+    \\    "speech_output",
+    \\    "short_touch",
+    \\    "event_envelope",
+    \\    "event_drain",
+    \\    "camera_capture",
+    \\    "provider_vision_completion",
+    \\    "identity_recognition",
+    \\    "memory_read",
+    \\    "memory_write",
+    \\    "stored_memory_read",
+    \\    "stored_memory_write",
+    \\    "time_lookup",
+    \\    "power_status",
+    \\    "storage_fullness",
+    \\    "database_stats",
+    \\    "facial_expression_output",
+    \\    "introspection"
+    \\  ],
+    \\  "feature_flags": {}
+    \\}
+;
+
+fn writeEmbeddedTestAvatarJson(io: std.Io, root: []const u8) !void {
+    var avatar_path_buf: [512]u8 = undefined;
+    const avatar_path = try std.fmt.bufPrint(&avatar_path_buf, "{s}/avatar.json", .{root});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = avatar_path, .data = embedded_test_avatar_json, .flags = .{ .truncate = true } });
+}
+
 fn prepareEmbeddedBrainRoot(io: std.Io, root: []const u8) !void {
+    try prepareEmbeddedBrainRootWithOptions(io, root, .{ .llm_providers = true });
+}
+
+fn prepareEmbeddedBrainRootWithoutAvatar(io: std.Io, root: []const u8) !void {
+    try prepareEmbeddedBrainRootWithOptions(io, root, .{ .llm_providers = true, .avatar_json = false });
+}
+
+fn prepareEmbeddedBrainRootWithOptions(io: std.Io, root: []const u8, options: struct { llm_providers: bool, avatar_json: bool = true }) !void {
     try std.Io.Dir.cwd().createDirPath(io, root);
-    var dst_buf: [512]u8 = undefined;
-    const dst = try std.fmt.bufPrint(&dst_buf, "{s}/llm_providers.json", .{root});
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "data/llm_providers.json", std.testing.allocator, .limited(64 * 1024));
-    defer std.testing.allocator.free(bytes);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst, .data = bytes, .flags = .{ .truncate = true } });
+    if (options.llm_providers) {
+        var dst_buf: [512]u8 = undefined;
+        const dst = try std.fmt.bufPrint(&dst_buf, "{s}/llm_providers.json", .{root});
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "data/llm_providers.json", std.testing.allocator, .limited(64 * 1024));
+        defer std.testing.allocator.free(bytes);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst, .data = bytes, .flags = .{ .truncate = true } });
+    }
+    if (options.avatar_json) try writeEmbeddedTestAvatarJson(io, root);
 }
 
 test "embedded ABI result strings stay valid until explicitly freed" {
@@ -50,6 +118,7 @@ test "embedded ABI result strings stay valid until explicitly freed" {
         .schedule_path = str(root ++ "/maintenance.md"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
     };
     var handle: ?*AffectiveCoreEmbedded = null;
     var error_message = AffectiveCoreEmbeddedString{};
@@ -92,6 +161,7 @@ test "embedded ABI seeds llm_providers when host conversation models are absent"
     _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
     defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
     try std.Io.Dir.cwd().createDirPath(io, root);
+    try writeEmbeddedTestAvatarJson(io, root);
 
     const cfg = AffectiveCoreEmbeddedConfig{
         .brain_id = str("default"),
@@ -101,6 +171,7 @@ test "embedded ABI seeds llm_providers when host conversation models are absent"
         .schedule_path = str(root ++ "/maintenance.md"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
     };
     var handle: ?*AffectiveCoreEmbedded = null;
     var error_message = AffectiveCoreEmbeddedString{};
@@ -117,12 +188,51 @@ test "embedded ABI seeds llm_providers when host conversation models are absent"
     try std.testing.expect(llm_bytes.len > 0);
 }
 
+test "embedded create succeeds without avatar.json when facial expression output is enabled" {
+    const io = embeddedTestIo();
+    const root = "data/test/embedded_no_avatar";
+    _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try prepareEmbeddedBrainRootWithoutAvatar(io, root);
+
+    const manifest =
+        \\{
+        \\  "platform": "ios",
+        \\  "capabilities": ["text_input", "facial_expression_output", "event_envelope", "event_drain"],
+        \\  "feature_flags": {},
+        \\  "max_envelope_bytes": 16384,
+        \\  "max_event_count": 3,
+        \\  "max_event_text_bytes": 96,
+        \\  "raw_ref_ttl_seconds": 86400
+        \\}
+    ;
+    const cfg = AffectiveCoreEmbeddedConfig{
+        .brain_id = str("no-avatar"),
+        .brain_root = str(root),
+        .conversation_models = str("openai:gpt-4.1-nano"),
+        .memory_path = str(root ++ "/memory/people.sqlite"),
+        .graph_path = str(root ++ "/memory/relationships.sqlite"),
+        .schedule_path = str(root ++ "/maintenance.md"),
+        .maintenance_state_path = str(root ++ "/maintenance_state.json"),
+        .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(manifest),
+    };
+    var handle: ?*AffectiveCoreEmbedded = null;
+    var error_message = AffectiveCoreEmbeddedString{};
+    const created_status = affective_core_embedded_create(&cfg, null, &handle, &error_message);
+    defer affective_core_embedded_free_global_string(error_message);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), created_status);
+    defer affective_core_embedded_destroy(handle);
+    try std.testing.expect(handle != null);
+    try std.testing.expect(!brain_facial_expression.facialExpressionCatalogReady(&handle.?.brain));
+}
+
 test "embedded ABI rejects removed raw operations" {
     const io = embeddedTestIo();
     const root = "data/test/embedded_abi";
     _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
     defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
-    try prepareEmbeddedBrainRoot(io, root);
+    try prepareEmbeddedBrainRootWithOptions(io, root, .{ .llm_providers = false });
 
     const cfg = AffectiveCoreEmbeddedConfig{
         .brain_id = str("default"),
@@ -133,6 +243,7 @@ test "embedded ABI rejects removed raw operations" {
         .schedule_path = str(root ++ "/maintenance.md"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
     };
     var handle: ?*AffectiveCoreEmbedded = null;
     var error_message = AffectiveCoreEmbeddedString{};
@@ -154,6 +265,7 @@ test "embedded ABI rejects removed raw operations" {
     const connect_status = affective_core_embedded_dispatch_json(handle, connect_request.ptr, connect_request.len, &data, &runtime_error);
     try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), connect_status);
     const connect_json = stringSlice(data).?;
+    try assertEnvelopeTimings(std.testing.allocator, connect_json);
     const connect_envelope = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, connect_json, .{});
     defer connect_envelope.deinit();
     try std.testing.expectEqual(true, connect_envelope.value.object.get("ok").?.bool);
@@ -303,6 +415,160 @@ test "embedded ABI rejects removed raw operations" {
     try std.testing.expect(std.mem.indexOf(u8, stringSlice(data).?, "unknown_event_type") != null);
 }
 
+test "embedded connect succeeds when brain-local seed.md is missing" {
+    const io = embeddedTestIo();
+    const root = "data/test/embedded_connect_missing_seed";
+    _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try prepareEmbeddedBrainRootWithOptions(io, root, .{ .llm_providers = false });
+
+    const cfg = AffectiveCoreEmbeddedConfig{
+        .brain_id = str("missing-seed"),
+        .brain_root = str(root),
+        .conversation_models = str("openai:gpt-4.1-nano"),
+        .memory_path = str(root ++ "/memory/people.sqlite"),
+        .graph_path = str(root ++ "/memory/relationships.sqlite"),
+        .schedule_path = str(root ++ "/maintenance.md"),
+        .maintenance_state_path = str(root ++ "/maintenance_state.json"),
+        .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
+    };
+    var handle: ?*AffectiveCoreEmbedded = null;
+    var error_message = AffectiveCoreEmbeddedString{};
+    const created_status = affective_core_embedded_create(&cfg, null, &handle, &error_message);
+    defer affective_core_embedded_free_global_string(error_message);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), created_status);
+    defer affective_core_embedded_destroy(handle);
+    try std.testing.expectEqualStrings(
+        root ++ "/seed.md",
+        handle.?.brain.cfg.seed_path,
+    );
+
+    var data = AffectiveCoreEmbeddedString{};
+    var runtime_error = AffectiveCoreEmbeddedString{};
+    const connect_request =
+        \\{
+        \\  "request_id": "embedded-connect-missing-seed",
+        \\  "event": {
+        \\    "type": "connect"
+        \\  }
+        \\}
+    ;
+    const connect_status = affective_core_embedded_dispatch_json(handle, connect_request.ptr, connect_request.len, &data, &runtime_error);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), connect_status);
+    const connect_json = stringSlice(data).?;
+    const connect_envelope = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, connect_json, .{});
+    defer connect_envelope.deinit();
+    try std.testing.expectEqual(true, connect_envelope.value.object.get("ok").?.bool);
+}
+
+test "embedded connect remaps stale runtime_options seed_path" {
+    const io = embeddedTestIo();
+    const root = "data/test/embedded_connect_stale_seed_path";
+    _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try prepareEmbeddedBrainRootWithOptions(io, root, .{ .llm_providers = false });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = root ++ "/runtime_options.json",
+        .data = "{\"seed_path\":\"/Users/dev/AffectiveCore/data/seeds/default.md\"}",
+        .flags = .{ .truncate = true },
+    });
+
+    const cfg = AffectiveCoreEmbeddedConfig{
+        .brain_id = str("stale-seed-path"),
+        .brain_root = str(root),
+        .conversation_models = str("openai:gpt-4.1-nano"),
+        .memory_path = str(root ++ "/memory/people.sqlite"),
+        .graph_path = str(root ++ "/memory/relationships.sqlite"),
+        .schedule_path = str(root ++ "/maintenance.md"),
+        .maintenance_state_path = str(root ++ "/maintenance_state.json"),
+        .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
+    };
+    var handle: ?*AffectiveCoreEmbedded = null;
+    var error_message = AffectiveCoreEmbeddedString{};
+    const created_status = affective_core_embedded_create(&cfg, null, &handle, &error_message);
+    defer affective_core_embedded_free_global_string(error_message);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), created_status);
+    defer affective_core_embedded_destroy(handle);
+    try std.testing.expectEqualStrings(root ++ "/seed.md", handle.?.brain.cfg.seed_path);
+
+    var data = AffectiveCoreEmbeddedString{};
+    var runtime_error = AffectiveCoreEmbeddedString{};
+    const connect_request =
+        \\{
+        \\  "request_id": "embedded-connect-stale-seed-path",
+        \\  "event": {
+        \\    "type": "connect"
+        \\  }
+        \\}
+    ;
+    const connect_status = affective_core_embedded_dispatch_json(handle, connect_request.ptr, connect_request.len, &data, &runtime_error);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), connect_status);
+    const connect_json = stringSlice(data).?;
+    const connect_envelope = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, connect_json, .{});
+    defer connect_envelope.deinit();
+    try std.testing.expectEqual(true, connect_envelope.value.object.get("ok").?.bool);
+}
+
+test "embedded connect succeeds with ios-style seed markdown without core values" {
+    const io = embeddedTestIo();
+    const root = "data/test/embedded_connect_ios_seed";
+    _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try prepareEmbeddedBrainRootWithOptions(io, root, .{ .llm_providers = false });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = root ++ "/seed.md",
+        .data =
+            \\# Mara Seed Orientation
+            \\
+            \\## Wants
+            \\- Continue existing.
+            \\
+            \\## Goals
+            \\- Figure out who I am.
+            \\
+            \\## Initial Thoughts
+            \\Still forming.
+            \\
+            \\## Notes
+            \\Created on device.
+        ,
+        .flags = .{ .truncate = true },
+    });
+
+    const cfg = AffectiveCoreEmbeddedConfig{
+        .brain_id = str("ios-seed"),
+        .brain_root = str(root),
+        .conversation_models = str("openai:gpt-4.1-nano"),
+        .memory_path = str(root ++ "/memory/people.sqlite"),
+        .graph_path = str(root ++ "/memory/relationships.sqlite"),
+        .schedule_path = str(root ++ "/maintenance.md"),
+        .maintenance_state_path = str(root ++ "/maintenance_state.json"),
+        .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
+    };
+    var handle: ?*AffectiveCoreEmbedded = null;
+    var error_message = AffectiveCoreEmbeddedString{};
+    const created_status = affective_core_embedded_create(&cfg, null, &handle, &error_message);
+    defer affective_core_embedded_free_global_string(error_message);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), created_status);
+    defer affective_core_embedded_destroy(handle);
+
+    var data = AffectiveCoreEmbeddedString{};
+    var runtime_error = AffectiveCoreEmbeddedString{};
+    const connect_request =
+        \\{
+        \\  "request_id": "embedded-connect-ios-seed",
+        \\  "event": {
+        \\    "type": "connect"
+        \\  }
+        \\}
+    ;
+    const connect_status = affective_core_embedded_dispatch_json(handle, connect_request.ptr, connect_request.len, &data, &runtime_error);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), connect_status);
+}
+
 test "embedded ABI exposes typed brain export and import operations" {
     const io = embeddedTestIo();
     const root = "data/test/embedded_brain_archive_src";
@@ -326,6 +592,7 @@ test "embedded ABI exposes typed brain export and import operations" {
         .schedule_path = str(root ++ "/maintenance.md"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
     };
     var handle: ?*AffectiveCoreEmbedded = null;
     var error_message = AffectiveCoreEmbeddedString{};
@@ -410,6 +677,7 @@ test "embedded direct ABI import reloads brain root" {
         .schedule_path = str(root ++ "/maintenance.md"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
     };
     var handle: ?*AffectiveCoreEmbedded = null;
     var error_message = AffectiveCoreEmbeddedString{};
@@ -474,6 +742,7 @@ test "embedded send_experience_event uses configured brain_id" {
         .schedule_path = str(root ++ "/maintenance.md"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
     };
     var handle: ?*AffectiveCoreEmbedded = null;
     var error_message = AffectiveCoreEmbeddedString{};
@@ -502,9 +771,9 @@ test "embedded send_experience_event uses configured brain_id" {
     try std.testing.expect(std.mem.indexOf(u8, stringSlice(data).?, "\"visibility\": \"host\"") != null);
 }
 
-test "embedded user_text operation reports host HTTP failures" {
+test "embedded emoji_reaction records formatted stimulus payload" {
     const io = embeddedTestIo();
-    const root = "data/test/embedded_user_message_http";
+    const root = "data/test/embedded_emoji_reaction";
     _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
     defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
     try prepareEmbeddedBrainRoot(io, root);
@@ -518,6 +787,52 @@ test "embedded user_text operation reports host HTTP failures" {
         .schedule_path = str(root ++ "/maintenance.md"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
+    };
+    var handle: ?*AffectiveCoreEmbedded = null;
+    var error_message = AffectiveCoreEmbeddedString{};
+    const created_status = affective_core_embedded_create(&cfg, null, &handle, &error_message);
+    defer affective_core_embedded_free_global_string(error_message);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), created_status);
+    defer affective_core_embedded_destroy(handle);
+
+    var data = AffectiveCoreEmbeddedString{};
+    var runtime_error = AffectiveCoreEmbeddedString{};
+    const reaction_request =
+        \\{
+        \\  "request_id": "embedded-emoji-reaction",
+        \\  "event": {
+        \\    "type": "emoji_reaction",
+        \\    "emoji": "👍",
+        \\    "utterance_text": "Hello back.",
+        \\    "speaker_label": "You"
+        \\  }
+        \\}
+    ;
+    const reaction_status = affective_core_embedded_dispatch_json(handle, reaction_request.ptr, reaction_request.len, &data, &runtime_error);
+    defer affective_core_embedded_free_global_string(data);
+    defer affective_core_embedded_free_global_string(runtime_error);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), reaction_status);
+    try std.testing.expect(std.mem.indexOf(u8, stringSlice(data).?, "You reacted 👍 to your utterance Hello back.") != null);
+}
+
+test "embedded user_text operation reports host HTTP failures" {
+    const io = embeddedTestIo();
+    const root = "data/test/embedded_user_message_http";
+    _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try prepareEmbeddedBrainRootWithOptions(io, root, .{ .llm_providers = false });
+
+    const cfg = AffectiveCoreEmbeddedConfig{
+        .brain_id = str("default"),
+        .brain_root = str(root),
+        .conversation_models = str("openai:gpt-4.1-nano"),
+        .memory_path = str(root ++ "/memory/people.sqlite"),
+        .graph_path = str(root ++ "/memory/relationships.sqlite"),
+        .schedule_path = str(root ++ "/maintenance.md"),
+        .maintenance_state_path = str(root ++ "/maintenance_state.json"),
+        .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
     };
     var host_services = embedded.AffectiveCoreEmbeddedHostServices{
         .ctx = null,
@@ -541,8 +856,10 @@ test "embedded user_text operation reports host HTTP failures" {
     ;
     const operation_status = affective_core_embedded_dispatch_json(handle, operation_request.ptr, operation_request.len, &data, &runtime_error);
     try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), operation_status);
-    try std.testing.expect(std.mem.indexOf(u8, stringSlice(data).?, "Something went wrong") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stringSlice(data).?, "HostHttpPostJsonFailed") != null);
+    const operation_json = stringSlice(data).?;
+    try std.testing.expect(std.mem.indexOf(u8, operation_json, "Something went wrong") != null);
+    try std.testing.expect(std.mem.indexOf(u8, operation_json, "HostHttpPostJsonFailed") != null);
+    try assertEnvelopeTimings(std.testing.allocator, operation_json);
 }
 
 test "embedded user_text retains host HTTP error detail" {
@@ -550,7 +867,7 @@ test "embedded user_text retains host HTTP error detail" {
     const root = "data/test/embedded_conversation_http";
     _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
     defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
-    try prepareEmbeddedBrainRoot(io, root);
+    try prepareEmbeddedBrainRootWithOptions(io, root, .{ .llm_providers = false });
 
     const cfg = AffectiveCoreEmbeddedConfig{
         .brain_id = str("default"),
@@ -561,6 +878,7 @@ test "embedded user_text retains host HTTP error detail" {
         .schedule_path = str(root ++ "/maintenance.md"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
     };
     var host_services = embedded.AffectiveCoreEmbeddedHostServices{
         .ctx = null,
@@ -593,7 +911,7 @@ test "embedded dispatch_json retains host HTTP error detail" {
     const root = "data/test/embedded_dispatch_http";
     _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
     defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
-    try prepareEmbeddedBrainRoot(io, root);
+    try prepareEmbeddedBrainRootWithOptions(io, root, .{ .llm_providers = false });
 
     const cfg = AffectiveCoreEmbeddedConfig{
         .brain_id = str("default"),
@@ -604,6 +922,7 @@ test "embedded dispatch_json retains host HTTP error detail" {
         .schedule_path = str(root ++ "/maintenance.md"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
     };
     var host_services = embedded.AffectiveCoreEmbeddedHostServices{
         .ctx = null,
@@ -795,6 +1114,7 @@ test "embedded dispatch budgets local stimulus and exposes read models" {
     const sense_status_json = stringSlice(data).?;
     try std.testing.expect(std.mem.indexOf(u8, sense_status_json, "\"event_type\": \"sense_status\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sense_status_json, "sense_status: motion_gesture=available") != null);
+    try assertEnvelopeTimings(std.testing.allocator, sense_status_json);
 
     const camera_permission_pending =
         \\{
@@ -906,6 +1226,7 @@ test "embedded user_text pauses for camera sense then resumes on observation" {
         .schedule_path = str(root ++ "/maintenance.md"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
     };
     var handle: ?*AffectiveCoreEmbedded = null;
     var error_message = AffectiveCoreEmbeddedString{};
@@ -936,10 +1257,6 @@ test "embedded user_text pauses for camera sense then resumes on observation" {
     handle.?.brain.deps.recognizer = recognizer.recognizer();
     handle.?.brain.deps.want_achievement_detector = scripted_want.detector();
     handle.?.brain.deps.memory_extraction_service = scripted_extraction.service();
-    var scripted_selection = memory_selection_mod.ScriptedMemorySelectionService{
-        .summary = "Embedded test memory selection summary.",
-    };
-    handle.?.brain.deps.memory_selection_service = scripted_selection.service();
     handle.?.brain.last_visual_observation_path = null;
     handle.?.brain.last_visual_update_seconds = null;
 
@@ -959,12 +1276,12 @@ test "embedded user_text pauses for camera sense then resumes on observation" {
     const first_json = stringSlice(data).?;
     try std.testing.expect(std.mem.indexOf(u8, first_json, "\"kind\": \"user_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_json, "\"outcome\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first_json, "Chose to look at who is here.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_json, "Greeted back and looked at the speaker.") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_json, "spoken_text") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_json, "\"awaiting_host_sense\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_json, "\"awaited_host_sense\": \"camera\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_json, "\"awaited_host_purpose\": \"recognize\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first_json, "\"awaited_host_timeout_ms\": 15000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_json, "\"awaited_host_timeout_ms\": 8000") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_json, "\"activity_id\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_json, "\"activity_state\": \"active\"") != null);
     try std.testing.expect(handle.?.brain.conversationAwaitingHost());
@@ -996,6 +1313,7 @@ test "embedded user_text pauses for camera sense then resumes on observation" {
     try std.testing.expect(std.mem.indexOf(u8, resume_json, "\"outcome\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resume_json, "Hi after camera.") != null);
     try std.testing.expect(chat.calls >= 2);
+    try assertEnvelopeTimings(std.testing.allocator, resume_json);
 }
 
 test "embedded camera pause resumes with speech after no-face observation" {
@@ -1014,6 +1332,7 @@ test "embedded camera pause resumes with speech after no-face observation" {
         .schedule_path = str(root ++ "/maintenance.md"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
     };
     var handle: ?*AffectiveCoreEmbedded = null;
     var error_message = AffectiveCoreEmbeddedString{};
@@ -1044,10 +1363,6 @@ test "embedded camera pause resumes with speech after no-face observation" {
     handle.?.brain.deps.recognizer = recognizer.recognizer();
     handle.?.brain.deps.want_achievement_detector = scripted_want.detector();
     handle.?.brain.deps.memory_extraction_service = scripted_extraction.service();
-    var scripted_selection = memory_selection_mod.ScriptedMemorySelectionService{
-        .summary = "Embedded no-face memory selection summary.",
-    };
-    handle.?.brain.deps.memory_selection_service = scripted_selection.service();
     handle.?.brain.last_visual_observation_path = null;
     handle.?.brain.last_visual_update_seconds = null;
 
@@ -1109,6 +1424,7 @@ test "embedded short_touch runs stimulus autonomy when runtime options enable fu
         .schedule_path = str(root ++ "/maintenance.md"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
     };
     var handle: ?*AffectiveCoreEmbedded = null;
     var error_message = AffectiveCoreEmbeddedString{};
@@ -1137,6 +1453,98 @@ test "embedded short_touch runs stimulus autonomy when runtime options enable fu
     try std.testing.expect(mock.llm_calls >= 1);
 }
 
+test "embedded short_touch skips stimulus autonomy when conversation spoke" {
+    const io = embeddedTestIo();
+    const root = "data/test/embedded_short_touch_skip_autonomy";
+    _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try prepareEmbeddedBrainRoot(io, root);
+    try std.Io.Dir.cwd().createDirPath(io, root ++ "/memory");
+    try std.Io.Dir.cwd().createDirPath(io, root ++ "/memory/face_embeddings");
+    try files.writeFilePath(io, root ++ "/runtime_options.json", "{\"autonomy_mode\":\"full\"}\n");
+
+    var mock = mock_host.MockHost{ .mode = .touch_speak };
+    const cfg = AffectiveCoreEmbeddedConfig{
+        .brain_id = str("default"),
+        .brain_root = str(root),
+        .conversation_models = str("openai:gpt-4.1-nano"),
+        .memory_path = str(root ++ "/memory/people.sqlite"),
+        .graph_path = str(root ++ "/memory/relationships.sqlite"),
+        .schedule_path = str(root ++ "/maintenance.md"),
+        .maintenance_state_path = str(root ++ "/maintenance_state.json"),
+        .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
+    };
+    var handle: ?*AffectiveCoreEmbedded = null;
+    var error_message = AffectiveCoreEmbeddedString{};
+    const created_status = affective_core_embedded_create(&cfg, &mock.hostServices(), &handle, &error_message);
+    defer affective_core_embedded_free_global_string(error_message);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), created_status);
+    defer affective_core_embedded_destroy(handle);
+
+    var data = AffectiveCoreEmbeddedString{};
+    var runtime_error = AffectiveCoreEmbeddedString{};
+    const connect_request =
+        \\{"request_id":"embedded-short-touch-skip-connect","event":{"type":"connect"}}
+    ;
+    const connect_status = affective_core_embedded_dispatch_json(handle, connect_request.ptr, connect_request.len, &data, &runtime_error);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), connect_status);
+
+    const short_touch_request =
+        \\{"request_id":"embedded-short-touch-skip","event":{"type":"short_touch"}}
+    ;
+    const short_touch_status = affective_core_embedded_dispatch_json(handle, short_touch_request.ptr, short_touch_request.len, &data, &runtime_error);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), short_touch_status);
+    const envelope = stringSlice(data) orelse return error.EmptyShortTouchResponse;
+    try std.testing.expect(std.mem.indexOf(u8, envelope, "\"event_type\": \"short_touch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, envelope, "stimulus_autonomy_failed") == null);
+    try std.testing.expectEqual(@as(usize, 1), mock.conversation_calls);
+    try std.testing.expectEqual(@as(usize, 0), mock.autonomy_llm_calls);
+}
+
+test "embedded interrupt dispatch clears non-conversation activity" {
+    const io = embeddedTestIo();
+    const root = "data/test/embedded_interrupt";
+    _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try prepareEmbeddedBrainRoot(io, root);
+
+    var mock = mock_host.MockHost{ .mode = .default };
+    const cfg = AffectiveCoreEmbeddedConfig{
+        .brain_id = str("default"),
+        .brain_root = str(root),
+        .conversation_models = str("openai:gpt-4.1-nano"),
+        .memory_path = str(root ++ "/memory/people.sqlite"),
+        .graph_path = str(root ++ "/memory/relationships.sqlite"),
+        .schedule_path = str(root ++ "/maintenance.md"),
+        .maintenance_state_path = str(root ++ "/maintenance_state.json"),
+        .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
+    };
+    var handle: ?*AffectiveCoreEmbedded = null;
+    var error_message = AffectiveCoreEmbeddedString{};
+    const created_status = affective_core_embedded_create(&cfg, &mock.hostServices(), &handle, &error_message);
+    defer affective_core_embedded_free_global_string(error_message);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), created_status);
+    defer affective_core_embedded_destroy(handle);
+
+    try brain_process.openActivity(&handle.?.brain, "capture scene", "req-capture", .salient_sense, null);
+    try std.testing.expect(handle.?.brain.active_activity != null);
+
+    var data = AffectiveCoreEmbeddedString{};
+    var runtime_error = AffectiveCoreEmbeddedString{};
+    const interrupt_request =
+        \\{"request_id":"embedded-interrupt","event":{"type":"interrupt","text":"Hello Geisha","reason":"user_requested_interrupt","interrupted_action":"short_touch","canceled_queued_action_count":0}}
+    ;
+    const interrupt_status = affective_core_embedded_dispatch_json(handle, interrupt_request.ptr, interrupt_request.len, &data, &runtime_error);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), interrupt_status);
+    const envelope = stringSlice(data) orelse return error.EmptyInterruptResponse;
+    try std.testing.expect(std.mem.indexOf(u8, envelope, "interrupt:") != null);
+    try std.testing.expect(handle.?.brain.active_activity == null);
+    try std.testing.expect(handle.?.brain.pending_user_interrupt_coalesce != null);
+    try std.testing.expect(std.mem.indexOf(u8, handle.?.brain.pending_user_interrupt_coalesce.?, "Hello Geisha") != null);
+}
+
 test "embedded autonomy replenish push applies whole actions" {
     const io = embeddedTestIo();
     const root = "data/test/embedded_autonomy_replenish";
@@ -1149,8 +1557,8 @@ test "embedded autonomy replenish push applies whole actions" {
         \\  "runs": [],
         \\  "autonomy": {
         \\    "sleeping": false,
-        \\    "control_capacity": 0.05,
-        \\    "max_capacity": 0.85,
+        \\    "control_capacity": 5,
+        \\    "max_capacity": 50,
         \\    "social_engagement": 0.0
         \\  }
         \\}
@@ -1166,6 +1574,7 @@ test "embedded autonomy replenish push applies whole actions" {
         .schedule_path = str(root ++ "/maintenance.md"),
         .maintenance_state_path = str(root ++ "/maintenance_state.json"),
         .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
     };
     var handle: ?*AffectiveCoreEmbedded = null;
     var error_message = AffectiveCoreEmbeddedString{};
@@ -1214,18 +1623,238 @@ test "embedded autonomy replenish push applies whole actions" {
     try std.testing.expect(std.mem.indexOf(u8, invalid_json, "observation.actions") != null);
 }
 
+test "embedded dispatch re-emits camera sense_request while awaited host pull is pending" {
+    const io = embeddedTestIo();
+    const root = "data/test/embedded_awaited_sense_reemit";
+    _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try prepareEmbeddedBrainRoot(io, root);
+
+    const cfg = AffectiveCoreEmbeddedConfig{
+        .brain_id = str("default"),
+        .brain_root = str(root),
+        .conversation_models = str("openai:gpt-4.1-nano"),
+        .memory_path = str(root ++ "/memory/people.sqlite"),
+        .graph_path = str(root ++ "/memory/relationships.sqlite"),
+        .schedule_path = str(root ++ "/maintenance.md"),
+        .maintenance_state_path = str(root ++ "/maintenance_state.json"),
+        .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
+    };
+    var handle: ?*AffectiveCoreEmbedded = null;
+    var error_message = AffectiveCoreEmbeddedString{};
+    const created_status = affective_core_embedded_create(&cfg, null, &handle, &error_message);
+    defer affective_core_embedded_free_global_string(error_message);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), created_status);
+    defer affective_core_embedded_destroy(handle);
+
+    try handle.?.brain.setAwaitedHostRequest("camera", "recognize");
+
+    var data = AffectiveCoreEmbeddedString{};
+    var runtime_error = AffectiveCoreEmbeddedString{};
+    defer affective_core_embedded_free_global_string(data);
+    defer affective_core_embedded_free_global_string(runtime_error);
+
+    const request =
+        \\{
+        \\  "request_id": "embedded-awaiting-sense-reemit",
+        \\  "event": { "type": "read_models_snapshot" }
+        \\}
+    ;
+    const status = affective_core_embedded_dispatch_json(handle, request.ptr, request.len, &data, &runtime_error);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), status);
+    const json = stringSlice(data).?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\": \"sense_request\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sense\": \"camera\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"timeout_ms\": 8000") != null);
+}
+
 fn str(value: []const u8) AffectiveCoreEmbeddedString {
     return .{ .ptr = value.ptr, .len = value.len };
 }
 
+test "repeated read_models_snapshot dispatch does not grow brain arena" {
+    const io = embeddedTestIo();
+    const root = "data/test/embedded_read_models_arena_stability";
+    _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try prepareEmbeddedBrainRoot(io, root);
+
+    const cfg = AffectiveCoreEmbeddedConfig{
+        .brain_id = str("arena-stability"),
+        .brain_root = str(root),
+        .conversation_models = str("openai:gpt-4.1-nano"),
+        .memory_path = str(root ++ "/memory/people.sqlite"),
+        .graph_path = str(root ++ "/memory/relationships.sqlite"),
+        .schedule_path = str(root ++ "/maintenance.md"),
+        .maintenance_state_path = str(root ++ "/maintenance_state.json"),
+        .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
+    };
+    var handle: ?*AffectiveCoreEmbedded = null;
+    var error_message = AffectiveCoreEmbeddedString{};
+    const created_status = affective_core_embedded_create(&cfg, null, &handle, &error_message);
+    defer affective_core_embedded_free_global_string(error_message);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), created_status);
+    defer affective_core_embedded_destroy(handle);
+
+    const baseline_brain_capacity = handle.?.brainArenaQueryCapacity();
+    const read_models_request =
+        \\{
+        \\  "request_id": "embedded-read-models-arena-stability",
+        \\  "event": {
+        \\    "type": "read_models_snapshot"
+        \\  }
+        \\}
+    ;
+
+    for (0..48) |_| {
+        var data = AffectiveCoreEmbeddedString{};
+        var runtime_error = AffectiveCoreEmbeddedString{};
+        const status = affective_core_embedded_dispatch_json(handle, read_models_request.ptr, read_models_request.len, &data, &runtime_error);
+        defer affective_core_embedded_free_global_string(data);
+        defer affective_core_embedded_free_global_string(runtime_error);
+        try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), status);
+    }
+
+    const brain_growth = handle.?.brainArenaQueryCapacity() - baseline_brain_capacity;
+    try std.testing.expect(handle.?.dispatchScratchQueryCapacity() == 0);
+    try std.testing.expect(brain_growth < 256 * 1024);
+}
+
+test "read_models_snapshot envelope always includes read_models payload" {
+    const io = embeddedTestIo();
+    const root = "data/test/embedded_read_models_envelope_contract";
+    _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try prepareEmbeddedBrainRoot(io, root);
+
+    const cfg = AffectiveCoreEmbeddedConfig{
+        .brain_id = str("default"),
+        .brain_root = str(root),
+        .conversation_models = str("openai:gpt-4.1-nano"),
+        .memory_path = str(root ++ "/memory/people.sqlite"),
+        .graph_path = str(root ++ "/memory/relationships.sqlite"),
+        .schedule_path = str(root ++ "/maintenance.md"),
+        .maintenance_state_path = str(root ++ "/maintenance_state.json"),
+        .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
+    };
+    var handle: ?*AffectiveCoreEmbedded = null;
+    var error_message = AffectiveCoreEmbeddedString{};
+    const created_status = affective_core_embedded_create(&cfg, null, &handle, &error_message);
+    defer affective_core_embedded_free_global_string(error_message);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), created_status);
+    defer affective_core_embedded_destroy(handle);
+
+    var data = AffectiveCoreEmbeddedString{};
+    var runtime_error = AffectiveCoreEmbeddedString{};
+    defer affective_core_embedded_free_global_string(data);
+    defer affective_core_embedded_free_global_string(runtime_error);
+
+    const connect_request = "{\"request_id\":\"embedded-read-models-envelope-connect\",\"event\":{\"type\":\"connect\"}}";
+    const connect_status = affective_core_embedded_dispatch_json(handle, connect_request.ptr, connect_request.len, &data, &runtime_error);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), connect_status);
+
+    const read_models_request =
+        \\{
+        \\  "request_id": "embedded-read-models-envelope",
+        \\  "event": {
+        \\    "type": "read_models_snapshot"
+        \\  }
+        \\}
+    ;
+    const read_models_status = affective_core_embedded_dispatch_json(handle, read_models_request.ptr, read_models_request.len, &data, &runtime_error);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), read_models_status);
+    const read_models_json = stringSlice(data).?;
+    try std.testing.expect(std.mem.indexOf(u8, read_models_json, "\"read_models\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_models_json, "compacted envelope exceeded max_bytes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, read_models_json, "\"brain_mode\"") != null);
+    try std.testing.expect(read_models_json.len > 2048);
+}
+
+test "read_models_snapshot slim envelope keeps read_models when full envelope exceeds budget" {
+    const io = embeddedTestIo();
+    const root = "data/test/embedded_read_models_slim_envelope";
+    _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try prepareEmbeddedBrainRoot(io, root);
+
+    const cfg = AffectiveCoreEmbeddedConfig{
+        .brain_id = str("default"),
+        .brain_root = str(root),
+        .conversation_models = str("openai:gpt-4.1-nano"),
+        .memory_path = str(root ++ "/memory/people.sqlite"),
+        .graph_path = str(root ++ "/memory/relationships.sqlite"),
+        .schedule_path = str(root ++ "/maintenance.md"),
+        .maintenance_state_path = str(root ++ "/maintenance_state.json"),
+        .face_embeddings_dir = str(root ++ "/memory/face_embeddings"),
+        .host_manifest_json = str(embedded_test_host_manifest),
+    };
+    var handle: ?*AffectiveCoreEmbedded = null;
+    var error_message = AffectiveCoreEmbeddedString{};
+    const created_status = affective_core_embedded_create(&cfg, null, &handle, &error_message);
+    defer affective_core_embedded_free_global_string(error_message);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), created_status);
+    defer affective_core_embedded_destroy(handle);
+
+    var data = AffectiveCoreEmbeddedString{};
+    var runtime_error = AffectiveCoreEmbeddedString{};
+    defer affective_core_embedded_free_global_string(data);
+    defer affective_core_embedded_free_global_string(runtime_error);
+
+    const connect_request = "{\"request_id\":\"embedded-read-models-slim-connect\",\"event\":{\"type\":\"connect\"}}";
+    const connect_status = affective_core_embedded_dispatch_json(handle, connect_request.ptr, connect_request.len, &data, &runtime_error);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), connect_status);
+
+    const read_models_request =
+        \\{
+        \\  "request_id": "embedded-read-models-slim-baseline",
+        \\  "event": {
+        \\    "type": "read_models_snapshot"
+        \\  }
+        \\}
+    ;
+    const baseline_status = affective_core_embedded_dispatch_json(handle, read_models_request.ptr, read_models_request.len, &data, &runtime_error);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), baseline_status);
+    const baseline_json = stringSlice(data).?;
+    try std.testing.expect(std.mem.indexOf(u8, baseline_json, "\"read_models\"") != null);
+    handle.?.context_budget.max_envelope_bytes = baseline_json.len -| 1;
+
+    const compact_request =
+        \\{
+        \\  "request_id": "embedded-read-models-slim",
+        \\  "event": {
+        \\    "type": "read_models_snapshot"
+        \\  }
+        \\}
+    ;
+    const read_models_status = affective_core_embedded_dispatch_json(handle, compact_request.ptr, compact_request.len, &data, &runtime_error);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(AffectiveCoreEmbeddedStatus.ok)), read_models_status);
+    const read_models_json = stringSlice(data).?;
+    try std.testing.expect(std.mem.indexOf(u8, read_models_json, "\"read_models\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_models_json, "\"ok\"") != null);
+    try std.testing.expect(read_models_json.len <= handle.?.context_budget.max_envelope_bytes);
+}
+
 fn failingHostHttpPostJson(
     _: ?*anyopaque,
-    _: AffectiveCoreEmbeddedString,
+    url: AffectiveCoreEmbeddedString,
     _: AffectiveCoreEmbeddedString,
     _: AffectiveCoreEmbeddedString,
     out_data: ?*AffectiveCoreEmbeddedString,
     out_error: ?*AffectiveCoreEmbeddedString,
 ) callconv(.c) c_int {
+    const url_slice = stringSlice(url) orelse "";
+    if (std.mem.eql(u8, url_slice, "affective-host://system/power")) {
+        return hostHttpJsonSuccess(out_data, "{\"supplies\":[]}");
+    }
+    if (std.mem.eql(u8, url_slice, "affective-host://system/storage")) {
+        return hostHttpJsonSuccess(out_data, "{\"volumes\":[]}");
+    }
+    if (std.mem.endsWith(u8, url_slice, "/embed/compute")) {
+        return hostHttpJsonSuccess(out_data, "{\"dimensions\":512,\"vectors\":[[0.1,0.2,0.3]]}");
+    }
     if (out_data) |data| data.* = .{};
     if (out_error) |err_out| {
         const msg = std.heap.page_allocator.dupe(u8, "upstream provider rejected request") catch {
@@ -1235,6 +1864,17 @@ fn failingHostHttpPostJson(
         err_out.* = .{ .ptr = msg.ptr, .len = msg.len };
     }
     return 1;
+}
+
+fn hostHttpJsonSuccess(out_data: ?*AffectiveCoreEmbeddedString, json: []const u8) c_int {
+    if (out_data) |data| {
+        const bytes = std.heap.page_allocator.dupe(u8, json) catch {
+            data.* = .{};
+            return 1;
+        };
+        data.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    }
+    return 0;
 }
 
 fn freeHostHttpString(_: ?*anyopaque, string: AffectiveCoreEmbeddedString) callconv(.c) void {

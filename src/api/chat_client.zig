@@ -7,6 +7,7 @@ const llm_routing = @import("../core/llm_routing.zig");
 const capability_registry = @import("../core/capability_registry.zig");
 const action_pressure_json_schema = @import("action_pressure_json_schema.zig");
 const brain_mod = @import("../core/brain.zig");
+const service_errors = @import("service_errors.zig");
 pub const skills = chat_port.skills;
 
 pub const ChatTurn = chat_port.ChatTurn;
@@ -87,30 +88,94 @@ pub const RandomProviderChatService = struct {
 
     fn respond(ctx: *anyopaque, allocator: std.mem.Allocator, memory: []const u8, user_text: []const u8, observations: []const u8) !ChatTurn {
         const self: *RandomProviderChatService = @ptrCast(@alignCast(ctx));
-        const prompt = try buildChatPrompt(allocator, memory, user_text, observations, max_chat_context_tokens);
-        const content = try self.provider_client.completeText(allocator, .{
-            .subsystem = "conversation",
-            .system_prompt = prompt.system_prompt,
-            .user_prompt = prompt.user_prompt,
-            .temperature = 0.4,
-            .response_format = .json_object,
-            .response_size = .medium,
-            .effort_tier = self.effort_tier,
-            .reasoning_effort = self.reasoning_effort,
-            .json_schema = chatJsonSchema(),
-        });
-        defer allocator.free(content);
-        var turn = parseChatTurn(allocator, content, user_text) catch |err| {
-            reportChatParseError("conversation", "host", "host_llm_complete", err, content);
-            if (self.parse_failure_brain) |brain| brain.rememberChatParseFailure(content) catch {};
-            return err;
-        };
-        turn = applyQualityPolicy(self.provider_client.llm_quality, turn);
-        if (turn.reasoning_effort) |effort| self.reasoning_effort = effort;
-        if (turn.effort_tier) |tier| self.effort_tier = tier;
-        return turn;
+        const stimulus_kind = if (self.parse_failure_brain) |brain| brain.conversation_turn_stimulus_kind else .heard_speech;
+        const prompt = try buildChatPrompt(allocator, memory, user_text, observations, max_chat_context_tokens, stimulus_kind);
+        const json_schema = if (self.parse_failure_brain) |brain|
+            try brain.conversationJsonSchema()
+        else
+            chatJsonSchema();
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const content = try self.provider_client.completeText(allocator, .{
+                .subsystem = "conversation",
+                .system_prompt = prompt.system_prompt,
+                .user_prompt = prompt.user_prompt,
+                .temperature = 0.4,
+                .response_format = .json_object,
+                .response_size = .medium,
+                .effort_tier = self.effort_tier,
+                .reasoning_effort = self.reasoning_effort,
+                .json_schema = json_schema,
+            });
+            defer self.provider_client.freeHttpResponse(allocator, content);
+            const turn_result = parseChatTurn(allocator, content, user_text) catch |err| {
+                reportChatParseError("conversation", "host", "host_llm_complete", err, content);
+                if (service_errors.shouldRetryChatParse(err, attempt)) {
+                    service_errors.logChatParseRetry("conversation", "host", "host_llm_complete", attempt);
+                    continue;
+                }
+                if (self.parse_failure_brain) |brain| brain.rememberChatParseFailure(content) catch {};
+                return err;
+            };
+            validateChatDeliveryContext(stimulus_kind, observations, turn_result.action_pressures.len) catch |err| {
+                reportChatParseError("conversation", "host", "host_llm_complete", err, content);
+                chat_port.freeActionProposals(allocator, turn_result.action_pressures);
+                allocator.free(turn_result.user_summary);
+                allocator.free(turn_result.brain_summary);
+                if (service_errors.shouldRetryChatParse(err, attempt)) {
+                    service_errors.logChatParseRetry("conversation", "host", "host_llm_complete", attempt);
+                    continue;
+                }
+                return err;
+            };
+            const turn = applyQualityPolicy(self.provider_client.llm_quality, turn_result);
+            if (turn.reasoning_effort) |effort| self.reasoning_effort = effort;
+            if (turn.effort_tier) |tier| self.effort_tier = tier;
+            return turn;
+        }
     }
 };
+
+const forbidden_chat_action_names = [_][]const u8{
+    "host_sense_pull_requested",
+    "host_sense_delivered",
+    "deferred_coherence",
+    "present_moment",
+    "subsystem_pressure_selected",
+    "host_capability_summary",
+    "host_capability_activations",
+    "conversation_cotext",
+    "active_process",
+    "timer_fired",
+    "waiting_for",
+};
+
+fn isForbiddenChatActionName(name: []const u8) bool {
+    for (forbidden_chat_action_names) |forbidden| {
+        if (std.mem.eql(u8, name, forbidden)) return true;
+    }
+    return false;
+}
+
+pub fn validateChatDeliveryContext(
+    stimulus_kind: chat_port.StimulusKind,
+    observations: []const u8,
+    action_count: usize,
+) !void {
+    if (stimulus_kind != .host_sense_delivery) return;
+    if (std.mem.indexOf(u8, observations, "delivery_materiality: low") == null) return;
+    if (action_count > 0) return error.InvalidChatAction;
+}
+
+fn validateActionPressureWire(pressure: ActionPressureWire) !void {
+    if (isForbiddenChatActionName(pressure.action)) return error.InvalidChatAction;
+    if (capability_registry.actionForCapabilityId(pressure.action)) |known| {
+        if (known == .recognize and pressure.text != null) {
+            const text = std.mem.trim(u8, pressure.text.?, " \r\n\t");
+            if (text.len > 0) return error.InvalidChatAction;
+        }
+    }
+}
 
 pub fn applyQualityPolicy(quality: ai.LlmQuality, turn: ChatTurn) ChatTurn {
     var out = turn;
@@ -143,9 +208,9 @@ pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.S
         \\- host_sense: orientation=upright
         \\- host_sense: ambient_light=moderate
     ;
-    const prompt = try buildChatPrompt(allocator, memory, "Hello, how are you today?", observations, max_chat_context_tokens);
+    const prompt = try buildChatPrompt(allocator, memory, "Hello, how are you today?", observations, max_chat_context_tokens, .heard_speech);
     defer allocator.free(prompt.user_prompt);
-    const scenario = try llm_tester_scenario.Scenario.init(
+    const greeting_scenario = try llm_tester_scenario.Scenario.init(
         allocator,
         "conversation_greeting",
         "Conversation turn with compact memory and observations",
@@ -158,8 +223,115 @@ pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.S
         512,
         0.2,
     );
-    const out = try allocator.alloc(llm_tester_scenario.Scenario, 1);
-    out[0] = scenario;
+
+    const host_sense_observations =
+        \\host_capability_summary:
+        \\- binding_changed: true
+        \\- digest: recognize:available;camera:available;request_orientation:available;
+        \\
+        \\host_capability_activations:
+        \\- host_id: mac-affective
+        \\- digest: recognize:12/14 ok avg=1800ms max=4200ms timeouts=1 last=completed;
+        \\- note: keyed by host; surprises vs this history shape expectations.
+    ;
+    const host_sense_prompt = try buildChatPrompt(
+        allocator,
+        memory,
+        "Do you recognize me?",
+        host_sense_observations,
+        max_chat_context_tokens,
+        .heard_speech,
+    );
+    defer allocator.free(host_sense_prompt.user_prompt);
+    const host_sense_scenario = try llm_tester_scenario.Scenario.init(
+        allocator,
+        "conversation_host_sense_pull",
+        "Recognition request with host capability activation history",
+        "Checks that the model returns valid action_pressures JSON for a recognition question when host capability activation history is available.",
+        "conversation",
+        host_sense_prompt.system_prompt,
+        host_sense_prompt.user_prompt,
+        .json_object,
+        chatJsonSchema(),
+        512,
+        0.2,
+    );
+
+    const greet_first_observations =
+        \\host_capability_summary:
+        \\- binding_changed: false
+        \\- digest: recognize:available;camera:available;
+        \\
+        \\host_capability_activations:
+        \\- host_id: mac-affective
+        \\- digest: recognize:12/14 ok avg=1800ms max=4200ms timeouts=1 last=completed;
+    ;
+    const greet_first_prompt = try buildChatPrompt(
+        allocator,
+        memory,
+        "Hello!",
+        greet_first_observations,
+        max_chat_context_tokens,
+        .heard_speech,
+    );
+    defer allocator.free(greet_first_prompt.user_prompt);
+    const greet_first_scenario = try llm_tester_scenario.Scenario.init(
+        allocator,
+        "conversation_greeting_camera_available",
+        "Greeting with camera recognize available",
+        "Checks valid action_pressures JSON for a greeting when camera recognize is available; say-first, recognize-first, combined steps, or silence are all acceptable.",
+        "conversation",
+        greet_first_prompt.system_prompt,
+        greet_first_prompt.user_prompt,
+        .json_object,
+        chatJsonSchema(),
+        512,
+        0.2,
+    );
+
+    const present_moment_observations =
+        \\present_moment:
+        \\  contact:
+        \\    last_user: "Hello Geisha" (6s ago)
+        \\    you_said: "Hello." (4s ago)
+        \\    contact_window: open
+        \\  in_flight:
+        \\    - recognize camera 12s for "Hello Geisha"
+        \\
+        \\deferred_coherence:
+        \\- bound_request: camera/recognize for "Hello Geisha"
+        \\- delivery_relevance: high
+        \\- delivery_materiality: low
+        \\- note: integrate into the contact thread; speech is optional unless identity changes what you'd say.
+    ;
+    const host_delivery_prompt = try buildChatPrompt(
+        allocator,
+        memory,
+        "Hello Geisha",
+        present_moment_observations,
+        max_chat_context_tokens,
+        .host_sense_delivery,
+    );
+    defer allocator.free(host_delivery_prompt.user_prompt);
+    const host_delivery_scenario = try llm_tester_scenario.Scenario.init(
+        allocator,
+        "conversation_host_sense_delivery_low_materiality",
+        "Host sense delivery after greeting with low materiality",
+        "Checks valid JSON when recognition completes a greeting contact without inventing a new topic.",
+        "conversation",
+        host_delivery_prompt.system_prompt,
+        host_delivery_prompt.user_prompt,
+        .json_object,
+        chatJsonSchema(),
+        512,
+        0.2,
+    );
+
+    const out = try allocator.alloc(llm_tester_scenario.Scenario, 4);
+    out[0] = greeting_scenario;
+    out[1] = host_sense_scenario;
+    out[2] = greet_first_scenario;
+    out[3] = host_delivery_scenario;
     return out;
 }
 
@@ -227,6 +399,7 @@ fn deriveBrainSummaryFromActionPressures(allocator: std.mem.Allocator, action_pr
 }
 
 fn chatTurnFromWire(allocator: std.mem.Allocator, wire: ChatWire, user_text: []const u8) !ChatTurn {
+    for (wire.action_pressures) |pressure| try validateActionPressureWire(pressure);
     var action_pressures = try allocator.alloc(ActionProposal, wire.action_pressures.len);
     for (wire.action_pressures, 0..) |pressure, i| {
         const resolved_action = capability_registry.actionForCapabilityId(pressure.action);

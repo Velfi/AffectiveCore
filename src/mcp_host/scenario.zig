@@ -3,7 +3,6 @@ const embedded = @import("../affective_core_embedded.zig");
 const support = @import("../core/brain_test_support.zig");
 const want_achievement_mod = @import("../core/port_want_achievement.zig");
 const memory_extraction_mod = @import("../core/port_memory_extraction.zig");
-const memory_selection_mod = @import("../core/port_memory_selection.zig");
 const recognition = @import("../api/recognition_client.zig");
 const mock_host = @import("mock_host.zig");
 
@@ -30,9 +29,6 @@ pub fn apply(handle: *embedded.AffectiveCoreEmbedded, allocator: std.mem.Allocat
         const extraction = try allocator.create(memory_extraction_mod.ScriptedMemoryExtractionService);
         extraction.* = .{ .candidates = &.{} };
         handle.brain.deps.memory_extraction_service = extraction.service();
-        const selection = try allocator.create(memory_selection_mod.ScriptedMemorySelectionService);
-        selection.* = .{ .summary = "Scenario test memory selection summary." };
-        handle.brain.deps.memory_selection_service = selection.service();
         return;
     }
     if (std.mem.eql(u8, scenario_name, "unknown_want_achievement")) {

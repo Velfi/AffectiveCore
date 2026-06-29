@@ -47,6 +47,8 @@ pub const LlmCompletionRecord = struct {
     request_bytes: usize,
     response_bytes: usize,
     outcome: LlmCompletionOutcome,
+    latency_ms: u64 = 0,
+    llm_call_id: ?[]const u8 = null,
 };
 
 const LastLlmCall = struct {
@@ -74,6 +76,7 @@ pub const State = struct {
     last_conversation_tokens: ?usize = null,
     last_conversation_at_seconds: ?i64 = null,
     last_llm_call: ?LastLlmCall = null,
+    last_dispatch: ?LastDispatchSnapshot = null,
 
     pub fn init(allocator: std.mem.Allocator) State {
         return .{
@@ -97,6 +100,12 @@ pub const State = struct {
             allocator.free(last.provider);
             allocator.free(last.model);
             if (last.effort_tier) |tier| allocator.free(tier);
+        }
+        if (self.last_dispatch) |last| {
+            allocator.free(last.dispatch_id);
+            allocator.free(last.operation);
+            for (last.sections) |section| allocator.free(section.section);
+            allocator.free(last.sections);
         }
     }
 };
@@ -131,6 +140,36 @@ const LastLlmCallFile = struct {
     at_seconds: i64,
 };
 
+const LastDispatchSectionFile = struct {
+    section: []const u8,
+    bytes: usize,
+    count: ?usize = null,
+};
+
+const LastDispatchFile = struct {
+    dispatch_id: []const u8,
+    at_seconds: i64,
+    operation: []const u8,
+    user_prompt_tokens: usize,
+    budget_exceeded: bool,
+    sections: []LastDispatchSectionFile = &.{},
+};
+
+pub const LastDispatchSection = struct {
+    section: []const u8,
+    bytes: usize,
+    count: ?usize = null,
+};
+
+pub const LastDispatchSnapshot = struct {
+    dispatch_id: []const u8,
+    at_seconds: i64,
+    operation: []const u8,
+    user_prompt_tokens: usize,
+    budget_exceeded: bool,
+    sections: []LastDispatchSection,
+};
+
 const StateFile = struct {
     updated_at_seconds: i64 = 0,
     total_composition_count: u64 = 0,
@@ -141,6 +180,7 @@ const StateFile = struct {
     total_llm_errors: u64 = 0,
     last_conversation: ?LastConversationFile = null,
     last_llm_call: ?LastLlmCallFile = null,
+    last_dispatch: ?LastDispatchFile = null,
     operations: []OperationEntryFile = &.{},
     sections: []SectionEntryFile = &.{},
     llm_subsystems: []LlmSubsystemEntryFile = &.{},
@@ -202,6 +242,25 @@ pub fn load(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, path: []co
         try state.llm_subsystems.put(try allocator.dupe(u8, entry.subsystem), entry.totals);
     }
 
+    if (parsed.value.last_dispatch) |last| {
+        var sections = try allocator.alloc(LastDispatchSection, last.sections.len);
+        for (last.sections, 0..) |section, index| {
+            sections[index] = .{
+                .section = try allocator.dupe(u8, section.section),
+                .bytes = section.bytes,
+                .count = section.count,
+            };
+        }
+        state.last_dispatch = .{
+            .dispatch_id = try allocator.dupe(u8, last.dispatch_id),
+            .at_seconds = last.at_seconds,
+            .operation = try allocator.dupe(u8, last.operation),
+            .user_prompt_tokens = last.user_prompt_tokens,
+            .budget_exceeded = last.budget_exceeded,
+            .sections = sections,
+        };
+    }
+
     return state;
 }
 
@@ -254,6 +313,28 @@ pub fn save(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, path: []co
         try sorted_llm_subsystems.append(allocator, .{ .subsystem = name, .totals = totals });
     }
 
+    var last_dispatch_section_files: ?[]LastDispatchSectionFile = null;
+    defer if (last_dispatch_section_files) |sections| allocator.free(sections);
+    const last_dispatch_file: ?LastDispatchFile = if (state.last_dispatch) |last| blk: {
+        var section_files = try allocator.alloc(LastDispatchSectionFile, last.sections.len);
+        last_dispatch_section_files = section_files;
+        for (last.sections, 0..) |section, index| {
+            section_files[index] = .{
+                .section = section.section,
+                .bytes = section.bytes,
+                .count = section.count,
+            };
+        }
+        break :blk .{
+            .dispatch_id = last.dispatch_id,
+            .at_seconds = last.at_seconds,
+            .operation = last.operation,
+            .user_prompt_tokens = last.user_prompt_tokens,
+            .budget_exceeded = last.budget_exceeded,
+            .sections = section_files,
+        };
+    } else null;
+
     const file: StateFile = .{
         .updated_at_seconds = state.updated_at_seconds,
         .total_composition_count = state.total_composition_count,
@@ -275,6 +356,7 @@ pub fn save(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, path: []co
             .response_bytes = last.response_bytes,
             .at_seconds = last.at_seconds,
         } else null,
+        .last_dispatch = last_dispatch_file,
         .operations = try sorted_operations.toOwnedSlice(allocator),
         .sections = try sorted_sections.toOwnedSlice(allocator),
         .llm_subsystems = try sorted_llm_subsystems.toOwnedSlice(allocator),
@@ -327,6 +409,57 @@ pub fn recordComposition(state: *State, report: context_composition.ContextCompo
     }
 }
 
+pub fn recordLastDispatch(
+    state: *State,
+    dispatch_id: []const u8,
+    report: context_composition.ContextCompositionReport,
+    budget_exceeded: bool,
+    now_seconds: i64,
+) !void {
+    if (!std.mem.eql(u8, report.operation, "conversation_chat")) return;
+
+    const allocator = state.operations.allocator;
+    if (state.last_dispatch) |previous| {
+        allocator.free(previous.dispatch_id);
+        allocator.free(previous.operation);
+        for (previous.sections) |section| allocator.free(section.section);
+        allocator.free(previous.sections);
+        state.last_dispatch = null;
+    }
+
+    const top_sections = try context_composition.ownedTopSections(allocator, report.sections, context_composition.top_section_limit);
+    errdefer {
+        for (top_sections) |section| allocator.free(section.name);
+        allocator.free(top_sections);
+    }
+    const stored = try allocator.alloc(LastDispatchSection, top_sections.len);
+    errdefer allocator.free(stored);
+    for (top_sections, 0..) |section, index| {
+        stored[index] = .{
+            .section = section.name,
+            .bytes = section.bytes,
+            .count = section.count,
+        };
+    }
+    allocator.free(top_sections);
+
+    const user_prompt_tokens = if (report.user_prompt_tokens > 0)
+        report.user_prompt_tokens
+    else
+        @import("context_tokens.zig").estimateTokensFromByteLength(report.user_prompt_bytes);
+
+    state.last_dispatch = .{
+        .dispatch_id = try allocator.dupe(u8, dispatch_id),
+        .at_seconds = now_seconds,
+        .operation = try allocator.dupe(u8, report.operation),
+        .user_prompt_tokens = user_prompt_tokens,
+        .budget_exceeded = budget_exceeded,
+        .sections = stored,
+    };
+    state.updated_at_seconds = now_seconds;
+    state.dirty_since_flush += 1;
+}
+
 pub fn recordBudgetExceeded(state: *State, now_seconds: i64) void {
     state.budget_exceeded_count += 1;
     state.updated_at_seconds = now_seconds;
@@ -361,6 +494,7 @@ pub fn recordLlmCompletion(state: *State, record: LlmCompletionRecord, now_secon
     }
     const response_bytes: u64 = @intCast(record.response_bytes);
     if (response_bytes > totals.max_response_bytes) totals.max_response_bytes = response_bytes;
+    totals.total_latency_ms += record.latency_ms;
 
     const allocator = state.llm_subsystems.allocator;
     if (state.last_llm_call) |last| {

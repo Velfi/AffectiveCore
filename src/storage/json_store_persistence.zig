@@ -6,6 +6,7 @@ const sqlite3 = opaque {};
 const sqlite3_stmt = opaque {};
 
 extern fn sqlite3_open(filename: [*:0]const u8, ppDb: *?*sqlite3) c_int;
+extern fn sqlite3_busy_timeout(db: *sqlite3, ms: c_int) c_int;
 extern fn sqlite3_close(db: *sqlite3) c_int;
 extern fn sqlite3_exec(db: *sqlite3, sql: [*:0]const u8, callback: ?*const fn (?*anyopaque, c_int, ?[*]?[*:0]u8, ?[*]?[*:0]u8) callconv(.c) c_int, arg: ?*anyopaque, errmsg: *?[*:0]u8) c_int;
 extern fn sqlite3_free(ptr: ?*anyopaque) void;
@@ -360,7 +361,9 @@ fn openMemoryDb(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !*sq
     const path_z = try allocator.dupeZ(u8, path);
     var maybe_db: ?*sqlite3 = null;
     if (sqlite3_open(path_z.ptr, &maybe_db) != SQLITE_OK) return error.SqliteOpenFailed;
-    return maybe_db orelse error.SqliteOpenFailed;
+    const db = maybe_db orelse return error.SqliteOpenFailed;
+    _ = sqlite3_busy_timeout(db, 5000);
+    return db;
 }
 
 fn initMemorySchema(allocator: std.mem.Allocator, db: *sqlite3) !void {

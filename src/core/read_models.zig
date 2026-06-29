@@ -1,14 +1,28 @@
 const std = @import("std");
 const brain_mod = @import("brain.zig");
 const activity_mod = @import("activity.zig");
+const process_runtime_mod = @import("process_runtime.zig");
 const ports = @import("ports.zig");
 const schema = ports.schema;
 const llm_routing = @import("llm_routing.zig");
 const brain_context_stats = @import("brain_context_stats.zig");
 const context_tokens = @import("context_tokens.zig");
 const config_mod = @import("config.zig");
+const present_moment = @import("present_moment.zig");
 
 const Brain = brain_mod.Brain;
+
+pub const PresentMomentModel = struct {
+    contact_window_open: bool = false,
+    last_user_text: ?[]const u8 = null,
+    last_spoken_text: ?[]const u8 = null,
+    in_flight_purpose: ?[]const u8 = null,
+    in_flight_sense: ?[]const u8 = null,
+    in_flight_seconds: ?i64 = null,
+    user_request_overlap: ?[]const u8 = null,
+    overlap_confidence: ?f32 = null,
+    deferred_speech_pending: bool = false,
+};
 
 pub const CurrentStimulusModel = struct {
     text: ?[]const u8 = null,
@@ -56,6 +70,8 @@ pub const AutonomyControlModel = struct {
     max_capacity: f32 = 0.0,
     social_engagement: f32 = 0.0,
     effective_threshold_bias: f32 = 0.0,
+    replenish_points_per_minute: f32 = 0.0,
+    last_capacity_replenish_at: ?i64 = null,
 };
 
 pub const BeliefModel = struct {
@@ -112,6 +128,8 @@ pub const HostCapabilityModel = struct {
     degraded_count: usize = 0,
     entries: []HostCapabilitySummary = &.{},
 };
+
+pub const ActiveProcessModel = process_runtime_mod.ActiveProcessModel;
 
 pub const ActivityModel = struct {
     activity_id: ?[]const u8 = null,
@@ -170,6 +188,21 @@ pub const SectionUsageSummary = struct {
     appearance_count: u64,
 };
 
+pub const LastDispatchSectionModel = struct {
+    section: []const u8,
+    bytes: usize,
+    count: ?usize = null,
+};
+
+pub const LastDispatchModel = struct {
+    dispatch_id: []const u8,
+    at_ms: i64,
+    operation: []const u8,
+    user_prompt_tokens: usize,
+    budget_exceeded: bool,
+    sections: []LastDispatchSectionModel = &.{},
+};
+
 pub const ContextUsageModel = struct {
     updated_at_ms: ?i64 = null,
     total_composition_count: u64 = 0,
@@ -180,6 +213,7 @@ pub const ContextUsageModel = struct {
     last_conversation_tokens: ?usize = null,
     last_conversation_bytes: ?usize = null,
     last_conversation_at_ms: ?i64 = null,
+    last_dispatch: ?LastDispatchModel = null,
     operations: []OperationUsageSummary = &.{},
     top_sections: []SectionUsageSummary = &.{},
 };
@@ -215,6 +249,7 @@ pub const Snapshot = struct {
     brain_mode: schema.BrainMode,
 
     llm_policy_model: LlmPolicyModel,
+    present_moment_model: PresentMomentModel,
     current_stimulus_model: CurrentStimulusModel,
     conversation_context_model: ConversationContextModel,
     focus_model: FocusModel,
@@ -226,6 +261,7 @@ pub const Snapshot = struct {
     disposition_model: DispositionModel,
     host_capability_model: HostCapabilityModel,
     activity_model: ActivityModel,
+    active_process_model: ActiveProcessModel,
     context_usage_model: ContextUsageModel,
     llm_usage_model: LlmUsageModel,
     capacity_model: CapacityModel,
@@ -243,6 +279,7 @@ pub const Snapshot = struct {
 };
 
 pub fn readModelsSnapshot(self: *Brain, allocator: std.mem.Allocator) !Snapshot {
+    if (self.deps.io) |io| self.syncClock(io);
     const events = try self.deps.store.loadExperienceEvents(allocator);
     const memories = try self.deps.store.loadMemoryRecords(allocator);
     const summaries = try self.deps.store.loadConversationSummaries(allocator);
@@ -261,6 +298,7 @@ pub fn readModelsSnapshot(self: *Brain, allocator: std.mem.Allocator) !Snapshot 
     return .{
         .brain_mode = try self.deps.store.loadBrainMode(),
         .llm_policy_model = llm_policy,
+        .present_moment_model = presentMomentModel(self),
         .current_stimulus_model = currentStimulusModel(self),
         .conversation_context_model = conversationContextModel(self, summaries),
         .focus_model = focusModel(self),
@@ -272,6 +310,7 @@ pub fn readModelsSnapshot(self: *Brain, allocator: std.mem.Allocator) !Snapshot 
         .disposition_model = dispositionModel(dispositions),
         .host_capability_model = hostCapabilityModel(capabilities, null),
         .activity_model = activity,
+        .active_process_model = process_runtime_mod.activeProcessModel(self),
         .context_usage_model = context_usage,
         .llm_usage_model = llm_usage,
         .capacity_model = capacity_model,
@@ -339,8 +378,29 @@ fn contextUsageModel(self: *Brain, allocator: std.mem.Allocator) !ContextUsageMo
         .last_conversation_tokens = stats.last_conversation_tokens,
         .last_conversation_bytes = stats.last_conversation_bytes,
         .last_conversation_at_ms = if (stats.last_conversation_at_seconds) |seconds| seconds * 1000 else null,
+        .last_dispatch = try lastDispatchModel(self, allocator),
         .operations = operations,
         .top_sections = top_sections,
+    };
+}
+
+fn lastDispatchModel(self: *Brain, allocator: std.mem.Allocator) !?LastDispatchModel {
+    const last = self.context_stats.last_dispatch orelse return null;
+    var sections = try allocator.alloc(LastDispatchSectionModel, last.sections.len);
+    for (last.sections, 0..) |section, index| {
+        sections[index] = .{
+            .section = section.section,
+            .bytes = section.bytes,
+            .count = section.count,
+        };
+    }
+    return .{
+        .dispatch_id = last.dispatch_id,
+        .at_ms = last.at_seconds * 1000,
+        .operation = last.operation,
+        .user_prompt_tokens = last.user_prompt_tokens,
+        .budget_exceeded = last.budget_exceeded,
+        .sections = sections,
     };
 }
 
@@ -378,6 +438,25 @@ fn llmUsageModel(self: *Brain, allocator: std.mem.Allocator) !LlmUsageModel {
         .total_llm_errors = stats.total_llm_errors,
         .subsystems = subsystems,
         .last_call = last_call,
+    };
+}
+
+fn presentMomentModel(self: *Brain) PresentMomentModel {
+    const active = self.active_activity;
+    const last_user = if (active) |a| if (a.kind == .conversation and a.goal.len > 0) a.goal else null else null;
+    const last_spoken = if (active) |a| a.state.last_spoken_text else null;
+    const overlap = if (last_user) |text| present_moment.detectRequestOverlap(self, text) else null;
+    const req = self.awaited_host_request;
+    return .{
+        .contact_window_open = present_moment.contactWindowOpen(self),
+        .last_user_text = last_user,
+        .last_spoken_text = last_spoken,
+        .in_flight_purpose = if (req) |value| value.purpose else null,
+        .in_flight_sense = if (req) |value| value.sense else null,
+        .in_flight_seconds = if (req) |value| @max(@as(i64, 0), self.now_seconds - value.since_seconds) else null,
+        .user_request_overlap = if (overlap) |o| o.in_flight_kind else null,
+        .overlap_confidence = if (overlap) |o| o.confidence else null,
+        .deferred_speech_pending = self.pending_deferred_heard_speech != null,
     };
 }
 
@@ -548,12 +627,17 @@ fn autonomyControlModel(self: *Brain) AutonomyControlModel {
         .control_capacity = default_max,
         .effective_threshold_bias = threshold_bias,
     };
+    const brain_autonomy = @import("brain_autonomy.zig");
+    const replenish_rate = brain_autonomy.autonomyReplenishRatePerSecond(self.cfg);
+    const effective_capacity = @import("maintenance.zig").projectControlCapacity(state, replenish_rate, self.now_seconds);
     return .{
         .mode = self.cfg.autonomy_mode,
-        .control_capacity = state.control_capacity,
+        .control_capacity = effective_capacity,
         .max_capacity = state.max_capacity,
         .social_engagement = state.social_engagement,
         .effective_threshold_bias = threshold_bias,
+        .replenish_points_per_minute = brain_autonomy.autonomyReplenishPointsPerMinute(self.cfg),
+        .last_capacity_replenish_at = self.now_seconds,
     };
 }
 

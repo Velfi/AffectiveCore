@@ -59,7 +59,7 @@ pub const LanguageMindActor = struct {
                     context_tokens.estimateTokensFromByteLength(input.user_prompt_bytes),
             }
         else
-            try chat.auditChatPrompt(self.allocator, input.memory, input.user_text, input.observations);
+            try chat.auditChatPrompt(self.allocator, input.memory, input.user_text, input.observations, .heard_speech);
 
         const section_payloads = try self.sectionPayloads(input.composition_sections);
         defer self.allocator.free(section_payloads);

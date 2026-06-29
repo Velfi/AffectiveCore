@@ -3,6 +3,7 @@ const activity_mod = @import("activity.zig");
 const schema = @import("port_schema.zig");
 const input_mod = @import("port_input.zig");
 const brain_mod = @import("brain.zig");
+const host_capability_activation = @import("host_capability_activation.zig");
 
 const Brain = brain_mod.Brain;
 const Active = activity_mod.Active;
@@ -148,7 +149,7 @@ pub fn applyRecordContext(self: *Brain, record: schema.ActivityRecord) !void {
         };
     }
     if (record.stimulus_text) |stimulus_text| {
-        self.setCurrentStimulusContext(try self.allocator.dupe(u8, stimulus_text));
+        try self.setOwnedCurrentStimulusContext(stimulus_text);
     }
     if (record.waiting_kind != null and record.waiting_intent != null and record.waiting_since_ms != null) {
         const kind = parseWaitingKind(record.waiting_kind.?);
@@ -164,12 +165,25 @@ pub fn applyRecordContext(self: *Brain, record: schema.ActivityRecord) !void {
         const sense = record.awaited_host_sense orelse return error.MissingAwaitedHostSense;
         const purpose = record.awaited_host_purpose orelse return error.MissingAwaitedHostPurpose;
         self.clearAwaitedHostRequest();
+        var bound_activity_id: ?[]const u8 = null;
+        var bound_user_text: ?[]const u8 = null;
+        var bound_goal: ?[]const u8 = null;
+        if (self.active_activity) |activity| {
+            bound_activity_id = try self.allocator.dupe(u8, activity.id);
+            if (activity.kind == .conversation and activity.goal.len > 0) {
+                bound_user_text = try self.allocator.dupe(u8, activity.goal);
+            }
+            bound_goal = try self.allocator.dupe(u8, activity.goal);
+        }
         self.awaited_host_request = .{
             .request_id = try self.allocator.dupe(u8, request_id),
             .sense = try self.allocator.dupe(u8, sense),
             .purpose = try self.allocator.dupe(u8, purpose),
             .since_seconds = if (record.waiting_since_ms) |ms| @divFloor(ms, 1000) else self.now_seconds,
-            .timeout_ms = try @import("awaited_host_request.zig").hostSensePullTimeoutMs(sense, purpose),
+            .timeout_ms = (try host_capability_activation.resolvePullTimeoutMs(self, sense, purpose)).timeout_ms,
+            .bound_activity_id = bound_activity_id,
+            .bound_user_text = bound_user_text,
+            .bound_goal = bound_goal,
         };
     } else if (record.awaiting) |awaiting| {
         if (std.mem.indexOf(u8, awaiting, "recognize") != null and std.mem.indexOf(u8, awaiting, "camera") != null) {

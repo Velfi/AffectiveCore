@@ -10,7 +10,9 @@ pub const CapacityConfig = struct {
     activity_stack_max: usize = 8,
     focus_slots_max: usize = 1,
     memory_selected_max: usize = 5,
-    memory_prefilter_max: usize = 15,
+    memory_prefilter_max: usize = 50,
+    memory_snippet_max_bytes: usize = 200,
+    memory_context_bytes_max: usize = 1200,
     candidate_actions_max: usize = 5,
     open_loops_soft_max: usize = 4,
     conversation_summaries_in_context_max: usize = 8,
@@ -24,6 +26,8 @@ pub const CapacityConfigPartial = struct {
     focus_slots_max: ?usize = null,
     memory_selected_max: ?usize = null,
     memory_prefilter_max: ?usize = null,
+    memory_snippet_max_bytes: ?usize = null,
+    memory_context_bytes_max: ?usize = null,
     candidate_actions_max: ?usize = null,
     open_loops_soft_max: ?usize = null,
     conversation_summaries_in_context_max: ?usize = null,
@@ -51,14 +55,13 @@ pub const Config = struct {
     autonomy_mode: []const u8 = "off",
     autonomy_sleep: []const u8 = "off",
     autonomy_quiet_hours: []const u8 = "22:00-08:00",
-    autonomy_limited_max_capacity: f32 = 0.45,
-    autonomy_full_max_capacity: f32 = 0.85,
+    autonomy_limited_max_capacity: f32 = 25,
+    autonomy_full_max_capacity: f32 = 50,
     autonomy_limited_threshold_bias: f32 = 0.20,
     autonomy_full_threshold_bias: f32 = 0.00,
-    autonomy_social_engagement_boost: f32 = 0.18,
-    autonomy_limited_replenish_actions_per_minute: f32 = 1.0,
-    autonomy_full_replenish_actions_per_minute: f32 = 4.0,
-    autonomy_planner_min_capacity: f32 = 0.12,
+    autonomy_social_engagement_boost: f32 = 3,
+    autonomy_limited_replenish_actions_per_minute: f32 = 2,
+    autonomy_full_replenish_actions_per_minute: f32 = 8,
     autonomy_social_reserve: f32 = 0.12,
     autonomy_safety_reserve: f32 = 0.20,
     autonomy_opportunity_reserve: f32 = 0.15,
@@ -149,9 +152,6 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, args[i], "--autonomy-full-replenish-actions-per-minute") and i + 1 < args.len) {
                 i += 1;
                 cfg.autonomy_full_replenish_actions_per_minute = try std.fmt.parseFloat(f32, args[i]);
-            } else if (std.mem.eql(u8, args[i], "--autonomy-planner-min-capacity") and i + 1 < args.len) {
-                i += 1;
-                cfg.autonomy_planner_min_capacity = try std.fmt.parseFloat(f32, args[i]);
             } else if (std.mem.eql(u8, args[i], "--autonomy-sleep") and i + 1 < args.len) {
                 i += 1;
                 cfg.autonomy_sleep = args[i];
@@ -307,10 +307,32 @@ pub const Config = struct {
         return cfg;
     }
 
+    pub fn resolveSeedPath(self: Config, allocator: std.mem.Allocator) !Config {
+        var cfg = self;
+        if (cfg.brain_root.len == 0) return cfg;
+        const brain_seed = try config_files.brainPath(allocator, cfg.brain_root, "seed.md");
+        if (cfg.seed_path.len == 0 or
+            std.mem.eql(u8, cfg.seed_path, "data/seeds/default.md") or
+            std.mem.startsWith(u8, cfg.seed_path, "data/seeds/"))
+        {
+            cfg.seed_path = brain_seed;
+            return cfg;
+        }
+        if (std.fs.path.isAbsolute(cfg.seed_path)) {
+            if (!std.mem.startsWith(u8, cfg.seed_path, cfg.brain_root)) {
+                cfg.seed_path = brain_seed;
+            }
+            return cfg;
+        }
+        cfg.seed_path = try std.fs.path.join(allocator, &.{ cfg.brain_root, cfg.seed_path });
+        return cfg;
+    }
+
     pub fn loadForBrain(self: Config, allocator: std.mem.Allocator, fs: FileSystem, io: std.Io) !Config {
         var cfg = try self.ensureBrainPaths(allocator);
         cfg = try cfg.withLlmConfig(allocator, fs, io);
         cfg = try cfg.withRuntimeOptions(allocator, fs, io);
+        cfg = try cfg.resolveSeedPath(allocator);
         try cognitive_capacity.validate(cfg.capacity);
         return cfg;
     }
@@ -418,7 +440,6 @@ pub const Config = struct {
             .autonomy_social_engagement_boost = self.autonomy_social_engagement_boost,
             .autonomy_limited_replenish_actions_per_minute = self.autonomy_limited_replenish_actions_per_minute,
             .autonomy_full_replenish_actions_per_minute = self.autonomy_full_replenish_actions_per_minute,
-            .autonomy_planner_min_capacity = self.autonomy_planner_min_capacity,
             .autonomy_social_reserve = self.autonomy_social_reserve,
             .autonomy_safety_reserve = self.autonomy_safety_reserve,
             .autonomy_opportunity_reserve = self.autonomy_opportunity_reserve,
@@ -492,7 +513,6 @@ pub const Config = struct {
         if (settings.autonomy_social_engagement_boost) |v| cfg.autonomy_social_engagement_boost = v;
         if (settings.autonomy_limited_replenish_actions_per_minute) |v| cfg.autonomy_limited_replenish_actions_per_minute = v;
         if (settings.autonomy_full_replenish_actions_per_minute) |v| cfg.autonomy_full_replenish_actions_per_minute = v;
-        if (settings.autonomy_planner_min_capacity) |v| cfg.autonomy_planner_min_capacity = v;
         if (settings.autonomy_social_reserve) |v| cfg.autonomy_social_reserve = v;
         if (settings.autonomy_safety_reserve) |v| cfg.autonomy_safety_reserve = v;
         if (settings.autonomy_opportunity_reserve) |v| cfg.autonomy_opportunity_reserve = v;
@@ -567,7 +587,6 @@ pub const BrainSettings = struct {
     autonomy_social_engagement_boost: ?f32 = null,
     autonomy_limited_replenish_actions_per_minute: ?f32 = null,
     autonomy_full_replenish_actions_per_minute: ?f32 = null,
-    autonomy_planner_min_capacity: ?f32 = null,
     autonomy_social_reserve: ?f32 = null,
     autonomy_safety_reserve: ?f32 = null,
     autonomy_opportunity_reserve: ?f32 = null,

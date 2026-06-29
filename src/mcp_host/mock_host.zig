@@ -1,6 +1,8 @@
 const std = @import("std");
 const embedded = @import("../affective_core_embedded.zig");
 const embedded_config = @import("../affective_core_embedded_config.zig");
+const hash_vector = @import("../core/hash_vector.zig");
+const embedding_port = @import("../core/port_embedding.zig");
 
 const AffectiveCoreEmbeddedString = embedded.AffectiveCoreEmbeddedString;
 
@@ -12,12 +14,15 @@ pub const Mode = enum {
     enrollment_without_remember_person,
     /// Every LLM call fails like upstream provider rejection.
     upstream_rejected,
+    /// First conversation call says aloud (touch orchestration with speech).
+    touch_speak,
 };
 
 pub const MockHost = struct {
     mode: Mode,
     llm_calls: usize = 0,
     conversation_calls: usize = 0,
+    autonomy_llm_calls: usize = 0,
     vision_calls: usize = 0,
     identify_calls: usize = 0,
     enroll_calls: usize = 0,
@@ -63,6 +68,15 @@ pub const MockHost = struct {
             self.enroll_calls += 1;
             return hostSuccess(out_data, out_error, enrollResponse());
         }
+        if (std.mem.endsWith(u8, url_slice, "/embed/compute")) {
+            return hostSuccess(out_data, out_error, embedResponse(body_slice));
+        }
+        if (std.mem.eql(u8, url_slice, "affective-host://system/power")) {
+            return hostSuccess(out_data, out_error, "{\"supplies\":[]}");
+        }
+        if (std.mem.eql(u8, url_slice, "affective-host://system/storage")) {
+            return hostSuccess(out_data, out_error, "{\"volumes\":[]}");
+        }
         return hostFailure(out_data, out_error, "unsupported mock host route");
     }
 
@@ -75,10 +89,11 @@ pub const MockHost = struct {
         const subsystem = parsed.value.subsystem orelse "conversation";
 
         if (std.mem.eql(u8, subsystem, "want_achievement")) return "{\"matches\":[]}";
-        if (std.mem.eql(u8, subsystem, "intent")) return "{\"action\":\"unknown\",\"value\":null}";
         if (std.mem.eql(u8, subsystem, "memory_extraction")) return "{\"candidates\":[]}";
-        if (std.mem.eql(u8, subsystem, "greeting")) return "{\"text\":\"Hello there.\"}";
-        if (std.mem.eql(u8, subsystem, "autonomy")) return "{\"action_pressures\":[],\"salience\":\"low\",\"reason\":\"mock autonomy\"}";
+        if (std.mem.eql(u8, subsystem, "autonomy")) {
+            self.autonomy_llm_calls += 1;
+            return "{\"action_pressures\":[],\"salience\":\"low\",\"reason\":\"mock autonomy\"}";
+        }
         if (std.mem.startsWith(u8, subsystem, "psyche") or std.mem.startsWith(u8, subsystem, "LanguageMind") or std.mem.eql(u8, subsystem, "language_mind")) {
             if (std.mem.eql(u8, subsystem, "psyche_superego")) {
                 return "{\"concerns\":[],\"vetoes\":[],\"preferred_restraints\":[],\"values_to_preserve\":[],\"salience\":\"low\",\"reason\":\"mock superego\"}";
@@ -105,6 +120,7 @@ pub const MockHost = struct {
                 1 => recognizeTurn(),
                 else => sayTurn("Hi — I'm here.", "Responded after observation."),
             },
+            .touch_speak => sayTurn("Hi there.", "Acknowledged touch."),
         };
     }
 };
@@ -123,7 +139,7 @@ fn echoUserText(request_body: []const u8) []const u8 {
 
 fn recognizeTurn() []const u8 {
     return
-        \\{"action_pressures":[{"action":"recognize","origin":"interaction","delay_ms":null,"scale":"full","text":null,"query":null,"memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"to":null,"subject":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]}],"user_summary":"User greeted the brain.","brain_summary":"Chose to look at who is here.","reasoning_effort":null,"turn_complete":false}
+        \\{"action_pressures":[{"action":"recognize","origin":"interaction","delay_ms":null,"scale":"full","text":null,"query":null,"memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"to":null,"subject":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]}],"user_summary":"User greeted the brain.","brain_summary":"Greeted back and looked at the speaker.","reasoning_effort":null,"turn_complete":false}
     ;
 }
 
@@ -173,6 +189,37 @@ fn enrollResponse() []const u8 {
     return
         \\{"person_id":"person_new","display_name":"Guest","representative_image_path":"/tmp/mcp-host-enroll.jpg","embedding_path":"/tmp/mcp-host-enroll.embedding","quality_score":0.82,"removed_embeddings":0,"kept_existing":false}
     ;
+}
+
+fn embedResponse(request_body: []const u8) []const u8 {
+    const Wire = struct { texts: []const []const u8 = &.{} };
+    const parsed = std.json.parseFromSlice(Wire, std.heap.page_allocator, request_body, .{ .ignore_unknown_fields = true }) catch {
+        return "{\"dimensions\":512,\"vectors\":[]}";
+    };
+    defer parsed.deinit();
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.heap.page_allocator);
+    out.appendSlice(std.heap.page_allocator, "{\"dimensions\":512,\"vectors\":[") catch return "{\"dimensions\":512,\"vectors\":[]}";
+    for (parsed.value.texts, 0..) |text, i| {
+        if (i > 0) out.append(std.heap.page_allocator, ',') catch {};
+        const compact = hash_vector.embed(std.heap.page_allocator, text, &.{}) catch continue;
+        defer std.heap.page_allocator.free(compact);
+        var vector = std.ArrayList(u8).empty;
+        defer vector.deinit(std.heap.page_allocator);
+        vector.append(std.heap.page_allocator, '[') catch continue;
+        var dim: usize = 0;
+        while (dim < embedding_port.test_embedding_dimensions) : (dim += 1) {
+            if (dim > 0) vector.append(std.heap.page_allocator, ',') catch {};
+            const value: f32 = if (dim < compact.len) compact[dim] else 0;
+            const piece = std.fmt.allocPrint(std.heap.page_allocator, "{d:.6}", .{value}) catch continue;
+            defer std.heap.page_allocator.free(piece);
+            vector.appendSlice(std.heap.page_allocator, piece) catch {};
+        }
+        vector.append(std.heap.page_allocator, ']') catch {};
+        out.appendSlice(std.heap.page_allocator, vector.items) catch {};
+    }
+    out.appendSlice(std.heap.page_allocator, "]}") catch {};
+    return std.heap.page_allocator.dupe(u8, out.items) catch "{\"dimensions\":512,\"vectors\":[]}";
 }
 
 fn hostSuccess(out_data: ?*AffectiveCoreEmbeddedString, out_error: ?*AffectiveCoreEmbeddedString, body: []const u8) c_int {

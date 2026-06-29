@@ -25,7 +25,6 @@ const ScriptedRecallChatService = support.ScriptedRecallChatService;
 const ScriptedClarificationChatService = support.ScriptedClarificationChatService;
 const ScriptedHardErrorRecoveryChatService = support.ScriptedHardErrorRecoveryChatService;
 const HeardSpeechObservationChatService = support.HeardSpeechObservationChatService;
-const FailingIdentityClaimIntentService = support.FailingIdentityClaimIntentService;
 const ScriptedContinuingChatService = support.ScriptedContinuingChatService;
 const makeBrain = support.makeBrain;
 const addMara = support.addMara;
@@ -87,8 +86,14 @@ test "think_about reflects and saves a short term thought" {
     const text = try brain.thinkAbout("how careful should I be?", &[_][]const u8{"preference"});
     try std.testing.expect(std.mem.indexOf(u8, text, "thought:") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "memory_saved") != null);
-    try std.testing.expectEqual(@as(usize, 2), store.memories.items.len);
-    try std.testing.expectEqual(schema.MemoryScope.short_term, store.memories.items[1].scope);
+    try std.testing.expect(store.memories.items.len >= 2);
+    const thought_memory = blk: {
+        for (store.memories.items) |memory| {
+            if (std.mem.indexOf(u8, memory.text, "I thought about") != null) break :blk memory;
+        }
+        return error.MissingThoughtMemory;
+    };
+    try std.testing.expectEqual(schema.MemoryScope.short_term, thought_memory.scope);
     try std.testing.expectEqual(@as(usize, 1), store.appraisals.items.len);
     try std.testing.expectEqual(@as(u32, 1), store.memories.items[0].access_count);
 }

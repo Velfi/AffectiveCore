@@ -83,15 +83,27 @@ pub const MemoryCandidateActor = struct {
     ) !?types.MemoryCandidate {
         const action = event.action orelse return null;
         if (action.len == 0) return null;
-        // TODO(memory-runtime-merge): migrate think_about to full candidate-only path after broad test suite adjustments.
         if (!std.mem.eql(u8, action, "define_need") and
             !std.mem.eql(u8, action, "define_want") and
             !std.mem.eql(u8, action, "define_goal") and
-            !std.mem.eql(u8, action, "set_fact"))
+            !std.mem.eql(u8, action, "edit_need") and
+            !std.mem.eql(u8, action, "edit_want") and
+            !std.mem.eql(u8, action, "edit_goal") and
+            !std.mem.eql(u8, action, "set_fact") and
+            !std.mem.eql(u8, action, "think_about"))
         {
             return null;
         }
-        const key = if (event.subject.len > 0) event.subject else action;
+        const key = if (event.subject.len > 0 and !std.mem.eql(u8, event.subject, action))
+            event.subject
+        else if (std.mem.startsWith(u8, action, "edit_"))
+            action["edit_".len..]
+        else if (std.mem.startsWith(u8, action, "define_"))
+            action["define_".len..]
+        else if (std.mem.eql(u8, action, "think_about"))
+            "thought"
+        else
+            action;
         const proposition = if (event.interpretation.len > 0) event.interpretation else event.body;
         const evidence = if (event.raw.len > 0) event.raw else event.body;
         if (proposition.len == 0 or evidence.len == 0) return error.InvalidCandidateEventPayload;

@@ -293,6 +293,9 @@ pub fn cloneDreamTimeRecord(allocator: std.mem.Allocator, dream: schema.DreamTim
         .title = try cloneString(allocator, dream.title),
         .text = try cloneString(allocator, dream.text),
         .waking_thought = try cloneString(allocator, dream.waking_thought),
+        .persona = try cloneString(allocator, dream.persona),
+        .short_term = try cloneString(allocator, dream.short_term),
+        .long_term = try cloneString(allocator, dream.long_term),
         .image_spec = try cloneDreamImageSpec(allocator, dream.image_spec),
         .created_at_ms = dream.created_at_ms,
     };

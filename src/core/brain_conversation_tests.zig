@@ -36,7 +36,6 @@ const ScriptedRecallChatService = support.ScriptedRecallChatService;
 const ScriptedClarificationChatService = support.ScriptedClarificationChatService;
 const ScriptedHardErrorRecoveryChatService = support.ScriptedHardErrorRecoveryChatService;
 const HeardSpeechObservationChatService = support.HeardSpeechObservationChatService;
-const FailingIdentityClaimIntentService = support.FailingIdentityClaimIntentService;
 const ScriptedContinuingChatService = support.ScriptedContinuingChatService;
 const makeBrain = support.makeBrain;
 const addMara = support.addMara;
@@ -165,26 +164,6 @@ test "conversation turn stores summary without forcing speaker recognition" {
     try std.testing.expectEqual(@as(usize, 1), store.impressions.items.len);
     try std.testing.expectEqual(@as(usize, 1), store.appraisals.items.len);
     _ = findExperienceEventByKind(store.experience_events.items, "User.TextReceived") orelse return error.MissingUserTextReceivedEvent;
-}
-
-test "conversation completes without intent LLM when intent service fails" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var store = TestStore.init(allocator);
-    var desc = openai.TestDescriptionService{};
-    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{"That's you. Remember?"}, &store, &desc);
-    var intent = FailingIdentityClaimIntentService{};
-    brain.deps.intent_service = intent.service();
-
-    try brain.handleConversationTurn();
-
-    try std.testing.expectEqual(@as(usize, 0), intent.calls);
-    _ = findExperienceEventByKind(store.experience_events.items, "Memory.ExperienceRecorded.utterance") orelse return error.MissingUtteranceExperienceEvent;
-    _ = findExperienceEventByKind(store.experience_events.items, "Memory.ExperienceRecorded.appraisal") orelse return error.MissingAppraisalExperienceEvent;
-    try std.testing.expectEqual(@as(usize, 1), store.impressions.items.len);
-    try std.testing.expectEqual(@as(usize, 1), store.appraisals.items.len);
-    try std.testing.expectEqual(@as(usize, 1), store.conversation_summaries.items.len);
 }
 
 test "plain conversation turns do not force repeated speaker recognition" {
@@ -433,7 +412,7 @@ test "conversation with large self facts stays within chat budget" {
     try std.testing.expect(std.mem.indexOf(u8, result.brain_summary, "exceeded context budget") == null);
 }
 
-test "conversation skips chat when prompt exceeds budget" {
+test "conversation trims low-salience context when prompt exceeds budget" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -457,11 +436,8 @@ test "conversation skips chat when prompt exceeds budget" {
         .{},
     );
 
-    try std.testing.expectEqual(@as(usize, 0), chat.calls);
-    try std.testing.expect(result.spoken_text.len == 0);
-    try std.testing.expect(std.mem.indexOf(u8, result.spoken_text, "ContextBudgetExceeded") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.spoken_text, "Something went wrong") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.brain_summary, "exceeded context budget") != null);
+    try std.testing.expect(chat.calls >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, result.brain_summary, "exceeded context budget") == null);
 }
 
 test "chat action batch continues after speech" {

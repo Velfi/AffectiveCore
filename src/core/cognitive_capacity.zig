@@ -7,6 +7,8 @@ pub fn validate(cfg: config.CapacityConfig) !void {
     if (cfg.focus_slots_max < 1) return error.InvalidFocusSlotsMax;
     if (cfg.memory_selected_max < 1) return error.InvalidMemorySelectedMax;
     if (cfg.memory_prefilter_max < 1) return error.InvalidMemoryPrefilterMax;
+    if (cfg.memory_snippet_max_bytes < 1) return error.InvalidMemorySnippetMaxBytes;
+    if (cfg.memory_context_bytes_max < 1) return error.InvalidMemoryContextBytesMax;
     if (cfg.candidate_actions_max < 1) return error.InvalidCandidateActionsMax;
     if (cfg.open_loops_soft_max < 1) return error.InvalidOpenLoopsSoftMax;
     if (cfg.conversation_summaries_in_context_max < 1) return error.InvalidConversationSummariesMax;
@@ -23,6 +25,8 @@ pub fn mergePartial(base: config.CapacityConfig, partial: config.CapacityConfigP
     if (partial.focus_slots_max) |v| cfg.focus_slots_max = v;
     if (partial.memory_selected_max) |v| cfg.memory_selected_max = v;
     if (partial.memory_prefilter_max) |v| cfg.memory_prefilter_max = v;
+    if (partial.memory_snippet_max_bytes) |v| cfg.memory_snippet_max_bytes = v;
+    if (partial.memory_context_bytes_max) |v| cfg.memory_context_bytes_max = v;
     if (partial.candidate_actions_max) |v| cfg.candidate_actions_max = v;
     if (partial.open_loops_soft_max) |v| cfg.open_loops_soft_max = v;
     if (partial.conversation_summaries_in_context_max) |v| cfg.conversation_summaries_in_context_max = v;

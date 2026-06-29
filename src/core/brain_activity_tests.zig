@@ -15,6 +15,9 @@ const activity_mod = @import("activity.zig");
 const brain_process = @import("brain_process.zig");
 const read_models = @import("read_models.zig");
 const awaited_host_request = @import("awaited_host_request.zig");
+const host_capability_activation = @import("host_capability_activation.zig");
+const process_runtime = @import("process_runtime.zig");
+const experience_kinds = @import("experience_kinds.zig");
 
 const Brain = brain_mod.Brain;
 const TestStore = store_support.TestStore;
@@ -30,7 +33,6 @@ const ScriptedRecallChatService = support.ScriptedRecallChatService;
 const ScriptedClarificationChatService = support.ScriptedClarificationChatService;
 const ScriptedHardErrorRecoveryChatService = support.ScriptedHardErrorRecoveryChatService;
 const HeardSpeechObservationChatService = support.HeardSpeechObservationChatService;
-const FailingIdentityClaimIntentService = support.FailingIdentityClaimIntentService;
 const ScriptedContinuingChatService = support.ScriptedContinuingChatService;
 const makeBrain = support.makeBrain;
 const addMara = support.addMara;
@@ -422,7 +424,7 @@ test "conversation turn awaiting host sense exposes activity id" {
     try std.testing.expect(result.awaiting_host_sense);
     try std.testing.expectEqualStrings("camera", result.awaited_host_sense.?);
     try std.testing.expectEqualStrings("recognize", result.awaited_host_purpose.?);
-    try std.testing.expectEqual(@as(u32, awaited_host_request.camera_recognize_timeout_ms), result.awaited_host_timeout_ms.?);
+    try std.testing.expectEqual(@as(u32, host_capability_activation.cold_start_pull_timeout_ms), result.awaited_host_timeout_ms.?);
     try std.testing.expect(result.activity_id != null);
     try std.testing.expectEqualStrings("active", result.activity_state.?);
     try std.testing.expectEqualStrings("hello", result.activity_goal.?);
@@ -514,3 +516,244 @@ test "conversation accepts another user turn while host pull is pending" {
     try std.testing.expect(brain.awaitedHostRequestActive());
 }
 
+test "user speech supersedes non-conversation activity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    try brain_process.openActivity(&brain, "capture scene", "req-capture", .salient_sense, null);
+    try std.testing.expect(brain.active_activity != null);
+    brain.active_activity.?.kind_label = try allocator.dupe(u8, "Capture");
+    try std.testing.expect(!std.ascii.eqlIgnoreCase(brain.active_activity.?.kind_label, "Conversation"));
+
+    try brain_process.ensureActiveActivity(&brain, "Hello Geisha", "req-speech", .user_speech);
+    try std.testing.expect(brain.active_activity != null);
+    try std.testing.expectEqual(activity_mod.Kind.conversation, brain.active_activity.?.kind);
+    try std.testing.expectEqualStrings("Hello Geisha", brain.active_activity.?.goal);
+    try std.testing.expect(!std.mem.eql(u8, brain.active_activity.?.kind_label, "Capture"));
+}
+
+test "handleUserInterruptFromHost supersedes non-conversation activity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    try brain_process.openActivity(&brain, "look at scene", "req-capture", .salient_sense, null);
+    try std.testing.expect(brain.active_activity != null);
+    try std.testing.expectEqual(activity_mod.Kind.generic, brain.active_activity.?.kind);
+
+    try brain.handleUserInterruptFromHost(.{
+        .reason = "user_requested_interrupt",
+        .interrupted_action = "capture",
+        .preview_text = "",
+        .canceled_queued_action_count = 0,
+    });
+    try std.testing.expect(brain.active_activity == null);
+    try std.testing.expect(brain.pending_user_interrupt_coalesce != null);
+    try std.testing.expect(std.mem.indexOf(u8, brain.pending_user_interrupt_coalesce.?, "user_interrupt_coalesce:") != null);
+}
+
+test "handleUserInterruptFromHost aborts active process and clears awaited host" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    var steps = [_]process_runtime.ProcessStep{
+        .{
+            .kind = .async_host_pull,
+            .action = .recognize,
+            .sense = try allocator.dupe(u8, "camera"),
+            .purpose = try allocator.dupe(u8, "recognize"),
+        },
+        .{ .kind = .respond, .action = .say },
+    };
+    try process_runtime.startProcess(&brain, "search_memory", "Who was that?", .interaction, "test", steps[0..]);
+    try brain.setAwaitedHostRequest("camera", "recognize");
+    try std.testing.expect(brain.active_process != null);
+    try std.testing.expect(brain.awaitedHostRequestActive());
+
+    try brain.handleUserInterruptFromHost(.{
+        .reason = "user_requested_interrupt",
+        .interrupted_action = "recognize",
+        .preview_text = "Hello Geisha",
+        .canceled_queued_action_count = 1,
+    });
+    try std.testing.expect(brain.active_process == null);
+    try std.testing.expect(!brain.awaitedHostRequestActive());
+    try std.testing.expect(brain.pending_user_interrupt_coalesce != null);
+    try std.testing.expect(std.mem.indexOf(u8, brain.pending_user_interrupt_coalesce.?, "search_memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, brain.pending_user_interrupt_coalesce.?, "Hello Geisha") != null);
+}
+
+test "second interrupt replaces pending coalesce from first" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    try brain.handleUserInterruptFromHost(.{
+        .reason = "user_requested_interrupt",
+        .interrupted_action = "first",
+        .preview_text = "first preview",
+        .canceled_queued_action_count = 0,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, brain.pending_user_interrupt_coalesce.?, "first preview") != null);
+
+    try brain.handleUserInterruptFromHost(.{
+        .reason = "user_requested_interrupt",
+        .interrupted_action = "second",
+        .preview_text = "second preview",
+        .canceled_queued_action_count = 0,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, brain.pending_user_interrupt_coalesce.?, "first preview") == null);
+    try std.testing.expect(std.mem.indexOf(u8, brain.pending_user_interrupt_coalesce.?, "second preview") != null);
+}
+
+test "handleUserInterruptFromHost clears pending deferred speech" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    brain.pending_deferred_heard_speech = try input_mod.HeardSpeech.typed(allocator, "stale while waiting");
+    try brain.handleUserInterruptFromHost(.{
+        .reason = "user_requested_interrupt",
+        .interrupted_action = "recognize",
+        .preview_text = "Hello",
+        .canceled_queued_action_count = 0,
+    });
+    try std.testing.expect(brain.pending_deferred_heard_speech == null);
+}
+
+test "handleUserInterruptFromHost keeps owned stimulus context after return" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    try brain.handleUserInterruptFromHost(.{
+        .reason = "user_requested_interrupt",
+        .interrupted_action = "capture",
+        .preview_text = "Hello Geisha",
+        .canceled_queued_action_count = 0,
+    });
+    try std.testing.expect(brain.owned_current_stimulus_context != null);
+    try std.testing.expectEqualStrings("user interrupt: Hello Geisha", brain.current_stimulus_context.?);
+}
+
+test "interrupt clears deferred speech so it is not replayed on next user turn" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    var chat = support.ScriptedContinuingChatService{ .done_after_call = 1 };
+    brain.deps.chat_service = chat.service();
+
+    brain.pending_deferred_heard_speech = try input_mod.HeardSpeech.typed(allocator, "stale while waiting");
+    try brain.handleUserInterruptFromHost(.{
+        .reason = "user_requested_interrupt",
+        .interrupted_action = "recognize",
+        .preview_text = "fresh",
+        .canceled_queued_action_count = 0,
+    });
+
+    _ = try brain.handleConversationText(try input_mod.HeardSpeech.typed(allocator, "fresh"), .{});
+    try std.testing.expectEqual(@as(usize, 1), chat.calls);
+}
+
+test "direct user turn nudges verbal reply after silent non-verbal action" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    var chat = support.ScriptedNonVerbalThenNudgedSayChatService{ .say_text = "Hello Geisha." };
+    brain.deps.chat_service = chat.service();
+
+    const result = try brain.handleConversationText(try input_mod.HeardSpeech.typed(allocator, "Hello Geisha"), .{});
+    try std.testing.expectEqualStrings("Hello Geisha.", result.spoken_text);
+    try std.testing.expectEqual(@as(usize, 1), chat.calls);
+    try std.testing.expectEqual(support.ScriptedNonVerbalThenNudgedSayChatService.NudgeKind.initial, chat.last_nudge_kind);
+}
+
+test "heard speech nudge retries when turn is not complete" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    var chat = support.ScriptedAlwaysNonVerbalChatService{};
+    brain.deps.chat_service = chat.service();
+
+    const result = try brain.handleConversationText(try input_mod.HeardSpeech.typed(allocator, "Hello"), .{});
+    try std.testing.expectEqualStrings("Hello.", result.spoken_text);
+    try std.testing.expectEqual(@as(usize, 2), chat.calls);
+}
+
+test "pending interrupt coalesce injects observation on next user turn" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    var chat = support.ScriptedInterruptCoalesceSayChatService{};
+    brain.deps.chat_service = chat.service();
+
+    try brain.handleUserInterruptFromHost(.{
+        .reason = "user_requested_interrupt",
+        .interrupted_action = "capture",
+        .preview_text = "Hello",
+        .canceled_queued_action_count = 0,
+    });
+    try std.testing.expect(brain.pending_user_interrupt_coalesce != null);
+
+    const result = try brain.handleConversationText(try input_mod.HeardSpeech.typed(allocator, "Hello"), .{});
+    try std.testing.expectEqualStrings("Hello.", result.spoken_text);
+    try std.testing.expect(brain.pending_user_interrupt_coalesce == null);
+}
+
+test "handleEmojiReaction records formatted stimulus when idle" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    const result = try brain.handleEmojiReaction(.{
+        .emoji = "👍",
+        .utterance_text = "Hello back.",
+        .speaker_label = "You",
+        .utterance_event_id = "evt_brain_123",
+    });
+    try std.testing.expectEqualStrings("", result.spoken_text);
+    var found_reaction = false;
+    for (store.experience_events.items) |event| {
+        if (!std.mem.eql(u8, event.kind, experience_kinds.user_emoji_reaction)) continue;
+        found_reaction = true;
+        try std.testing.expectEqualStrings("You reacted 👍 to your utterance Hello back.", event.payload);
+        try std.testing.expectEqual(@as(usize, 1), event.causal_parent_ids.len);
+        try std.testing.expectEqualStrings("evt_brain_123", event.causal_parent_ids[0]);
+    }
+    try std.testing.expect(found_reaction);
+}

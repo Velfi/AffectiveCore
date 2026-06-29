@@ -5,6 +5,7 @@ const brain_container = @import("app/brain_container.zig");
 const host_profiles = @import("app/host_profiles.zig");
 const context_gate = @import("app/context_gate.zig");
 const embedded_protocol = @import("app/embedded_protocol.zig");
+const request_timings = @import("core/request_timings.zig");
 const config_mod = @import("core/config.zig");
 const brain_mod = @import("core/brain.zig");
 const ai_provider = @import("api/random_provider_client.zig");
@@ -65,6 +66,8 @@ pub const AffectiveCoreEmbeddedStatus = enum(c_int) {
 
 pub const AffectiveCoreEmbedded = struct {
     arena: std.heap.ArenaAllocator = undefined,
+    brain_arena: std.heap.ArenaAllocator = undefined,
+    scratch_arena: std.heap.ArenaAllocator = undefined,
     io_threaded: std.Io.Threaded = .init_single_threaded,
     env: std.process.Environ.Map,
     brain: brain_mod.Brain,
@@ -82,6 +85,46 @@ pub const AffectiveCoreEmbedded = struct {
 
     pub fn allocator(self: *AffectiveCoreEmbedded) std.mem.Allocator {
         return self.arena.allocator();
+    }
+
+    pub fn brainAllocator(self: *AffectiveCoreEmbedded) std.mem.Allocator {
+        return self.brain_arena.allocator();
+    }
+
+    /// Transient allocator for per-dispatch work (JSON compaction, envelope staging).
+    /// Reset via `resetDispatchScratch` after each dispatch boundary.
+    pub fn dispatchScratch(self: *AffectiveCoreEmbedded) std.mem.Allocator {
+        return self.scratch_arena.allocator();
+    }
+
+    pub fn wireDispatchScratchToLlmClients(self: *AffectiveCoreEmbedded) void {
+        const scratch = self.dispatchScratch();
+        for (self.llm_provider_clients) |client| {
+            client.http_response_allocator = scratch;
+        }
+    }
+
+    pub fn clearDispatchScratchWiring(self: *AffectiveCoreEmbedded) void {
+        for (self.llm_provider_clients) |client| {
+            client.http_response_allocator = null;
+        }
+    }
+
+    pub fn resetDispatchScratch(self: *AffectiveCoreEmbedded) void {
+        self.clearDispatchScratchWiring();
+        _ = self.scratch_arena.reset(.free_all);
+    }
+
+    pub fn brainArenaQueryCapacity(self: *AffectiveCoreEmbedded) usize {
+        return self.brain_arena.queryCapacity();
+    }
+
+    pub fn dispatchScratchQueryCapacity(self: *AffectiveCoreEmbedded) usize {
+        return self.scratch_arena.queryCapacity();
+    }
+
+    pub fn clearHttpTransportLastError(self: *AffectiveCoreEmbedded) void {
+        self.http_transport.releaseLastError();
     }
 
     pub fn io(self: *AffectiveCoreEmbedded) std.Io {
@@ -104,10 +147,14 @@ const host_error_detail_unavailable = "host error (detail unavailable)";
 const HostHttpTransport = struct {
     services: AffectiveCoreEmbeddedHostServices = .{},
     failing: FailingHttpTransport = .{},
+    error_allocator: std.mem.Allocator = undefined,
     last_error: ?[]const u8 = null,
 
-    fn init(services: ?*const AffectiveCoreEmbeddedHostServices) HostHttpTransport {
-        return .{ .services = if (services) |value| value.* else .{} };
+    fn init(services: ?*const AffectiveCoreEmbeddedHostServices, error_allocator: std.mem.Allocator) HostHttpTransport {
+        return .{
+            .services = if (services) |value| value.* else .{},
+            .error_allocator = error_allocator,
+        };
     }
 
     fn client(self: *HostHttpTransport) http_transport_mod.Client {
@@ -139,7 +186,7 @@ const HostHttpTransport = struct {
         defer free_string(self.services.ctx, out_error);
 
         if (status != 0) {
-            self.rememberLastError(allocator, out_error);
+            self.rememberLastError(out_error);
             return error.HostHttpPostJsonFailed;
         }
         const bytes = try embeddedStringToOwnedSlice(allocator, out_data);
@@ -148,16 +195,30 @@ const HostHttpTransport = struct {
         return bytes;
     }
 
-    fn rememberLastError(self: *HostHttpTransport, allocator: std.mem.Allocator, out_error: AffectiveCoreEmbeddedString) void {
+    fn releaseLastError(self: *HostHttpTransport) void {
+        if (self.last_error) |prev| {
+            if (prev.ptr != host_error_detail_unavailable.ptr) {
+                self.error_allocator.free(prev);
+            }
+            self.last_error = null;
+        }
+    }
+
+    fn rememberLastError(self: *HostHttpTransport, out_error: AffectiveCoreEmbeddedString) void {
         const bytes = embedded_config.stringSlice(out_error) orelse "";
         const trimmed = std.mem.trim(u8, bytes, &std.ascii.whitespace);
-        if (trimmed.len == 0) {
-            self.last_error = null;
-            return;
-        }
-        self.last_error = allocator.dupe(u8, trimmed) catch host_error_detail_unavailable;
+        self.releaseLastError();
+        if (trimmed.len == 0) return;
+        self.last_error = self.error_allocator.dupe(u8, trimmed) catch host_error_detail_unavailable;
     }
 };
+
+fn hostSystemSensesHttpClient(http_transport_state: *HostHttpTransport) ?http_transport_mod.Client {
+    if (http_transport_state.services.http_post_json != null and http_transport_state.services.free_string != null) {
+        return http_transport_state.client();
+    }
+    return null;
+}
 
 const HostCapabilityPending = struct {
     request_id: []const u8,
@@ -184,10 +245,13 @@ pub export fn affective_core_embedded_create(
     errdefer std.heap.page_allocator.destroy(handle);
 
     handle.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    handle.brain_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    handle.scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     handle.io_threaded = .init_single_threaded;
     const allocator = handle.allocator();
+    const brain_allocator = handle.brainAllocator();
     handle.env = std.process.Environ.Map.init(allocator);
-    handle.http_transport = HostHttpTransport.init(host_services);
+    handle.http_transport = HostHttpTransport.init(host_services, allocator);
     handle.brain_initialized = false;
     handle.storage_backend = null;
     handle.host_effects = null;
@@ -197,37 +261,49 @@ pub export fn affective_core_embedded_create(
     handle.pending_camera_permission = null;
     handle.dispatch_mutex = .unlocked;
     const manifest_json = embedded_config.stringSlice(raw_config.host_manifest_json) orelse "";
-    const manifest = embedded_protocol.parseHostManifest(
-        allocator,
-        if (manifest_json.len == 0) embedded_protocol.defaultMacosManifestJson() else manifest_json,
-    ) catch |err| {
+    if (manifest_json.len == 0) {
+        return createFailureWithHandle(handle, out_error, "embedded create requires host_manifest_json from the host app", error.MissingHostManifestCapabilities);
+    }
+    const manifest = embedded_protocol.parseHostManifest(allocator, manifest_json) catch |err| {
         return createFailureWithHandle(handle, out_error, "could not parse embedded host manifest", err);
     };
     embedded_config.configureHostProviderRouting(allocator, &handle.env, raw_config.*) catch |err| {
         return createFailureWithHandle(handle, out_error, "could not configure embedded host provider routing", err);
     };
 
-    const base_cfg = embedded_config.makeConfig(allocator, raw_config.*) catch |err| {
+    const base_cfg = embedded_config.makeConfig(brain_allocator, raw_config.*) catch |err| {
         return createFailureWithHandle(handle, out_error, "could not build embedded config", err);
     };
     var local_filesystem = files.LocalFileSystem{};
-    var cfg = base_cfg.ensureBrainPaths(allocator) catch |err| {
+    var cfg = base_cfg.ensureBrainPaths(brain_allocator) catch |err| {
         return createFailureWithHandle(handle, out_error, "could not resolve embedded brain paths", err);
     };
-    config_mod.provisionBrainConfigFiles(allocator, local_filesystem.filesystem(), handle.io(), cfg) catch |err| {
+    config_mod.provisionBrainConfigFiles(brain_allocator, local_filesystem.filesystem(), handle.io(), cfg) catch |err| {
         return createFailureWithHandle(handle, out_error, "could not provision embedded brain config files", err);
     };
-    cfg = cfg.loadForBrain(allocator, local_filesystem.filesystem(), handle.io()) catch |err| {
+    cfg = cfg.loadForBrain(brain_allocator, local_filesystem.filesystem(), handle.io()) catch |err| {
         return createFailureWithHandle(handle, out_error, "could not load embedded brain config", err);
     };
-    cfg = embedded_config.restoreHostControlledPaths(allocator, raw_config.*, cfg) catch |err| {
+    cfg = embedded_config.restoreHostControlledPaths(brain_allocator, raw_config.*, cfg) catch |err| {
         return createFailureWithHandle(handle, out_error, "could not restore embedded host paths", err);
     };
     if (ensureParentDirsOrFailure(handle, out_error, cfg)) |status| return status;
-    const embedded_brain_host = host_profiles.initEmbeddedMacosBrainHost(allocator, handle.io(), handle.http_transport.client(), cfg, manifest.capabilities) catch |err| {
+    const host_system_senses_http = hostSystemSensesHttpClient(&handle.http_transport);
+    const host_http_available = host_services != null and host_services.?.http_post_json != null;
+    const embedded_brain_host = host_profiles.initEmbeddedMacosBrainHost(
+        brain_allocator,
+        handle.io(),
+        handle.http_transport.client(),
+        cfg,
+        manifest.capabilities,
+        host_system_senses_http,
+        host_http_available,
+    ) catch |err| {
         return createFailureWithHandle(handle, out_error, "could not initialize embedded AffectiveCore runtime", err);
     };
     handle.brain = embedded_brain_host.brain;
+    embedded_brain_host.chat_service.parse_failure_brain = &handle.brain;
+    embedded_brain_host.autonomy_planner.parse_failure_brain = &handle.brain;
     handle.llm_provider_clients = embedded_brain_host.llm_provider_clients;
     brain_mod.wireLlmStatsRecorder(&handle.brain, handle.llm_provider_clients);
     handle.storage_backend = embedded_brain_host.storage;
@@ -250,11 +326,13 @@ pub export fn affective_core_embedded_create(
 pub export fn affective_core_embedded_destroy(handle: ?*AffectiveCoreEmbedded) void {
     const ctx = handle orelse return;
     if (ctx.storage_backend) |*storage| {
-        storage.deinit(ctx.allocator());
+        storage.deinit(ctx.brainAllocator());
         ctx.storage_backend = null;
     }
     ctx.env.deinit();
     ctx.io_threaded.deinit();
+    ctx.scratch_arena.deinit();
+    ctx.brain_arena.deinit();
     ctx.arena.deinit();
     std.heap.page_allocator.destroy(ctx);
 }
@@ -305,17 +383,27 @@ pub export fn affective_core_embedded_drain_events_json(
     const ctx = handle orelse return runtimeFailure(null, out_error, "missing embedded AffectiveCore handle");
     if (tryAcquireDispatch(ctx, out_data, out_error)) |status| return status;
     defer releaseDispatch(ctx);
+    defer ctx.resetDispatchScratch();
     const request_id = "";
-    const compacted = context_gate.compactEvents(ctx.allocator(), ctx.brain.now_seconds, request_id, ctx.brain.activeActivityId() orelse "", ctx.event_queue.items, ctx.context_budget) catch |err| {
+    ctx.brain.beginRequestTimings(request_id) catch |err| {
+        return runtimeError(ctx, out_error, "could not begin request timings", err);
+    };
+    defer ctx.brain.resetRequestTimings();
+    const scratch = ctx.dispatchScratch();
+    const compacted = context_gate.compactEvents(scratch, ctx.brain.now_seconds, request_id, ctx.brain.activeActivityId() orelse "", ctx.event_queue.items, ctx.context_budget) catch |err| {
         return runtimeError(ctx, out_error, "could not compact drained events", err);
     };
     embedded_dispatch.persistRawRefs(ctx, compacted.raw_refs) catch |err| {
         return runtimeError(ctx, out_error, "could not store compacted drained event refs", err);
     };
-    const budget = context_gate.budgetWithResult(ctx.allocator(), compacted.budget, 0, &.{}, false) catch |err| {
+    const budget = context_gate.budgetWithResult(scratch, compacted.budget, 0, &.{}, false) catch |err| {
         return runtimeError(ctx, out_error, "could not build drain budget", err);
     };
-    const output = embedded_protocol.successEnvelopeAlloc(std.heap.page_allocator, request_id, compacted.events, .{ .kind = "drain" }, budget) catch |err| {
+    var timings = embedded_dispatch.finishDispatchTimings(ctx) catch |err| {
+        return runtimeError(ctx, out_error, "could not finish drain request timings", err);
+    };
+    defer embedded_dispatch.deinitDispatchTimingsReport(ctx, &timings);
+    const output = embedded_protocol.successEnvelopeAlloc(std.heap.page_allocator, request_id, compacted.events, .{ .kind = "drain" }, budget, timings, null) catch |err| {
         return runtimeError(ctx, out_error, "could not encode drained events", err);
     };
     ctx.event_queue.clearRetainingCapacity();
@@ -335,9 +423,14 @@ pub export fn affective_core_embedded_raw_ref_lookup_json(
     const ctx = handle orelse return runtimeFailure(null, out_error, "missing embedded AffectiveCore handle");
     if (tryAcquireDispatch(ctx, out_data, out_error)) |status| return status;
     defer releaseDispatch(ctx);
+    defer ctx.resetDispatchScratch();
     const raw_ref = embedded_config.requiredSlice(raw_ref_ptr, raw_ref_len) catch {
         return protocolError(ctx, out_data, "", "invalid_request", "missing raw_ref");
     };
+    ctx.brain.beginRequestTimings("raw_ref_lookup") catch |err| {
+        return runtimeError(ctx, out_error, "could not begin request timings", err);
+    };
+    defer ctx.brain.resetRequestTimings();
     const bytes = embedded_dispatch.lookupRawRef(ctx, raw_ref) catch |err| {
         const message = allocEmbeddedErrorMessage(ctx, "raw_ref_not_found", err) catch {
             return protocolError(ctx, out_data, "", "raw_ref_not_found", embeddedErrorName(ctx, err));
@@ -345,6 +438,10 @@ pub export fn affective_core_embedded_raw_ref_lookup_json(
         defer std.heap.page_allocator.free(message);
         return protocolError(ctx, out_data, "", "raw_ref_not_found", message);
     };
+    var timings = embedded_dispatch.finishDispatchTimings(ctx) catch |err| {
+        return runtimeError(ctx, out_error, "could not finish raw ref lookup timings", err);
+    };
+    defer embedded_dispatch.deinitDispatchTimingsReport(ctx, &timings);
     const output = embedded_protocol.successEnvelopeAlloc(std.heap.page_allocator, "", &[_]embedded_protocol.HostEvent{}, .{
         .event_type = "raw_ref_lookup",
         .value = .{
@@ -352,7 +449,7 @@ pub export fn affective_core_embedded_raw_ref_lookup_json(
             .raw_ref = raw_ref,
             .content = bytes,
         },
-    }, embedded_dispatch.emptyBudget(ctx)) catch |err| {
+    }, embedded_dispatch.emptyBudget(ctx), timings, null) catch |err| {
         return runtimeError(ctx, out_error, "could not encode raw ref lookup", err);
     };
     return success(ctx, out_data, output);
@@ -385,10 +482,11 @@ pub export fn affective_core_embedded_export_brain(
     const ctx = handle orelse return runtimeFailure(null, out_error, "missing embedded AffectiveCore handle");
     if (tryAcquireDispatch(ctx, out_data, out_error)) |status| return status;
     defer releaseDispatch(ctx);
+    defer ctx.resetDispatchScratch();
     const brain_file_path = embedded_config.requiredSlice(brain_file_path_ptr, brain_file_path_len) catch {
         return runtimeFailure(ctx, out_error, "missing brain export file path");
     };
-    const manifest = brain_container.exportBrain(ctx.allocator(), ctx.io(), ctx.brain.cfg, brain_file_path) catch |err| {
+    const manifest = brain_container.exportBrain(ctx.dispatchScratch(), ctx.io(), ctx.brain.cfg, brain_file_path) catch |err| {
         return runtimeError(ctx, out_error, "embedded brain export failed", err);
     };
     _ = ctx.brain.recordSimpleExperienceEvent("Brain.Exported", .system, brain_file_path) catch {};
@@ -417,6 +515,7 @@ pub export fn affective_core_embedded_import_brain(
     const ctx = handle orelse return runtimeFailure(null, out_error, "missing embedded AffectiveCore handle");
     if (tryAcquireDispatch(ctx, out_data, out_error)) |status| return status;
     defer releaseDispatch(ctx);
+    defer ctx.resetDispatchScratch();
     const brain_file_path = embedded_config.requiredSlice(brain_file_path_ptr, brain_file_path_len) catch {
         return runtimeFailure(ctx, out_error, "missing brain import file path");
     };
@@ -440,9 +539,9 @@ pub export fn affective_core_embedded_import_brain(
     };
     const host_id = optionalNonEmptySlice(host_id_ptr, host_id_len) orelse ctx.brain.currentHostId();
     const payload = if (host_id.len > 0)
-        std.fmt.allocPrint(ctx.allocator(), "brain_id={s}; brain_root={s}; host_id={s}", .{ manifest.brain_id, brain_root, host_id }) catch ""
+        std.fmt.allocPrint(ctx.dispatchScratch(), "brain_id={s}; brain_root={s}; host_id={s}", .{ manifest.brain_id, brain_root, host_id }) catch ""
     else
-        std.fmt.allocPrint(ctx.allocator(), "brain_id={s}; brain_root={s}", .{ manifest.brain_id, brain_root }) catch "";
+        std.fmt.allocPrint(ctx.dispatchScratch(), "brain_id={s}; brain_root={s}", .{ manifest.brain_id, brain_root }) catch "";
     if (payload.len > 0) _ = ctx.brain.recordSimpleExperienceEvent("Brain.Imported", .system, payload) catch {};
     if (host_id.len > 0) _ = ctx.brain.recordSimpleExperienceEvent("Host.BindingChangedAfterImport", .host, host_id) catch {};
     const output = std.json.Stringify.valueAlloc(std.heap.page_allocator, struct { manifest: brain_container.BrainManifest }{ .manifest = manifest }, .{ .whitespace = .indent_2 }) catch |err| {
@@ -477,7 +576,7 @@ pub export fn affective_core_embedded_api_e2e(
     embedded_config.ensureParentDirs(io, cfg) catch |err| {
         return runtimeError(null, out_error, "could not create embedded e2e directories", err);
     };
-    var http_transport = HostHttpTransport.init(host_services);
+    var http_transport = HostHttpTransport.init(host_services, allocator);
     const report = embedded_e2e.runApiE2E(allocator, io, http_transport.client(), &env, cfg) catch |err| {
         return runtimeError(null, out_error, "embedded api e2e failed", err);
     };
@@ -496,37 +595,47 @@ fn syncContextBudgetFromConfig(ctx: *AffectiveCoreEmbedded, cfg: config_mod.Conf
 }
 
 pub fn reloadEmbeddedBrain(ctx: *AffectiveCoreEmbedded, brain_id: []const u8, brain_root: []const u8) !void {
-    const allocator = ctx.allocator();
+    const main_allocator = ctx.allocator();
+    const brain_allocator = ctx.brainAllocator();
+    const cfg_snapshot = try embedded_config.snapshotConfigPathsForRebind(main_allocator, ctx.brain.cfg);
     if (ctx.storage_backend) |*storage| {
-        storage.deinit(allocator);
+        storage.deinit(brain_allocator);
         ctx.storage_backend = null;
     }
+    _ = ctx.brain_arena.reset(.free_all);
     ctx.host_effects = null;
     ctx.event_queue.clearRetainingCapacity();
     ctx.pending_camera_permission = null;
 
-    var cfg = try embedded_config.rebindConfigBrainRoot(allocator, ctx.brain.cfg, brain_id, brain_root);
+    var cfg = try embedded_config.rebindConfigBrainRoot(brain_allocator, cfg_snapshot, brain_id, brain_root);
     var local_filesystem = files.LocalFileSystem{};
-    try config_mod.provisionBrainConfigFiles(allocator, local_filesystem.filesystem(), ctx.io(), cfg);
-    cfg = try cfg.loadForBrain(allocator, local_filesystem.filesystem(), ctx.io());
+    try config_mod.provisionBrainConfigFiles(brain_allocator, local_filesystem.filesystem(), ctx.io(), cfg);
+    cfg = try cfg.loadForBrain(brain_allocator, local_filesystem.filesystem(), ctx.io());
     try embedded_config.ensureParentDirs(ctx.io(), cfg);
 
     const embedded_brain_host = try host_profiles.initEmbeddedMacosBrainHost(
-        allocator,
+        brain_allocator,
         ctx.io(),
         ctx.http_transport.client(),
         cfg,
         ctx.host_capabilities,
+        hostSystemSensesHttpClient(&ctx.http_transport),
+        ctx.http_transport.services.http_post_json != null,
     );
     ctx.brain = embedded_brain_host.brain;
+    embedded_brain_host.chat_service.parse_failure_brain = &ctx.brain;
+    embedded_brain_host.autonomy_planner.parse_failure_brain = &ctx.brain;
     ctx.llm_provider_clients = embedded_brain_host.llm_provider_clients;
     brain_mod.wireLlmStatsRecorder(&ctx.brain, ctx.llm_provider_clients);
     ctx.storage_backend = embedded_brain_host.storage;
     ctx.host_effects = embedded_brain_host.effects;
+    if (ctx.host_capabilities.facial_expression_output) {
+        _ = try ctx.brain.refreshFacialExpressionCatalog();
+    }
     ctx.brain_initialized = true;
     syncContextBudgetFromConfig(ctx, cfg, ctx.context_budget.max_event_text_bytes);
 
-    const payload = try std.fmt.allocPrint(allocator, "brain_id={s}; brain_root={s}", .{ brain_id, brain_root });
+    const payload = try std.fmt.allocPrint(brain_allocator, "brain_id={s}; brain_root={s}", .{ brain_id, brain_root });
     _ = try ctx.brain.recordSimpleExperienceEvent("Brain.RuntimeReloaded", .system, payload);
 }
 
@@ -601,7 +710,16 @@ fn protocolError(
     code: []const u8,
     message: []const u8,
 ) c_int {
-    const output = embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, code, message, false, embedded_dispatch.emptyBudget(ctx)) catch {
+    var timings = if (ctx.brain.request_timings.active)
+        embedded_dispatch.finishDispatchTimings(ctx) catch {
+            return runtimeFailure(ctx, null, "could not finish request timings for protocol error");
+        }
+    else
+        request_timings.emptyReport(std.heap.page_allocator, request_id) catch {
+            return runtimeFailure(ctx, null, "could not encode embedded protocol error");
+        };
+    defer request_timings.deinitReport(std.heap.page_allocator, &timings);
+    const output = embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, code, message, false, embedded_dispatch.emptyBudget(ctx), timings, ctx.brain.dispatchContextReportView()) catch {
         return runtimeFailure(ctx, null, "could not encode embedded protocol error");
     };
     return success(ctx, out_data, output);

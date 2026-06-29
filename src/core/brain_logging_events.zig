@@ -14,7 +14,6 @@ const store_mod = ports.store;
 const graph_store = ports.graph_store;
 const intent_mod = ports.intent;
 const openai = ports.openai;
-const greeting_client = ports.greeting;
 const speech_mod = ports.speech;
 const chat_mod = ports.chat;
 const skills_mod = ports.skills;
@@ -43,8 +42,12 @@ const process = ports.process;
 const helpers = @import("brain_helpers.zig");
 const error_descriptions = @import("error_descriptions.zig");
 const context_composition = @import("context_composition.zig");
+const context_dispatch_report = @import("context_dispatch_report.zig");
+const context_tokens = @import("context_tokens.zig");
 const brain_context_stats = @import("brain_context_stats.zig");
 const random_provider_client = @import("../api/random_provider_client.zig");
+const request_timings = @import("request_timings.zig");
+const operation_ids = @import("operation_ids.zig");
 
 const Brain = brain_mod.Brain;
 const BrainDeps = brain_mod.BrainDeps;
@@ -70,7 +73,7 @@ pub fn logUserUtterance(self: *Brain, title: []const u8, text: []const u8) !void
 
 pub fn logCapabilityRequested(self: *Brain, proposal: chat_mod.ActionProposal) !void {
     const body = try formatActionPressure(self, proposal);
-    try recordExperienceLogEvent(self, .{
+    _ = try recordExperienceLogEvent(self, .{
         .kind = .capability_requested,
         .title = @tagName(proposal.action),
         .body = body,
@@ -83,9 +86,19 @@ pub fn logCapabilityRequested(self: *Brain, proposal: chat_mod.ActionProposal) !
     });
 }
 
+pub fn logActionSuppressed(self: *Brain, action: chat_mod.ActionProposalType, reason: []const u8) !void {
+    const body = try std.fmt.allocPrint(self.allocator, "action_suppressed: {s}", .{reason});
+    defer self.allocator.free(body);
+    try appendEventLog(self, "state", skills_mod.name(action), body);
+}
+
+pub fn logAutonomyStatus(self: *Brain, title: []const u8, body: []const u8) !void {
+    try appendEventLog(self, "state", title, body);
+}
+
 pub fn logCapabilityResult(self: *Brain, proposal: chat_mod.ActionProposal, result: []const u8) !void {
     const formatted_action_pressure = try formatActionPressure(self, proposal);
-    try recordExperienceLogEvent(self, .{
+    _ = try recordExperienceLogEvent(self, .{
         .kind = .capability_result,
         .title = @tagName(proposal.action),
         .body = result,
@@ -103,7 +116,7 @@ pub fn logCapabilityResult(self: *Brain, proposal: chat_mod.ActionProposal, resu
 }
 
 pub fn logMaintenanceCapabilityRequested(self: *Brain, command: []const u8) !void {
-    try recordExperienceLogEvent(self, .{
+    _ = try recordExperienceLogEvent(self, .{
         .kind = .capability_requested,
         .source = "maintenance",
         .title = "maintenance",
@@ -119,7 +132,7 @@ pub fn logMaintenanceCapabilityRequested(self: *Brain, command: []const u8) !voi
 
 pub fn logMaintenanceCapabilityResult(self: *Brain, command: []const u8, result: []const u8) !void {
     const body = try std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ command, result });
-    try recordExperienceLogEvent(self, .{
+    _ = try recordExperienceLogEvent(self, .{
         .kind = .capability_result,
         .source = "maintenance",
         .title = "maintenance",
@@ -234,9 +247,59 @@ pub fn recordProcessGoalComposition(
     try maybeFlushContextStats(self);
 }
 
+pub fn clearDispatchContextReport(self: *Brain) void {
+    if (self.dispatch_context_report) |*report| {
+        report.deinit(self.allocator);
+        self.dispatch_context_report = null;
+    }
+}
+
+pub fn dispatchContextReportView(self: *Brain) ?context_dispatch_report.Report {
+    if (self.dispatch_context_report) |*report| return report.envelopeView();
+    return null;
+}
+
+fn dispatchContextIdLabel(self: *Brain) []const u8 {
+    if (self.request_timings.active and self.request_timings.dispatch_id.len > 0) {
+        return self.request_timings.dispatch_id;
+    }
+    return dispatchIdLabel(self);
+}
+
+pub fn setDispatchContextFromComposition(
+    self: *Brain,
+    report: context_composition.ContextCompositionReport,
+    stimulus_kind: ?chat_mod.StimulusKind,
+    budget_exceeded: bool,
+) !void {
+    if (!std.mem.eql(u8, report.operation, "conversation_chat")) return;
+    clearDispatchContextReport(self);
+    const dispatch_id = dispatchContextIdLabel(self);
+    self.dispatch_context_report = try context_dispatch_report.ownedFromComposition(
+        self.allocator,
+        dispatch_id,
+        stimulus_kind,
+        self.cfg.capacity.chat_context_tokens_max,
+        budget_exceeded,
+        report,
+    );
+    try ensureContextStatsLoaded(self);
+    try brain_context_stats.recordLastDispatch(
+        &self.context_stats,
+        dispatch_id,
+        report,
+        budget_exceeded,
+        self.now_seconds,
+    );
+    try maybeFlushContextStats(self);
+}
+
 pub fn traceContextComposition(self: *Brain, report: context_composition.ContextCompositionReport) !void {
     try ensureContextStatsLoaded(self);
     try brain_context_stats.recordComposition(&self.context_stats, report, self.now_seconds);
+    if (std.mem.eql(u8, report.operation, "conversation_chat")) {
+        try setDispatchContextFromComposition(self, report, self.conversation_turn_stimulus_kind, false);
+    }
     try maybeFlushContextStats(self);
     const brain_ptr: *anyopaque = @ptrCast(self);
     const dispatch_id = self.current_dispatch_request_id orelse "(none)";
@@ -245,7 +308,17 @@ pub fn traceContextComposition(self: *Brain, report: context_composition.Context
 
 fn recordLlmCompletionCallback(ctx: *anyopaque, record: brain_context_stats.LlmCompletionRecord) void {
     const brain: *Brain = @ptrCast(@alignCast(ctx));
-    brain.recordLlmCompletion(record) catch |err| {
+    var owned_call_id: ?[]const u8 = null;
+    defer if (owned_call_id) |id| brain.allocator.free(id);
+    var effective = record;
+    if (brain.request_timings.active) {
+        owned_call_id = brain.requestTimingsAllocLlmCallId() catch |err| {
+            brain.traceError("request_timings.llm_call_id", err);
+            return;
+        };
+        effective.llm_call_id = owned_call_id;
+    }
+    brain.recordLlmCompletion(effective) catch |err| {
         brain.traceError("llm_stats.record", err);
     };
 }
@@ -268,6 +341,177 @@ pub fn recordLlmCompletion(self: *Brain, record: brain_context_stats.LlmCompleti
     try ensureContextStatsLoaded(self);
     try brain_context_stats.recordLlmCompletion(&self.context_stats, record, self.now_seconds);
     try maybeFlushContextStats(self);
+    if (!self.request_timings.active) return;
+    const span_id = try self.request_timings.allocSpanId(self.allocator);
+    const outcome: request_timings.Outcome = switch (record.outcome) {
+        .success => .success,
+        .provider_error => .provider_error,
+        .validation_error => .validation_error,
+    };
+    const process_id = if (self.active_process) |active_process| try self.allocator.dupe(u8, active_process.id) else null;
+    const step_ctx = currentTimingStepContext(self);
+    const step_id = if (step_ctx.step_id) |id| try self.allocator.dupe(u8, id) else null;
+    try self.request_timings.record(self.allocator, .{
+        .span_id = span_id,
+        .kind = try self.allocator.dupe(u8, "llm"),
+        .label = try self.allocator.dupe(u8, record.subsystem),
+        .duration_ms = @intCast(record.latency_ms),
+        .dispatch_id = try duplicateTimingString(self.allocator, currentTimingDispatchId(self)),
+        .activity_id = try duplicateTimingString(self.allocator, currentTimingActivityId(self)),
+        .process_id = process_id,
+        .step_id = step_id,
+        .step_index = step_ctx.step_index,
+        .llm_call_id = if (record.llm_call_id) |id| try self.allocator.dupe(u8, id) else null,
+        .subsystem = try self.allocator.dupe(u8, record.subsystem),
+        .provider = try self.allocator.dupe(u8, record.provider),
+        .model = try self.allocator.dupe(u8, record.model),
+        .outcome = outcome,
+        .request_bytes = record.request_bytes,
+        .response_bytes = record.response_bytes,
+        .estimated_prompt_tokens = context_tokens.estimateTokensFromByteLength(record.request_bytes),
+        .effort_tier = if (record.effort_tier) |tier| try self.allocator.dupe(u8, tier) else null,
+        .reasoning_effort = if (record.reasoning_effort) |effort| try self.allocator.dupe(u8, effort) else null,
+    });
+}
+
+pub const MissingIoForRequestTimings = error{MissingIoForRequestTimings};
+
+pub fn beginRequestTimings(self: *Brain, dispatch_id: []const u8) !void {
+    const io = self.deps.io orelse return error.MissingIoForRequestTimings;
+    clearDispatchContextReport(self);
+    try self.request_timings.begin(self.allocator, io, dispatch_id);
+}
+
+fn llmSpanRollup(spans: []const request_timings.Span) struct { count: usize, request_bytes: usize, prompt_tokens: usize } {
+    var count: usize = 0;
+    var request_bytes: usize = 0;
+    var prompt_tokens: usize = 0;
+    for (spans) |span| {
+        if (!std.mem.eql(u8, span.kind, "llm")) continue;
+        count += 1;
+        if (span.request_bytes) |bytes| request_bytes += bytes;
+        if (span.estimated_prompt_tokens) |tokens| prompt_tokens += tokens;
+    }
+    return .{ .count = count, .request_bytes = request_bytes, .prompt_tokens = prompt_tokens };
+}
+
+fn addDispatchSummarySpan(self: *Brain, io: std.Io) !void {
+    if (!self.request_timings.active) return;
+    const rollup = llmSpanRollup(self.request_timings.spans.items);
+    const context_tokens_value = if (self.dispatch_context_report) |report| report.user_prompt_tokens else 0;
+    if (self.dispatch_context_report) |*report| report.llm_call_count = rollup.count;
+    try self.request_timings.record(self.allocator, .{
+        .span_id = try self.request_timings.allocSpanId(self.allocator),
+        .kind = try self.allocator.dupe(u8, "dispatch_summary"),
+        .label = try self.allocator.dupe(u8, "context_and_llm"),
+        .duration_ms = std.Io.Clock.real.now(io).toMilliseconds() - self.request_timings.started_ms,
+        .dispatch_id = try duplicateTimingString(self.allocator, currentTimingDispatchId(self)),
+        .activity_id = try duplicateTimingString(self.allocator, currentTimingActivityId(self)),
+        .llm_call_count = rollup.count,
+        .total_request_bytes = rollup.request_bytes,
+        .total_prompt_tokens = rollup.prompt_tokens,
+        .context_user_prompt_tokens = if (context_tokens_value > 0) context_tokens_value else null,
+    });
+}
+
+pub fn finishRequestTimings(self: *Brain) !request_timings.Report {
+    const io = self.deps.io orelse return error.MissingIoForRequestTimings;
+    try addDispatchSummarySpan(self, io);
+    return self.request_timings.finish(self.allocator, io);
+}
+
+pub fn resetRequestTimings(self: *Brain) void {
+    self.request_timings.reset(self.allocator);
+}
+
+pub fn requestTimingsAllocSpanId(self: *Brain) ![]const u8 {
+    return self.request_timings.allocSpanId(self.allocator);
+}
+
+pub fn requestTimingsAllocLlmCallId(self: *Brain) ![]const u8 {
+    return self.request_timings.allocLlmCallId(self.allocator);
+}
+
+pub fn requestTimingsAllocOperationId(self: *Brain, prefix: []const u8) ![]const u8 {
+    return operation_ids.allocOperationId(self, prefix);
+}
+
+pub fn currentTimingDispatchId(self: *Brain) ?[]const u8 {
+    if (self.request_timings.active and self.request_timings.dispatch_id.len > 0) {
+        return self.request_timings.dispatch_id;
+    }
+    return self.current_dispatch_request_id;
+}
+
+pub fn currentTimingActivityId(self: *Brain) ?[]const u8 {
+    if (self.active_activity) |active| return active.id;
+    return null;
+}
+
+pub fn currentTimingProcessId(self: *Brain) ?[]const u8 {
+    if (self.active_process) |active_process| return active_process.id;
+    return null;
+}
+
+pub fn currentTimingStepContext(self: *Brain) struct { step_id: ?[]const u8, step_index: ?usize } {
+    const active_process = self.active_process orelse return .{ .step_id = null, .step_index = null };
+    const step_id: ?[]const u8 = if (active_process.step_index < active_process.step_ids.len)
+        active_process.step_ids[active_process.step_index]
+    else
+        null;
+    return .{ .step_id = step_id, .step_index = active_process.step_index };
+}
+
+pub fn recordRequestSpan(self: *Brain, span: request_timings.Span) !void {
+    try self.request_timings.record(self.allocator, span);
+}
+
+pub fn recordComposeTimingSpan(self: *Brain, label: []const u8, started_ms: i64) !void {
+    if (!self.request_timings.active) return;
+    const io = self.deps.io orelse return;
+    const duration_ms = std.Io.Clock.real.now(io).toMilliseconds() - started_ms;
+    try self.recordRequestSpan(.{
+        .span_id = try self.requestTimingsAllocSpanId(),
+        .kind = try self.allocator.dupe(u8, "compose"),
+        .label = try self.allocator.dupe(u8, label),
+        .duration_ms = duration_ms,
+        .dispatch_id = try self.ownedTimingDispatchId(),
+        .activity_id = try self.ownedTimingActivityId(),
+    });
+}
+
+pub fn traceConversationContextBudgetExceeded(
+    self: *Brain,
+    user_prompt_tokens: usize,
+    budget_max_tokens: usize,
+) void {
+    const dispatch_id = dispatchContextIdLabel(self);
+    self.outputFmt(
+        "TRACE now={d} dispatch_id={s} stage=context.budget_exceeded tokens={d} max={d}\n",
+        .{ self.now_seconds, dispatch_id, user_prompt_tokens, budget_max_tokens },
+    );
+    if (self.dispatch_context_report) |report| {
+        for (report.top_sections, 0..) |section, index| {
+            if (index >= 3) break;
+            self.outputFmt(
+                "TRACE now={d} dispatch_id={s} stage=context.budget_exceeded section={s} bytes={d}\n",
+                .{ self.now_seconds, dispatch_id, section.name, section.bytes },
+            );
+        }
+    }
+}
+
+fn duplicateTimingString(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+    if (value) |actual| return try allocator.dupe(u8, actual);
+    return null;
+}
+
+pub fn ownedTimingDispatchId(self: *Brain) !?[]const u8 {
+    return duplicateTimingString(self.allocator, currentTimingDispatchId(self));
+}
+
+pub fn ownedTimingActivityId(self: *Brain) !?[]const u8 {
+    return duplicateTimingString(self.allocator, currentTimingActivityId(self));
 }
 
 fn noopTraceWrite(_: i64, _: []const u8) void {}
@@ -356,7 +600,7 @@ pub fn outputRecognitionResult(self: *Brain, result: identity.IdentityResult) vo
 }
 
 pub fn appendEventLog(self: *Brain, kind: []const u8, title: []const u8, body: []const u8) !void {
-    try recordExperienceLogEvent(self, .{
+    _ = try recordExperienceLogEvent(self, .{
         .kind = .developer_log,
         .title = title,
         .body = body,
@@ -366,7 +610,7 @@ pub fn appendEventLog(self: *Brain, kind: []const u8, title: []const u8, body: [
     });
 }
 
-pub fn recordExperienceLogEvent(self: *Brain, event: schema.ExperienceLogEvent) anyerror!void {
+pub fn recordExperienceLogEvent(self: *Brain, event: schema.ExperienceLogEvent) anyerror![]const u8 {
     const now = try self.timestampNow();
     const existing_events = self.deps.store.loadExperienceEvents(self.allocator) catch &.{};
     const event_id = try std.fmt.allocPrint(self.allocator, "event_{d}_{d}_{s}_{d}_{d}", .{ self.now_seconds, existing_events.len, @tagName(event.kind), event.title.len, event.body.len });
@@ -407,18 +651,19 @@ pub fn recordExperienceLogEvent(self: *Brain, event: schema.ExperienceLogEvent) 
     try superegoReader(self, full_event);
     try egoReader(self, full_event);
     try memoryFormationReader(self, full_event);
+    return event_id;
 }
 
 pub fn recordIdMonitorEvent(self: *Brain, event: schema.ExperienceLogEvent) !void {
     if (event.monitor_id == null) return error.MissingIdMonitorId;
     if (event.title.len == 0 or event.body.len == 0) return error.InvalidIdMonitorEvent;
     if (!try self.id_monitor_manager.shouldEmit(self.allocator, self.now_seconds, event, @intCast(self.cfg.id_monitor_external_restart_cooldown_seconds))) return;
-    try recordExperienceLogEvent(self, event);
+    _ = try recordExperienceLogEvent(self, event);
 }
 
 pub fn recordIdMonitorCrashEvent(self: *Brain, monitor_id: []const u8, err: anyerror) !void {
     const body = try std.fmt.allocPrint(self.allocator, "Id monitor {s} failed: {s}", .{ monitor_id, @errorName(err) });
-    try recordExperienceLogEvent(self, .{
+    _ = try recordExperienceLogEvent(self, .{
         .kind = .system,
         .source = "id_monitor",
         .title = "id_monitor_crash",
@@ -444,7 +689,7 @@ pub fn recordMemoryCandidateEvent(
     derived_memory_ids: []const []const u8,
     tags: []const []const u8,
 ) !void {
-    try recordExperienceLogEvent(self, .{
+    _ = try recordExperienceLogEvent(self, .{
         .kind = event_kind,
         .source = event_source,
         .title = title,
@@ -494,7 +739,7 @@ pub fn superegoReader(self: *Brain, event: schema.ExperienceLogEvent) anyerror!v
     if (event.forgotten_memory_id) |memory_id| {
         if (try psycheEffectiveRank(self, .superego, "superego_memory_boundary", event, .notice) < id_monitor.severityRank(.notice)) return;
         const body = try std.fmt.allocPrint(self.allocator, "Memory {s} was forgotten. Keep this as audit-only and do not form recallable memory from the forgetting itself.", .{memory_id});
-        try recordExperienceLogEvent(self, .{
+        _ = try recordExperienceLogEvent(self, .{
             .kind = .psyche,
             .source = "superego",
             .title = "superego_memory_boundary",
@@ -519,7 +764,7 @@ pub fn superegoReader(self: *Brain, event: schema.ExperienceLogEvent) anyerror!v
         "Superego noticed {s} severity event from {s} with effective significance {d}: {s}. Preserve restraint and do not let this event execute actions directly.",
         .{ @tagName(severity), event.source, effective_rank, event.body },
     );
-    try recordExperienceLogEvent(self, .{
+    _ = try recordExperienceLogEvent(self, .{
         .kind = .psyche,
         .source = "superego",
         .title = "superego_concern",
@@ -546,7 +791,7 @@ pub fn egoReader(self: *Brain, event: schema.ExperienceLogEvent) anyerror!void {
         "Ego marked attention candidate from {s} with effective significance {d}: {s}",
         .{ event.source, effective_rank, if (event.interpretation.len > 0) event.interpretation else event.body },
     );
-    try recordExperienceLogEvent(self, .{
+    _ = try recordExperienceLogEvent(self, .{
         .kind = .psyche,
         .source = "ego",
         .title = "ego_attention_candidate",
@@ -612,6 +857,7 @@ fn maybeRecordMemoryCandidate(
         .kind = @tagName(candidate.kind),
         .confidence = candidate.confidence,
         .salience = candidate.salience,
+        .source_event_ids = parents,
         .tags = candidate.tags,
     }, .{ .whitespace = .minified });
     _ = try actor_context.makeExperienceEvent(.memory, "memory.candidate", payload, parents, .episode);

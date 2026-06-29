@@ -3,6 +3,7 @@ const brain_mod = @import("brain.zig");
 const belief_updates = @import("belief_updates.zig");
 const capability_registry = @import("capability_registry.zig");
 const experience_kinds = @import("experience_kinds.zig");
+const host_capability_activation = @import("host_capability_activation.zig");
 const learning = @import("learning.zig");
 const ports = @import("ports.zig");
 const schema = ports.schema;
@@ -58,8 +59,32 @@ pub fn markMailboxRead(self: *Brain, mailbox_id: []const u8) !schema.MailboxItem
     return item;
 }
 
-pub fn recordManifestStatuses(self: *Brain, host_id: []const u8, capability_ids: []const []const u8) !void {
+pub const ManifestStatusTiming = struct {
+    capability_id: []const u8,
+    duration_ms: i64,
+    span_id: []const u8,
+    operation_id: []const u8,
+};
+
+fn manifestTimingStartMs(self: *Brain) i64 {
+    const io = self.deps.io orelse return 0;
+    return std.Io.Clock.real.now(io).toMilliseconds();
+}
+
+pub fn recordManifestStatuses(self: *Brain, host_id: []const u8, capability_ids: []const []const u8) ![]ManifestStatusTiming {
+    var timings = std.ArrayList(ManifestStatusTiming).empty;
+    errdefer {
+        for (timings.items) |entry| {
+            self.allocator.free(entry.capability_id);
+            self.allocator.free(entry.span_id);
+            self.allocator.free(entry.operation_id);
+        }
+        timings.deinit(self.allocator);
+    }
+    try self.deps.store.beginDeferredPersist();
+    errdefer self.deps.store.endDeferredPersist() catch @panic("manifest deferred persist end failed");
     for (capability_ids) |id| {
+        const started_ms = manifestTimingStartMs(self);
         const canonical = capability_registry.canonicalId(id);
         try self.recordCapabilityStatus(.{
             .capability_id = canonical,
@@ -70,7 +95,35 @@ pub fn recordManifestStatuses(self: *Brain, host_id: []const u8, capability_ids:
             .reliability = 0.70,
             .updated_at_ms = self.now_seconds * 1000,
         });
+        const duration_ms = manifestTimingStartMs(self) - started_ms;
+        const capability_id = try self.allocator.dupe(u8, canonical);
+        const span_id = try self.requestTimingsAllocSpanId();
+        const operation_id = try self.requestTimingsAllocOperationId("manifest");
+        defer self.allocator.free(operation_id);
+        try self.recordRequestSpan(.{
+            .span_id = span_id,
+            .kind = try self.allocator.dupe(u8, "manifest"),
+            .label = try self.allocator.dupe(u8, canonical),
+            .duration_ms = duration_ms,
+            .dispatch_id = try self.ownedTimingDispatchId(),
+            .activity_id = try self.ownedTimingActivityId(),
+            .operation_id = try self.allocator.dupe(u8, operation_id),
+            .capability_id = try self.allocator.dupe(u8, canonical),
+        });
+        try timings.append(self.allocator, .{
+            .capability_id = capability_id,
+            .duration_ms = duration_ms,
+            .span_id = try self.allocator.dupe(u8, span_id),
+            .operation_id = try self.allocator.dupe(u8, operation_id),
+        });
+        logManifestStatusTiming(canonical, duration_ms);
     }
+    try self.deps.store.endDeferredPersist();
+    return try timings.toOwnedSlice(self.allocator);
+}
+
+fn logManifestStatusTiming(capability_id: []const u8, duration_ms: i64) void {
+    std.debug.print("[core-load]   manifest {s}: {d}ms\n", .{ capability_id, duration_ms });
 }
 
 pub fn recordCapabilityResult(self: *Brain, request: schema.CapabilityRequest, state: schema.CapabilityRequestState, output: []const u8, error_message: []const u8) !schema.CapabilityResult {
@@ -107,6 +160,7 @@ pub fn recordCapabilityResult(self: *Brain, request: schema.CapabilityRequest, s
         .completed_at_ms = self.now_seconds * 1000,
     };
     try self.deps.store.addCapabilityResult(result);
+    try host_capability_activation.recordCapabilityActivationOutcome(self, result);
     try self.publishRuntimeLearningCapabilityRecorded(.{
         .result = result,
         .source_event_ids = request.causal_parent_ids,

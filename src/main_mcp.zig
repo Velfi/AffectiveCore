@@ -111,8 +111,10 @@ const Server = struct {
         if (std.mem.eql(u8, operation, "connect")) return self.connect();
         if (std.mem.eql(u8, operation, "host_attach")) return self.hostAttach(args);
         if (std.mem.eql(u8, operation, "host_capability_manifest")) return self.hostCapabilityManifest(args);
+        if (std.mem.eql(u8, operation, "refresh_facial_expression_catalog")) return self.refreshFacialExpressionCatalog();
         if (std.mem.eql(u8, operation, "send_experience_event")) return self.sendExperienceEvent(args);
         if (std.mem.eql(u8, operation, "user_text")) return self.userText(try mcp_utils.requireString(args, "text"), mcp_utils.getString(args, "request_id"));
+        if (std.mem.eql(u8, operation, "emoji_reaction")) return self.emojiReaction(args);
         if (std.mem.eql(u8, operation, "request_dream_time")) return self.requestDreamTime(mcp_utils.getString(args, "text"));
         if (std.mem.eql(u8, operation, "brain_mode")) return self.brainMode();
         if (std.mem.eql(u8, operation, "read_models_snapshot")) return self.readModelsSnapshot();
@@ -120,6 +122,7 @@ const Server = struct {
         if (std.mem.eql(u8, operation, "mailbox_list")) return self.mailboxList();
         if (std.mem.eql(u8, operation, "mailbox_mark_read")) return self.mailboxMarkRead(try mcp_utils.requireString(args, "mailbox_id"));
         if (std.mem.eql(u8, operation, "capability_status")) return self.capabilityStatus(args);
+        if (std.mem.eql(u8, operation, "capability_status_batch")) return self.capabilityStatusBatch(args);
         if (std.mem.eql(u8, operation, "export_brain")) return self.exportBrain(try mcp_utils.requireString(args, "brain_file_path"));
         if (std.mem.eql(u8, operation, "import_brain")) return self.importBrain(args);
         return error.UnknownOperation;
@@ -128,6 +131,7 @@ const Server = struct {
     fn connect(self: *Server) ![]const u8 {
         const info = try brain_container.inspectBrain(self.allocator, self.io, self.brain.cfg);
         _ = try self.brain.recordSimpleExperienceEvent("MCP.Connected", .host, "connect");
+        try self.brain.refreshPersonaDirectiveFromStore();
         return std.json.Stringify.valueAlloc(self.allocator, struct { brain: brain_container.BrainIntrospection }{ .brain = info }, .{ .whitespace = .indent_2 });
     }
 
@@ -152,8 +156,14 @@ const Server = struct {
     fn hostCapabilityManifest(self: *Server, args: std.json.Value) ![]const u8 {
         const host_id = mcp_utils.getString(args, "host_id") orelse "mcp";
         const ids = try mcp_utils.getStringArray(self.allocator, args, "capability_ids");
-        try self.brain.recordManifestStatuses(host_id, ids);
+        _ = try self.brain.recordManifestStatuses(host_id, ids);
         return std.json.Stringify.valueAlloc(self.allocator, struct { capability_count: usize }{ .capability_count = ids.len }, .{ .whitespace = .indent_2 });
+    }
+
+    fn refreshFacialExpressionCatalog(self: *Server) ![]const u8 {
+        const brain_facial_expression = @import("core/brain_facial_expression.zig");
+        const catalog = try self.brain.refreshFacialExpressionCatalog();
+        return std.json.Stringify.valueAlloc(self.allocator, struct { catalog: brain_facial_expression.FacialExpressionCatalogSnapshot }{ .catalog = catalog }, .{ .whitespace = .indent_2 });
     }
 
     fn sendExperienceEvent(self: *Server, args: std.json.Value) ![]const u8 {
@@ -270,6 +280,39 @@ const Server = struct {
         return std.json.Stringify.valueAlloc(self.allocator, struct { status: schema.CapabilityStatus }{ .status = status }, .{ .whitespace = .indent_2 });
     }
 
+    fn capabilityStatusBatch(self: *Server, args: std.json.Value) ![]const u8 {
+        const statuses_value = if (args == .object) args.object.get("statuses") orelse return error.MissingCapabilityStatuses else return error.MissingCapabilityStatuses;
+        if (statuses_value != .array) return error.ExpectedCapabilityStatusArray;
+        try self.brain.deps.store.beginDeferredPersist();
+        errdefer self.brain.deps.store.endDeferredPersist() catch @panic("capability status batch deferred persist end failed");
+        for (statuses_value.array.items) |item| {
+            if (item != .object) return error.ExpectedCapabilityStatusObject;
+            const object = item.object;
+            const capability_id = object.get("capability_id") orelse return error.MissingRequiredString;
+            if (capability_id != .string) return error.MissingRequiredString;
+            const status: schema.CapabilityStatus = .{
+                .capability_id = capability_id.string,
+                .host_id = stringFromObject(object, "host_id") orelse "mcp",
+                .permission = permissionFromString(stringFromObject(object, "permission") orelse "unknown"),
+                .availability = availabilityFromString(stringFromObject(object, "availability") orelse "unavailable"),
+                .quality = @floatCast(numberFromObject(object, "quality") orelse 0.0),
+                .reliability = @floatCast(numberFromObject(object, "reliability") orelse 0.0),
+                .cost = @floatCast(numberFromObject(object, "cost") orelse 0.0),
+                .latency_ms = blk: {
+                    const value = integerFromObject(object, "latency_ms") orelse break :blk 0;
+                    if (value < 0) break :blk 0;
+                    break :blk @intCast(value);
+                },
+                .risk = @floatCast(numberFromObject(object, "risk") orelse 0.0),
+                .unavailable_reason = stringFromObject(object, "unavailable_reason") orelse "",
+                .updated_at_ms = self.brain.now_seconds * 1000,
+            };
+            try self.brain.recordCapabilityStatus(status);
+        }
+        try self.brain.deps.store.endDeferredPersist();
+        return std.json.Stringify.valueAlloc(self.allocator, struct { capability_count: usize }{ .capability_count = statuses_value.array.items.len }, .{ .whitespace = .indent_2 });
+    }
+
     fn exportBrain(self: *Server, path: []const u8) ![]const u8 {
         const manifest = try brain_container.exportBrain(self.allocator, self.io, self.brain.cfg, path);
         _ = try self.brain.recordSimpleExperienceEvent("Brain.Exported", .system, path);
@@ -309,6 +352,18 @@ const Server = struct {
             try input_mod.HeardSpeech.typed(self.allocator, text),
             .{ .request_id = dispatch_id },
         );
+        return std.json.Stringify.valueAlloc(self.allocator, result, .{ .whitespace = .indent_2 });
+    }
+
+    fn emojiReaction(self: *Server, args: std.json.Value) ![]const u8 {
+        const emoji = try mcp_utils.requireString(args, "emoji");
+        const utterance_text = try mcp_utils.requireString(args, "utterance_text");
+        const result = app_core.userTextOutcome(try self.brain.handleEmojiReaction(.{
+            .emoji = emoji,
+            .utterance_text = utterance_text,
+            .speaker_label = mcp_utils.getString(args, "speaker_label") orelse "",
+            .utterance_event_id = mcp_utils.getString(args, "utterance_event_id") orelse "",
+        }));
         return std.json.Stringify.valueAlloc(self.allocator, result, .{ .whitespace = .indent_2 });
     }
 
@@ -396,6 +451,30 @@ fn argValue(args: std.json.Value, key: []const u8) ?std.json.Value {
     return args.object.get(key);
 }
 
+fn stringFromObject(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = object.get(key) orelse return null;
+    if (value != .string) return null;
+    return value.string;
+}
+
+fn numberFromObject(object: std.json.ObjectMap, key: []const u8) ?f64 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .float => value.float,
+        .integer => @floatFromInt(value.integer),
+        else => null,
+    };
+}
+
+fn integerFromObject(object: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .integer => value.integer,
+        .float => @intFromFloat(value.float),
+        else => null,
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
@@ -475,6 +554,8 @@ fn parseCapacityPartial(value: std.json.Value) !config_mod.CapacityConfigPartial
         .focus_slots_max = usizeField(object.get("focus_slots_max")),
         .memory_selected_max = usizeField(object.get("memory_selected_max")),
         .memory_prefilter_max = usizeField(object.get("memory_prefilter_max")),
+        .memory_snippet_max_bytes = usizeField(object.get("memory_snippet_max_bytes")),
+        .memory_context_bytes_max = usizeField(object.get("memory_context_bytes_max")),
         .candidate_actions_max = usizeField(object.get("candidate_actions_max")),
         .open_loops_soft_max = usizeField(object.get("open_loops_soft_max")),
         .conversation_summaries_in_context_max = usizeField(object.get("conversation_summaries_in_context_max")),

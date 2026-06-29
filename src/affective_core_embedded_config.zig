@@ -97,6 +97,27 @@ pub fn rebindConfigBrainRoot(
     return next;
 }
 
+/// Copies path fields needed by `rebindConfigBrainRoot` onto `allocator` so brain arena reset can precede reload.
+pub fn snapshotConfigPathsForRebind(allocator: std.mem.Allocator, cfg: config_mod.Config) !config_mod.Config {
+    var next = cfg;
+    next.brain_id = try allocator.dupe(u8, cfg.brain_id);
+    next.brain_root = try allocator.dupe(u8, cfg.brain_root);
+    next.memory_path = try allocator.dupe(u8, cfg.memory_path);
+    next.graph_path = try allocator.dupe(u8, cfg.graph_path);
+    next.seed_path = try allocator.dupe(u8, cfg.seed_path);
+    next.maintenance_schedule_path = try allocator.dupe(u8, cfg.maintenance_schedule_path);
+    next.maintenance_state_path = try allocator.dupe(u8, cfg.maintenance_state_path);
+    next.runtime_options_path = try allocator.dupe(u8, cfg.runtime_options_path);
+    next.llm_providers_path = try allocator.dupe(u8, cfg.llm_providers_path);
+    next.captures_dir = try allocator.dupe(u8, cfg.captures_dir);
+    next.capture_scratch_dir = try allocator.dupe(u8, cfg.capture_scratch_dir);
+    next.audio_input_dir = try allocator.dupe(u8, cfg.audio_input_dir);
+    next.audio_output_dir = try allocator.dupe(u8, cfg.audio_output_dir);
+    next.face_embeddings_dir = try allocator.dupe(u8, cfg.face_embeddings_dir);
+    next.image_generation_output_dir = try allocator.dupe(u8, cfg.image_generation_output_dir);
+    return next;
+}
+
 pub fn configureHostProviderRouting(allocator: std.mem.Allocator, env: *std.process.Environ.Map, raw: AffectiveCoreEmbeddedConfig) !void {
     try tryConfigureHostProviderRouting(allocator, env, raw);
 }

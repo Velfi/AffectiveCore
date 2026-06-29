@@ -97,6 +97,7 @@ pub const MemoryRecord = struct {
     text: []const u8,
     original_text: []const u8 = "",
     interpretation: []const u8 = "",
+    context_snippet: []const u8 = "",
     fulfillment_criterion: []const u8 = "",
     vector: []f32 = &.{},
     confidence: f32 = 0.70,
@@ -318,6 +319,9 @@ pub const DreamTimeRecord = struct {
     title: []const u8,
     text: []const u8,
     waking_thought: []const u8 = "",
+    persona: []const u8 = "",
+    short_term: []const u8 = "",
+    long_term: []const u8 = "",
     image_spec: DreamImageSpec = .{},
     created_at_ms: i64,
 };

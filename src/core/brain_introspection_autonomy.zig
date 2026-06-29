@@ -11,9 +11,7 @@ const ports = @import("ports.zig");
 const schema = ports.schema;
 const store_mod = ports.store;
 const graph_store = ports.graph_store;
-const intent_mod = ports.intent;
 const openai = ports.openai;
-const greeting_client = ports.greeting;
 const speech_mod = ports.speech;
 const chat_mod = ports.chat;
 const skills_mod = ports.skills;
@@ -44,6 +42,7 @@ const brain_autonomy = @import("brain_autonomy.zig");
 const capability_registry = @import("capability_registry.zig");
 const skill_tree = @import("skill_tree.zig");
 const llm_routing = @import("llm_routing.zig");
+const process_recipe_memory = @import("process_recipe_memory.zig");
 
 const Brain = brain_mod.Brain;
 const BrainDeps = brain_mod.BrainDeps;
@@ -59,6 +58,8 @@ const speech_artifact_ttl_seconds = brain_mod.speech_artifact_ttl_seconds;
 const speech_artifact_prefix = brain_mod.speech_artifact_prefix;
 const speech_audio_suffix = brain_mod.speech_audio_suffix;
 const speech_transcription_json_suffix = brain_mod.speech_transcription_json_suffix;
+
+const brain_facial_expression = @import("brain_facial_expression.zig");
 
 fn traceIntrospectionLoad(self: *Brain, name: []const u8, count: usize) void {
     self.outputFmt("TRACE now={d} stage=introspect.load.done name={s} count={d}\n", .{ self.now_seconds, name, count });
@@ -92,8 +93,79 @@ pub fn introspect(self: *Brain, query: ?[]const u8) ![]const u8 {
         .autonomy => try introspectAutonomy(self),
         .focus => try introspectFocus(self),
         .identity => try introspectIdentity(self),
-        .unknown => |topic| try std.fmt.allocPrint(self.allocator, "introspection: unknown query topic \"{s}\"\nDrill-down topics: skills, skill/<name>, skills/<group>, memory, facts, needs, capabilities, senses, autonomy, focus, identity\n", .{topic}),
+        .processes => try introspectProcesses(self),
+        .process => |goal| try introspectProcessDetail(self, goal),
+        .unknown => |topic| try std.fmt.allocPrint(self.allocator, "introspection: unknown query topic \"{s}\"\nDrill-down topics: skills, skill/<name>, skills/<group>, processes, process/<goal>, memory, facts, needs, capabilities, senses, autonomy, focus, identity\n", .{topic}),
     };
+}
+
+fn appendRelatedProcessRecipes(self: *Brain, out: *std.ArrayList(u8), recipes: []const process_recipe_memory.ProcessRecipe) !void {
+    if (recipes.len == 0) return;
+    try process_recipe_memory.appendRelatedProcessesHeader(self.allocator, out);
+    for (recipes) |recipe| try process_recipe_memory.appendRecipeLine(self.allocator, out, recipe);
+}
+
+fn appendRelatedProcessesForSkill(self: *Brain, out: *std.ArrayList(u8), id: skill_tree.SkillId) !void {
+    const recipes = try process_recipe_memory.recipesForSkill(self, id, 5);
+    defer {
+        for (recipes) |recipe| process_recipe_memory.freeRecipe(self.allocator, recipe);
+        self.allocator.free(recipes);
+    }
+    try appendRelatedProcessRecipes(self, out, recipes);
+}
+
+fn appendRelatedProcessesForGroup(self: *Brain, out: *std.ArrayList(u8), group: skill_tree.SkillGroup) !void {
+    const recipes = try process_recipe_memory.recipesForGroup(self, group, 5);
+    defer {
+        for (recipes) |recipe| process_recipe_memory.freeRecipe(self.allocator, recipe);
+        self.allocator.free(recipes);
+    }
+    try appendRelatedProcessRecipes(self, out, recipes);
+}
+
+fn introspectProcesses(self: *Brain) ![]const u8 {
+    const recipes = try process_recipe_memory.topWorkingRecipes(self, 20);
+    defer {
+        for (recipes) |recipe| process_recipe_memory.freeRecipe(self.allocator, recipe);
+        self.allocator.free(recipes);
+    }
+    var out = std.ArrayList(u8).empty;
+    try out.appendSlice(self.allocator, "introspection processes:\n");
+    if (recipes.len == 0) {
+        try out.appendSlice(self.allocator, "- none yet\n");
+    } else {
+        for (recipes) |recipe| try process_recipe_memory.appendRecipeLine(self.allocator, &out, recipe);
+    }
+    return out.toOwnedSlice(self.allocator);
+}
+
+fn introspectProcessDetail(self: *Brain, goal: []const u8) ![]const u8 {
+    const autonomy_recipe = try process_recipe_memory.lookupRecipe(self, goal, .autonomy);
+    defer if (autonomy_recipe) |recipe| process_recipe_memory.freeRecipe(self.allocator, recipe);
+    const interaction_recipe = try process_recipe_memory.lookupRecipe(self, goal, .interaction);
+    defer if (interaction_recipe) |recipe| process_recipe_memory.freeRecipe(self.allocator, recipe);
+    if (autonomy_recipe == null and interaction_recipe == null) {
+        return std.fmt.allocPrint(self.allocator, "introspection process/{s}:\n- no stored recipe\n", .{goal});
+    }
+    var out = std.ArrayList(u8).empty;
+    try out.print(self.allocator, "introspection process/{s}:\n", .{goal});
+    if (autonomy_recipe) |recipe| {
+        try out.appendSlice(self.allocator, "- autonomy: ");
+        try process_recipe_memory.appendRecipeLine(self.allocator, &out, recipe);
+        try appendRecipeFailureDetail(self.allocator, &out, recipe);
+    }
+    if (interaction_recipe) |recipe| {
+        try out.appendSlice(self.allocator, "- interaction: ");
+        try process_recipe_memory.appendRecipeLine(self.allocator, &out, recipe);
+        try appendRecipeFailureDetail(self.allocator, &out, recipe);
+    }
+    return out.toOwnedSlice(self.allocator);
+}
+
+fn appendRecipeFailureDetail(allocator: std.mem.Allocator, out: *std.ArrayList(u8), recipe: process_recipe_memory.ProcessRecipe) !void {
+    if (recipe.last_failure_detail) |detail| {
+        try out.print(allocator, "  last failure: {s}\n", .{detail});
+    }
 }
 
 fn introspectOverview(self: *Brain) ![]const u8 {
@@ -154,7 +226,7 @@ fn introspectOverview(self: *Brain) ![]const u8 {
     const autonomy_line = try autonomyOverviewLine(self);
     return std.fmt.allocPrint(
         self.allocator,
-        "introspection overview:\n- memory: {s}\n- impressions={d} appraisals={d} dreams={d}\n- memory_score_total: {d}\n- memory_access_total: {d}\n- salient_memory: {s}\n- recent_appraisal: {s}\n- focus: {s}\n- needs: {d} active (query=needs)\n- facts: {d} active (query=facts)\n- capabilities: {d} available, {d} unavailable (query=capabilities)\n- autonomy: {s} (query=autonomy)\n{s}\nDrill-down topics: skills, skill/<name>, skills/<group>, memory, facts, needs, capabilities, senses, autonomy, focus, identity\n- uncertainty/human_needs: use say when an appraisal needs human help, clarification, or permission; use think_about for private reflection or model-mediated judgment\n",
+        "introspection overview:\n- memory: {s}\n- impressions={d} appraisals={d} dreams={d}\n- memory_score_total: {d}\n- memory_access_total: {d}\n- salient_memory: {s}\n- recent_appraisal: {s}\n- focus: {s}\n- needs: {d} active (query=needs)\n- facts: {d} active (query=facts)\n- capabilities: {d} available, {d} unavailable (query=capabilities)\n- autonomy: {s} (query=autonomy)\n{s}\nDrill-down topics: skills, skill/<name>, skills/<group>, processes, process/<goal>, memory, facts, needs, capabilities, senses, autonomy, focus, identity\n- uncertainty/human_needs: use say when an appraisal needs human help, clarification, or permission; use think_about for private reflection or model-mediated judgment\n",
         .{ memory_status, impressions.len, appraisals.len, dreams.len, score_total, access_total, salient_text, recent_appraisal, focus_status, active_need_count, fact_count, capability_counts.available, capability_counts.unavailable, autonomy_line, skill_summary.items },
     );
 }
@@ -163,6 +235,12 @@ fn introspectSkillsTree(self: *Brain) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     try out.appendSlice(self.allocator, "introspection:\n");
     try skill_tree.appendSkillsTree(self.allocator, &out, skillAvailabilityContext(self));
+    const recipes = try process_recipe_memory.topWorkingRecipes(self, 5);
+    defer {
+        for (recipes) |recipe| process_recipe_memory.freeRecipe(self.allocator, recipe);
+        self.allocator.free(recipes);
+    }
+    try appendRelatedProcessRecipes(self, &out, recipes);
     return out.toOwnedSlice(self.allocator);
 }
 
@@ -170,16 +248,33 @@ fn introspectSkillsGroup(self: *Brain, group: skill_tree.SkillGroup) ![]const u8
     var out = std.ArrayList(u8).empty;
     try out.appendSlice(self.allocator, "introspection:\n");
     try skill_tree.appendGroupCatalog(self.allocator, &out, group, skillAvailabilityContext(self));
+    try appendRelatedProcessesForGroup(self, &out, group);
     return out.toOwnedSlice(self.allocator);
 }
 
 fn introspectSkillDetail(self: *Brain, id: skill_tree.SkillId) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     try out.appendSlice(self.allocator, "introspection:\n");
-    try skill_tree.appendSkillDetail(self.allocator, &out, id, skillAvailabilityContext(self));
+    if (id == .facial_expression) {
+        try out.appendSlice(self.allocator, "skill_detail: facial_expression\n");
+        if (self.deps.facial_expression_output != null) {
+            try self.reloadFacialExpressionCatalog();
+            if (self.facialExpressionCatalogView()) |catalog| {
+                try facial_expression.appendSkillDescription(self.allocator, &out, catalog);
+            } else if (skills_mod.spec(.facial_expression)) |spec| {
+                try out.appendSlice(self.allocator, spec.description);
+            }
+        } else if (skills_mod.spec(.facial_expression)) |spec| {
+            try out.appendSlice(self.allocator, spec.description);
+        }
+        try out.append(self.allocator, '\n');
+    } else {
+        try skill_tree.appendSkillDetail(self.allocator, &out, id, skillAvailabilityContext(self));
+    }
     if (try actionUnavailableReason(self, id)) |reason| {
         try out.print(self.allocator, "unavailable_reason: {s}\n", .{reason});
     }
+    try appendRelatedProcessesForSkill(self, &out, id);
     return out.toOwnedSlice(self.allocator);
 }
 
@@ -345,8 +440,10 @@ pub fn affordanceObservation(self: *Brain) ![]const u8 {
 
 pub fn appendAffordanceObservation(self: *Brain, out: *std.ArrayList(u8)) !void {
     try appendLlmPolicyObservation(self, out);
+    try self.appendFacialExpressionCatalogObservation(out);
     try out.appendSlice(self.allocator, "Current skill availability:\n");
     try appendAffordanceCatalog(self, out);
+    try process_recipe_memory.appendKnownWorkingProcessesBlock(self, out);
 }
 
 pub fn appendLlmPolicyObservation(self: *Brain, out: *std.ArrayList(u8)) !void {
@@ -461,7 +558,7 @@ fn depsSenseAvailable(self: *Brain, capability: chat_mod.Capability) bool {
         .local_process_io => self.deps.io != null,
         .audio_classification, .audio_transcription => self.deps.audio_inspection_service != null,
         .video_inspection => false,
-        .facial_expression_output => self.deps.facial_expression_output != null,
+        .facial_expression_output => self.deps.facial_expression_output != null and brain_facial_expression.facialExpressionCatalogReady(self),
         else => true,
     };
 }
@@ -487,6 +584,8 @@ pub fn capabilityUnavailableReason(self: *Brain, capability: chat_mod.Capability
         .video_inspection => "video inspection is not configured",
         .facial_expression_output => if (self.deps.facial_expression_output == null)
             "facial expression output is not configured"
+        else if (!brain_facial_expression.facialExpressionCatalogReady(self))
+            "facial expression catalog is not loaded from avatar.json"
         else
             "facial expression output is unavailable",
         else => try std.fmt.allocPrint(self.allocator, "{s} is unavailable", .{@tagName(capability)}),

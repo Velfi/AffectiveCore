@@ -10,6 +10,7 @@ const input_mod = ports.input;
 
 const email_mod = ports.email;
 const helpers = @import("brain_helpers.zig");
+const process_recipe_memory = @import("process_recipe_memory.zig");
 
 const Brain = brain_mod.Brain;
 const TestStore = store_support.TestStore;
@@ -25,7 +26,6 @@ const ScriptedRecallChatService = support.ScriptedRecallChatService;
 const ScriptedClarificationChatService = support.ScriptedClarificationChatService;
 const ScriptedHardErrorRecoveryChatService = support.ScriptedHardErrorRecoveryChatService;
 const HeardSpeechObservationChatService = support.HeardSpeechObservationChatService;
-const FailingIdentityClaimIntentService = support.FailingIdentityClaimIntentService;
 const ScriptedContinuingChatService = support.ScriptedContinuingChatService;
 const makeBrain = support.makeBrain;
 const addMara = support.addMara;
@@ -126,6 +126,56 @@ test "introspect drills into skill groups and individual skills" {
 
     const skill = try brain.introspect("skill/say");
     try std.testing.expect(std.mem.indexOf(u8, skill, "skill_detail: say") != null);
+}
+
+test "introspect skill detail includes related working processes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    var pressures = [_]chat_mod.ActionProposal{
+        .{ .action = .recognize, .origin = .interaction },
+        .{ .action = .say, .origin = .interaction, .text = "Hello again." },
+    };
+    try process_recipe_memory.recordOutcome(&brain, "answer_with_host_visual", .interaction, .{
+        .action_pressures = &pressures,
+        .reason = "recognize then say",
+        .step_kinds = &.{},
+    }, .success, &.{}, null);
+
+    const skill = try brain.introspect("skill/recognize");
+    try std.testing.expect(std.mem.indexOf(u8, skill, "related_processes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skill, "answer_with_host_visual") != null);
+
+    const processes = try brain.introspect("processes");
+    try std.testing.expect(std.mem.indexOf(u8, processes, "answer_with_host_visual") != null);
+
+    const detail = try brain.introspect("process/answer_with_host_visual");
+    try std.testing.expect(std.mem.indexOf(u8, detail, "interaction:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "answer_with_host_visual") != null);
+}
+
+test "affordance observation includes known working processes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    var pressures = [_]chat_mod.ActionProposal{
+        .{ .action = .feel_about, .origin = .autonomy, .query = "touch" },
+    };
+    try process_recipe_memory.recordOutcome(&brain, "investigate_touch", .autonomy, .{
+        .action_pressures = &pressures,
+        .reason = "cached",
+        .step_kinds = &.{},
+    }, .success, &.{}, null);
+    var observations = std.ArrayList(u8).empty;
+    try brain.appendAffordanceObservation(&observations);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "known_working_processes:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "investigate_touch") != null);
 }
 
 test "unavailable action records reason without executing sense" {

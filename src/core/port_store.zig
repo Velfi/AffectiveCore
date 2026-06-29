@@ -67,6 +67,8 @@ pub const MemoryStore = struct {
     loadActivityStackFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.ActivityRecord,
     appendActivityHistoryFn: *const fn (*anyopaque, schema.ActivityRecord) anyerror!void,
     loadActivityHistoryFn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]schema.ActivityRecord,
+    beginDeferredPersistFn: *const fn (*anyopaque) anyerror!void,
+    endDeferredPersistFn: *const fn (*anyopaque) anyerror!void,
     pub fn upsertBelief(self: MemoryStore, belief: schema.Belief) !void {
         return self.upsertBeliefFn(self.ctx, belief);
     }
@@ -222,4 +224,6 @@ pub const MemoryStore = struct {
     pub fn loadActivityStack(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.ActivityRecord { return self.loadActivityStackFn(self.ctx, allocator); }
     pub fn appendActivityHistory(self: MemoryStore, record: schema.ActivityRecord) !void { return self.appendActivityHistoryFn(self.ctx, record); }
     pub fn loadActivityHistory(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.ActivityRecord { return self.loadActivityHistoryFn(self.ctx, allocator); }
+    pub fn beginDeferredPersist(self: MemoryStore) !void { return self.beginDeferredPersistFn(self.ctx); }
+    pub fn endDeferredPersist(self: MemoryStore) !void { return self.endDeferredPersistFn(self.ctx); }
 };

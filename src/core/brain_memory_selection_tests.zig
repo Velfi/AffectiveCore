@@ -25,7 +25,6 @@ const ScriptedRecallChatService = support.ScriptedRecallChatService;
 const ScriptedClarificationChatService = support.ScriptedClarificationChatService;
 const ScriptedHardErrorRecoveryChatService = support.ScriptedHardErrorRecoveryChatService;
 const HeardSpeechObservationChatService = support.HeardSpeechObservationChatService;
-const FailingIdentityClaimIntentService = support.FailingIdentityClaimIntentService;
 const ScriptedContinuingChatService = support.ScriptedContinuingChatService;
 const makeBrain = support.makeBrain;
 const addMara = support.addMara;
@@ -58,7 +57,7 @@ test "conversation memory selection adds relevant_memories and observation" {
     });
 
     const selection = try brain.selectConversationMemories("Do you recognize me?");
-    const memory = try brain.buildConversationMemoryWithSpeaker(null, null, selection);
+    const memory = try brain.buildConversationMemoryWithSpeaker(null, null, selection, .heard_speech);
     var observations = std.ArrayList(u8).empty;
     try memory_selection_mod.appendMemorySelectionObservation(allocator, &observations, selection);
 
@@ -68,14 +67,13 @@ test "conversation memory selection adds relevant_memories and observation" {
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "want_recognition") != null);
 }
 
-test "conversation memory selection works without llm service" {
+test "conversation memory selection uses vector search" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
-    brain.deps.memory_selection_service = null;
     try brain.deps.store.saveMemoryRecord(.{
         .memory_id = "mem_a",
         .scope = .long_term,

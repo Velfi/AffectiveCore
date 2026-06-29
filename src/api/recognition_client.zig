@@ -3,7 +3,7 @@ const identity = @import("../core/identity.zig");
 const openai = @import("openai_client.zig");
 const schema = @import("../storage/schema.zig");
 const store_mod = @import("../storage/store.zig");
-const vector_index = @import("../core/vector_index.zig");
+const hash_vector = @import("../core/hash_vector.zig");
 const http_transport = @import("http_transport.zig");
 const http_log = @import("http_log.zig");
 const error_descriptions = @import("../core/error_descriptions.zig");
@@ -209,13 +209,13 @@ fn appendDescriptionLine(allocator: std.mem.Allocator, out: *std.ArrayList(u8), 
 }
 
 fn bestDescriptionCandidate(allocator: std.mem.Allocator, candidates: []const DescriptionCandidate, current_description: []const u8) !?CandidateMatch {
-    const query = try vector_index.embedQuery(allocator, current_description, &[_][]const u8{"appearance"});
+    const query = try hash_vector.embed(allocator, current_description, &[_][]const u8{"appearance"});
     defer allocator.free(query);
     var best: ?CandidateMatch = null;
     for (candidates, 0..) |candidate, i| {
-        const vector = try vector_index.embedQuery(allocator, candidate.description, &[_][]const u8{"appearance"});
+        const vector = try hash_vector.embed(allocator, candidate.description, &[_][]const u8{"appearance"});
         defer allocator.free(vector);
-        const similarity = vector_index.cosine(query, vector);
+        const similarity = hash_vector.cosine(query, vector);
         if (best == null or similarity > best.?.similarity) best = .{ .index = i, .similarity = similarity };
     }
     return best;

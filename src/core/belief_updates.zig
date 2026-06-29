@@ -1,5 +1,7 @@
 const std = @import("std");
 const brain_mod = @import("brain.zig");
+const capability_registry = @import("capability_registry.zig");
+const host_capability_activation = @import("host_capability_activation.zig");
 const memory_actors = @import("actors/memory/mod.zig");
 const experience_kinds = @import("experience_kinds.zig");
 const learning = @import("learning.zig");
@@ -124,6 +126,63 @@ fn firstCandidateFromHypothesis(allocator: std.mem.Allocator, candidates_json: [
         .person_id = if (candidate.person_id.len > 0) try allocator.dupe(u8, candidate.person_id) else try allocator.dupe(u8, ""),
         .name = if (candidate.name.len > 0) try allocator.dupe(u8, candidate.name) else try allocator.dupe(u8, ""),
     };
+}
+
+pub fn onHostCapabilityActivation(
+    self: *Brain,
+    host_id: []const u8,
+    capability_id: []const u8,
+    state: schema.CapabilityRequestState,
+    duration_ms: u32,
+    stats: host_capability_activation.ActivationStats,
+    detail: []const u8,
+    source_event_ids: []const []const u8,
+) !void {
+    const canonical = capability_registry.canonicalId(capability_id);
+    const key = try std.fmt.allocPrint(self.allocator, "host_{s}_{s}_activations", .{ host_id, canonical });
+    const proposition = try std.fmt.allocPrint(
+        self.allocator,
+        "Host {s} capability {s}: {d}/{d} completed, avg {d}ms, max {d}ms, timeouts {d}, last_duration {d}ms; last={s}; detail={s}",
+        .{
+            host_id,
+            canonical,
+            stats.completed_count,
+            stats.attempt_count,
+            stats.avg_duration_ms,
+            stats.max_duration_ms,
+            stats.timed_out_count,
+            duration_ms,
+            @tagName(state),
+            detail,
+        },
+    );
+    const confidence: f32 = if (stats.attempt_count == 0)
+        0.35
+    else
+        @min(0.95, @max(0.20, @as(f32, @floatFromInt(stats.completed_count)) / @as(f32, @floatFromInt(stats.attempt_count))));
+    const valence: f32 = switch (state) {
+        .completed => 0.15,
+        .failed, .unavailable, .refused => -0.35,
+        else => -0.10,
+    };
+    const now_text = try std.fmt.allocPrint(self.allocator, "{d}", .{self.now_seconds});
+    const belief_id = try std.fmt.allocPrint(self.allocator, "belief_host_activation_{s}_{s}", .{ host_id, canonical });
+    try upsertBeliefWithEvent(self, .{
+        .belief_id = belief_id,
+        .key = key,
+        .proposition = proposition,
+        .confidence = confidence,
+        .salience = 0.62,
+        .valence = valence,
+        .evidence_event_ids = try cloneEventIds(self.allocator, source_event_ids),
+        .provenance = "host_activation",
+        .tags = try cloneTags(self.allocator, &[_][]const u8{ "host", "capability", "activation" }),
+        .lifecycle = .{
+            .status = if (state == .completed) .active else .doubted,
+            .created_at = now_text,
+            .updated_at = now_text,
+        },
+    }, if (stats.attempt_count <= 1) experience_kinds.belief_created else experience_kinds.belief_updated);
 }
 
 pub fn onHostCapabilityChange(self: *Brain, status: schema.CapabilityStatus, prior: ?schema.CapabilityStatus, source_event_ids: []const []const u8) !void {

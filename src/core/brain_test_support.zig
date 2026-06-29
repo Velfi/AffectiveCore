@@ -7,12 +7,9 @@ const interrupt_mod = @import("interrupt.zig");
 const ports = @import("ports.zig");
 const schema = ports.schema;
 const memory_extraction_mod = ports.memory_extraction;
-const memory_selection_mod = ports.memory_selection;
 const store_mod = ports.store;
 const graph_store = ports.graph_store;
-const intent_mod = ports.intent;
 const openai = ports.openai;
-const greeting_client = ports.greeting;
 const chat_mod = ports.chat;
 const speech_mod = ports.speech;
 const audio_mod = ports.audio;
@@ -29,6 +26,7 @@ const facial_expression = ports.facial_expression;
 const process_mod = ports.process;
 const id_monitor = @import("id_monitor.zig");
 const maintenance = @import("maintenance.zig");
+const embedding_mod = ports.embedding;
 
 const Brain = brain_mod.Brain;
 const BrainDeps = brain_mod.BrainDeps;
@@ -101,7 +99,7 @@ pub const ScriptedRecognizeThenSayChatService = struct {
             return .{
                 .action_pressures = commands,
                 .user_summary = try allocator.dupe(u8, user_text),
-                .brain_summary = try allocator.dupe(u8, "Chose to look at who is here."),
+                .brain_summary = try allocator.dupe(u8, "Greeted back and looked at the speaker."),
                 .turn_complete = false,
             };
         }
@@ -133,6 +131,89 @@ pub const ScriptedRecognizeThenSayChatService = struct {
             .action_pressures = commands,
             .user_summary = try allocator.dupe(u8, user_text),
             .brain_summary = try allocator.dupe(u8, "Answered deferred speech after the awaited visual observation."),
+            .turn_complete = true,
+        };
+    }
+};
+
+pub const ConversationCotextOnNextTurnChatService = struct {
+    calls: usize = 0,
+
+    pub fn service(self: *ConversationCotextOnNextTurnChatService) chat_mod.ChatService {
+        return .{ .ctx = self, .respondFn = respond };
+    }
+
+    fn respond(ctx: *anyopaque, allocator: std.mem.Allocator, _: []const u8, user_text: []const u8, observations: []const u8) !chat_mod.ChatTurn {
+        const self: *ConversationCotextOnNextTurnChatService = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (std.mem.indexOf(u8, observations, "salient_sense_during_conversation:") != null) {
+            return .{
+                .action_pressures = &.{},
+                .user_summary = try allocator.dupe(u8, "Ambient visual sense during conversation."),
+                .brain_summary = try allocator.dupe(u8, "Noted internally without speaking."),
+                .turn_complete = true,
+            };
+        }
+        if (std.mem.eql(u8, user_text, "what did you see?")) {
+            try std.testing.expect(std.mem.indexOf(u8, observations, "conversation_cotext:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, observations, "uploaded_image:") != null);
+        }
+        return .{
+            .action_pressures = &.{},
+            .user_summary = try allocator.dupe(u8, user_text),
+            .brain_summary = try allocator.dupe(u8, "Continued the conversation."),
+            .turn_complete = true,
+        };
+    }
+};
+
+pub const SilentSalientSenseDuringConversationChatService = struct {
+    calls: usize = 0,
+
+    pub fn service(self: *SilentSalientSenseDuringConversationChatService) chat_mod.ChatService {
+        return .{ .ctx = self, .respondFn = respond };
+    }
+
+    fn respond(ctx: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8, observations: []const u8) !chat_mod.ChatTurn {
+        const self: *SilentSalientSenseDuringConversationChatService = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        _ = observations;
+        return .{
+            .action_pressures = &.{},
+            .user_summary = try allocator.dupe(u8, "Ambient visual sense during conversation."),
+            .brain_summary = try allocator.dupe(u8, "Noted internally without speaking."),
+            .turn_complete = true,
+        };
+    }
+};
+
+pub const SpeakingSalientSenseDuringConversationChatService = struct {
+    calls: usize = 0,
+    say_text: []const u8 = "I see the photo.",
+
+    pub fn service(self: *SpeakingSalientSenseDuringConversationChatService) chat_mod.ChatService {
+        return .{ .ctx = self, .respondFn = respond };
+    }
+
+    fn respond(ctx: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8, observations: []const u8) !chat_mod.ChatTurn {
+        const self: *SpeakingSalientSenseDuringConversationChatService = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (std.mem.indexOf(u8, observations, "salient_sense_during_conversation:") != null) {
+            const commands = try allocator.alloc(chat_mod.ActionProposal, 1);
+            commands[0] = .{ .action = .say, .text = try allocator.dupe(u8, self.say_text) };
+            return .{
+                .action_pressures = commands,
+                .user_summary = try allocator.dupe(u8, "User showed a photo mid-conversation."),
+                .brain_summary = try allocator.dupe(u8, "Associated the image with the ongoing talk."),
+                .turn_complete = true,
+            };
+        }
+        const commands = try allocator.alloc(chat_mod.ActionProposal, 1);
+        commands[0] = .{ .action = .say, .text = try allocator.dupe(u8, "Hello.") };
+        return .{
+            .action_pressures = commands,
+            .user_summary = try allocator.dupe(u8, "User greeted."),
+            .brain_summary = try allocator.dupe(u8, "Greeted back."),
             .turn_complete = true,
         };
     }
@@ -202,6 +283,101 @@ pub const ScriptedRecognizeAndSaySameBatchChatService = struct {
             .user_summary = try allocator.dupe(u8, user_text),
             .brain_summary = try allocator.dupe(u8, "Greeted after recognition in one batch."),
             .turn_complete = false,
+        };
+    }
+};
+
+/// Expects the interrupt coalesce observation and responds with say.
+pub const ScriptedInterruptCoalesceSayChatService = struct {
+    pub fn service(_: *ScriptedInterruptCoalesceSayChatService) chat_mod.ChatService {
+        return .{ .ctx = undefined, .respondFn = respond };
+    }
+
+    fn respond(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, user_text: []const u8, observations: []const u8) !chat_mod.ChatTurn {
+        try std.testing.expect(std.mem.indexOf(u8, observations, "user_interrupt_coalesce:") != null);
+        const commands = try allocator.alloc(chat_mod.ActionProposal, 1);
+        commands[0] = .{ .action = .say, .text = try allocator.dupe(u8, "Hello.") };
+        return .{
+            .action_pressures = commands,
+            .user_summary = try allocator.dupe(u8, user_text),
+            .brain_summary = try allocator.dupe(u8, "Greeted after interrupt coalesce."),
+            .turn_complete = true,
+        };
+    }
+};
+
+/// First pass returns a non-verbal action; pre-pass nudge on pass 0 should elicit say on the same pass.
+pub const ScriptedNonVerbalThenNudgedSayChatService = struct {
+    calls: usize = 0,
+    say_text: []const u8 = "Hello there.",
+    last_nudge_kind: NudgeKind = .none,
+
+    pub const NudgeKind = enum { none, initial, follow_up };
+
+    pub fn service(self: *ScriptedNonVerbalThenNudgedSayChatService) chat_mod.ChatService {
+        return .{ .ctx = self, .respondFn = respond };
+    }
+
+    fn respond(ctx: *anyopaque, allocator: std.mem.Allocator, _: []const u8, user_text: []const u8, observations: []const u8) !chat_mod.ChatTurn {
+        const self: *ScriptedNonVerbalThenNudgedSayChatService = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.last_nudge_kind = classifyHeardSpeechNudge(observations);
+        if (self.calls == 1 and self.last_nudge_kind == .none) {
+            const commands = try allocator.alloc(chat_mod.ActionProposal, 1);
+            commands[0] = .{ .action = .introspect };
+            return .{
+                .action_pressures = commands,
+                .user_summary = try allocator.dupe(u8, user_text),
+                .brain_summary = try allocator.dupe(u8, "Chose to introspect."),
+                .turn_complete = true,
+            };
+        }
+        const commands = try allocator.alloc(chat_mod.ActionProposal, 1);
+        commands[0] = .{ .action = .say, .text = try allocator.dupe(u8, self.say_text) };
+        return .{
+            .action_pressures = commands,
+            .user_summary = try allocator.dupe(u8, user_text),
+            .brain_summary = try allocator.dupe(u8, "Responded verbally after nudge."),
+            .turn_complete = true,
+        };
+    }
+
+    fn classifyHeardSpeechNudge(observations: []const u8) NudgeKind {
+        if (std.mem.indexOf(u8, observations, chat_mod.heard_speech_stimulus_response_nudge_follow_up) != null) return .follow_up;
+        if (std.mem.indexOf(u8, observations, chat_mod.heard_speech_stimulus_response_nudge_initial) != null) return .initial;
+        return .none;
+    }
+};
+
+/// Non-verbal with turn_complete=false until follow-up nudge, then say.
+pub const ScriptedAlwaysNonVerbalChatService = struct {
+    calls: usize = 0,
+    say_text: []const u8 = "Hello.",
+
+    pub fn service(self: *ScriptedAlwaysNonVerbalChatService) chat_mod.ChatService {
+        return .{ .ctx = self, .respondFn = respond };
+    }
+
+    fn respond(ctx: *anyopaque, allocator: std.mem.Allocator, _: []const u8, user_text: []const u8, observations: []const u8) !chat_mod.ChatTurn {
+        const self: *ScriptedAlwaysNonVerbalChatService = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (std.mem.indexOf(u8, observations, chat_mod.heard_speech_stimulus_response_nudge_follow_up) == null) {
+            const commands = try allocator.alloc(chat_mod.ActionProposal, 1);
+            commands[0] = .{ .action = .introspect };
+            return .{
+                .action_pressures = commands,
+                .user_summary = try allocator.dupe(u8, user_text),
+                .brain_summary = try allocator.dupe(u8, "Chose to introspect."),
+                .turn_complete = false,
+            };
+        }
+        const commands = try allocator.alloc(chat_mod.ActionProposal, 1);
+        commands[0] = .{ .action = .say, .text = try allocator.dupe(u8, self.say_text) };
+        return .{
+            .action_pressures = commands,
+            .user_summary = try allocator.dupe(u8, user_text),
+            .brain_summary = try allocator.dupe(u8, "Responded verbally after nudge."),
+            .turn_complete = true,
         };
     }
 };
@@ -337,21 +513,6 @@ pub const TestInput = struct {
     fn isActive(ctx: *anyopaque, _: std.mem.Allocator) !bool {
         const self: *TestInput = @ptrCast(@alignCast(ctx));
         return self.active;
-    }
-};
-
-pub const FailingIdentityClaimIntentService = struct {
-    calls: usize = 0,
-
-    pub fn service(self: *FailingIdentityClaimIntentService) intent_mod.IntentService {
-        return .{ .ctx = self, .classifyFn = classify };
-    }
-
-    fn classify(ctx: *anyopaque, _: std.mem.Allocator, context: intent_mod.IntentContext, _: []const u8) !intent_mod.IntentResult {
-        const self: *FailingIdentityClaimIntentService = @ptrCast(@alignCast(ctx));
-        self.calls += 1;
-        try std.testing.expectEqual(intent_mod.IntentContext.identity_claim, context);
-        return error.SyntaxError;
     }
 };
 
@@ -775,7 +936,6 @@ pub const TestFacialExpressionOutput = struct {
 
     fn show(ctx: *anyopaque, expression: facial_expression.Expression) !void {
         const self: *TestFacialExpressionOutput = @ptrCast(@alignCast(ctx));
-        try facial_expression.validate(expression);
         self.calls += 1;
         const allocator = std.testing.allocator;
         if (self.eyes) |eyes| allocator.free(eyes);
@@ -786,6 +946,59 @@ pub const TestFacialExpressionOutput = struct {
     }
 };
 
+pub const TestEmoteOutput = struct {
+    calls: usize = 0,
+    text: ?[]const u8 = null,
+    display_text: ?[]const u8 = null,
+    duration_ms: u32 = 0,
+
+    pub fn output(self: *TestEmoteOutput) @import("port_emote.zig").Output {
+        return .{ .ctx = self, .showFn = show };
+    }
+
+    pub fn deinit(self: *TestEmoteOutput) void {
+        const allocator = std.testing.allocator;
+        if (self.text) |text| allocator.free(text);
+        if (self.display_text) |display_text| allocator.free(display_text);
+        self.* = .{};
+    }
+
+    fn show(ctx: *anyopaque, emote: @import("port_emote.zig").Emote) !void {
+        const self: *TestEmoteOutput = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        const allocator = std.testing.allocator;
+        if (self.text) |text| allocator.free(text);
+        if (self.display_text) |display_text| allocator.free(display_text);
+        self.text = try allocator.dupe(u8, emote.text);
+        self.display_text = try allocator.dupe(u8, emote.display_text);
+        self.duration_ms = emote.duration_ms;
+    }
+};
+
+pub fn writeAndRefreshFacialExpressionCatalog(
+    brain: *Brain,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    brain_root: []const u8,
+    avatar_json: []const u8,
+) !void {
+    brain.deps.io = io;
+    brain.cfg.brain_root = try allocator.dupe(u8, brain_root);
+    const fs = brain.deps.filesystem orelse return error.MissingFacialExpressionCatalog;
+    const avatar_path = try std.fs.path.join(allocator, &.{ brain_root, "avatar.json" });
+    defer allocator.free(avatar_path);
+    try fs.writeFilePath(io, avatar_path, avatar_json);
+    const maintenance_path = try std.fs.path.join(allocator, &.{ brain_root, "maintenance_state.json" });
+    defer allocator.free(maintenance_path);
+    brain.cfg.maintenance_state_path = try allocator.dupe(u8, maintenance_path);
+    try maintenance.saveAutonomyState(allocator, fs, io, maintenance_path, .{
+        .sleeping = false,
+        .control_capacity = brain.cfg.autonomy_full_max_capacity,
+        .max_capacity = brain.cfg.autonomy_full_max_capacity,
+    });
+    _ = try brain.refreshFacialExpressionCatalog();
+}
+
 pub fn makeBrain(allocator: std.mem.Allocator, image: []const u8, answers: []const []const u8, store: *TestStore, desc: *openai.TestDescriptionService) Brain {
     var camera = allocator.create(TestCamera) catch unreachable;
     camera.* = .{ .image = image };
@@ -793,10 +1006,6 @@ pub fn makeBrain(allocator: std.mem.Allocator, image: []const u8, answers: []con
     input.* = .{ .answers = answers };
     var recog = allocator.create(TestRecognitionClient) catch unreachable;
     recog.* = .{};
-    var intent = allocator.create(intent_mod.TestIntentService) catch unreachable;
-    intent.* = .{};
-    var greeting_model = allocator.create(greeting_client.TestGreetingService) catch unreachable;
-    greeting_model.* = .{};
     var chat = allocator.create(chat_mod.TestChatService) catch unreachable;
     chat.* = .{};
     var image_gen = allocator.create(image_mod.TestImageGenerationService) catch unreachable;
@@ -822,10 +1031,6 @@ pub fn makeBrain(allocator: std.mem.Allocator, image: []const u8, answers: []con
             },
         },
     };
-    var selection = allocator.create(memory_selection_mod.ScriptedMemorySelectionService) catch unreachable;
-    selection.* = .{
-        .summary = "Selected memories relevant to the user's latest words.",
-    };
     var process_runner = allocator.create(TestProcessRunner) catch unreachable;
     process_runner.* = .{};
     var clock = allocator.create(TestClock) catch unreachable;
@@ -834,6 +1039,9 @@ pub fn makeBrain(allocator: std.mem.Allocator, image: []const u8, answers: []con
     senses.* = .{ .snapshot_value = .{
         .datetime = .{
             .datetime = "2026-06-23T12:30:00-05:00",
+            .datetime_format = "ISO-8601 local",
+            .friendly_datetime = "June 23, 2026 at 12:30 PM",
+            .friendly_datetime_format = "local long date and time",
             .unix_seconds = 1_781_222_400,
         },
         .power = .{ .supplies = &[_]system_senses_mod.PowerSupply{
@@ -850,21 +1058,22 @@ pub fn makeBrain(allocator: std.mem.Allocator, image: []const u8, answers: []con
     } };
     var graph_impl = allocator.create(graph_store.TestGraphStore) catch unreachable;
     graph_impl.* = .{};
+    var test_embedding = allocator.create(embedding_mod.TestEmbeddingService) catch unreachable;
+    test_embedding.* = .{};
 
-    return Brain.init(allocator, .{}, .{
+    return Brain.init(allocator, .{ .psyche_mode = "off" }, .{
         .io = null,
         .capabilities = chat_mod.CapabilitySet.all(),
         .camera = camera.camera(),
         .recognizer = recog.recognizer(),
         .description_service = desc.service(),
-        .greeting_service = greeting_model.service(),
-        .intent_service = intent.service(),
         .chat_service = chat.service(),
+        .embedding_service = test_embedding.service(),
         .memory_extraction_service = extraction.service(),
-        .memory_selection_service = selection.service(),
         .image_generation_service = image_gen.service(),
         .audio_inspection_service = audio_inspector.service(),
         .want_achievement_detector = store.want_detector.detector(),
+        .persona_directive_synthesizer = store.persona_synthesizer.synthesizer(),
         .speech_service = speech.service(),
         .speaker = speaker.speaker(),
         .input = input.input(),

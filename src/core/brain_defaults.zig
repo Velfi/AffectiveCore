@@ -100,3 +100,47 @@ test "apply new brain defaults is idempotent" {
     }
     try std.testing.expect(found_goal);
 }
+
+test "conversation memory includes seeded self goals" {
+    const brain_test_store = @import("brain_test_store.zig");
+    const brain_test_support = @import("brain_test_support.zig");
+    const openai = @import("ports.zig").openai;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = brain_test_store.TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = brain_test_support.makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    try applyNewBrainDefaults(&brain);
+
+    const memory = try brain.buildConversationMemory();
+    try std.testing.expect(std.mem.indexOf(u8, memory, "inner_directives:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "self_wants:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "self_goals:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "self-defined goal: Figure out who I am") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "self-defined want: Continue existing.") != null);
+}
+
+test "conversation memory includes pre-dream persona directive defaults" {
+    const brain_test_store = @import("brain_test_store.zig");
+    const brain_test_support = @import("brain_test_support.zig");
+    const openai = @import("ports.zig").openai;
+    const persona_directive_mod = @import("ports.zig").persona_directive;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = brain_test_store.TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = brain_test_support.makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    const memory = try brain.buildConversationMemory();
+    const persona_idx = std.mem.indexOf(u8, memory, "persona_directive:") orelse return error.MissingPersonaDirective;
+    const focus_idx = std.mem.indexOf(u8, memory, "focus:") orelse return error.MissingFocus;
+    try std.testing.expect(persona_idx < focus_idx);
+    try std.testing.expect(std.mem.indexOf(u8, memory, persona_directive_mod.default_persona) != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, persona_directive_mod.default_short_term) != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, persona_directive_mod.default_long_term) != null);
+}

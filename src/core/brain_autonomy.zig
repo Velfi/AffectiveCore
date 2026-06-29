@@ -11,6 +11,10 @@ const autonomy_mod = ports.autonomy;
 const psyche_client = ports.psyche;
 const brain_introspection = @import("brain_introspection_autonomy.zig");
 const context_composition = @import("context_composition.zig");
+const present_moment = @import("present_moment.zig");
+const process_runtime_mod = @import("process_runtime.zig");
+const process_recipe_memory = @import("process_recipe_memory.zig");
+const brain_observation_append = @import("brain_observation_append.zig");
 const clock_mod = @import("../platform/common/clock.zig");
 
 const Brain = brain_mod.Brain;
@@ -39,19 +43,19 @@ pub fn defaultAutonomySleeping(self: *Brain) bool {
     return std.mem.eql(u8, self.cfg.autonomy_sleep, "on");
 }
 
-pub fn autonomyReplenishActionsPerMinute(cfg: config_mod.Config) f32 {
+pub fn autonomyReplenishPointsPerMinute(cfg: config_mod.Config) f32 {
     if (std.mem.eql(u8, cfg.autonomy_mode, "limited")) return cfg.autonomy_limited_replenish_actions_per_minute;
     return cfg.autonomy_full_replenish_actions_per_minute;
 }
 
 pub fn autonomyReplenishRatePerSecond(cfg: config_mod.Config) f32 {
-    return maintenance.replenishRatePerSecond(autonomyReplenishActionsPerMinute(cfg), cfg.autonomy_planner_min_capacity);
+    return maintenance.replenishPointsPerSecond(autonomyReplenishPointsPerMinute(cfg));
 }
 
-pub fn autonomyReplenishSecondsPerAction(cfg: config_mod.Config) f32 {
-    const actions_per_minute = autonomyReplenishActionsPerMinute(cfg);
-    if (actions_per_minute <= 0.0) return 0.0;
-    return 60.0 / actions_per_minute;
+pub fn autonomyReplenishSecondsPerPoint(cfg: config_mod.Config) f32 {
+    const points_per_minute = autonomyReplenishPointsPerMinute(cfg);
+    if (points_per_minute <= 0.0) return 0.0;
+    return 60.0 / points_per_minute;
 }
 
 pub fn autonomyPlannerCost() u32 {
@@ -64,7 +68,7 @@ pub fn autonomyActionCost(command: chat_mod.ActionProposalType) !u32 {
 }
 
 pub fn autonomyIntrospection(self: *Brain) ![]const u8 {
-    const costs = try skills_mod.autonomyCostCatalog(self.allocator);
+    const costs = try skills_mod.autonomyCostCatalog(self.allocator, self.cfg.autonomy_mode);
     if (!autonomyEnabled(self)) {
         return std.fmt.allocPrint(
             self.allocator,
@@ -90,6 +94,7 @@ pub fn autonomyBlockedReason(self: *Brain, io: std.Io, state: maintenance.Autono
     if (state.sleeping) return "sleep";
     if (std.mem.eql(u8, self.cfg.autonomy_mode, "off")) return "mode_off";
     if (!maintenance.autonomyBudgetAvailable(state)) return "autonomy_overdrawn";
+    if (maintenance.autonomyActionCooldownActive(state, self.now_seconds)) return "action_cooldown";
     if (std.mem.eql(u8, self.cfg.autonomy_mode, "limited") and (try inQuietHours(self, io))) return "quiet_hours_bias";
     return "none";
 }
@@ -104,9 +109,10 @@ pub fn buildAutonomyContext(self: *Brain, io: std.Io, state: maintenance.Autonom
     }
     const psyche = self.deps.psyche_service orelse return error.MissingPsycheService;
     try self.traceContextComposition(context_composition.auditPsycheConsult("id", shared_context.len));
-    const id = try psyche.consultId(self.allocator, shared_context);
     try self.traceContextComposition(context_composition.auditPsycheConsult("superego", shared_context.len));
-    const superego = try psyche.consultSuperego(self.allocator, shared_context);
+    const turns = try psyche.consultBoth(self.allocator, shared_context);
+    const id = turns.id;
+    const superego = turns.superego;
     const id_text = try psyche_client.formatIdTurn(self.allocator, id);
     defer self.allocator.free(id_text);
     const superego_text = try psyche_client.formatSuperegoTurn(self.allocator, superego);
@@ -120,7 +126,19 @@ pub fn buildAutonomyContext(self: *Brain, io: std.Io, state: maintenance.Autonom
 pub fn buildPsycheSharedContext(self: *Brain, io: std.Io, state: maintenance.AutonomyState) ![]const u8 {
     const inputs = try psycheSharedInputs(self, io, state);
     try self.traceContextComposition(context_composition.auditPsycheSharedInputs(inputs));
-    return psyche_mod.formatSharedContext(self.allocator, inputs);
+    const shared = try psyche_mod.formatSharedContext(self.allocator, inputs);
+    defer self.allocator.free(shared);
+    var out = std.ArrayList(u8).empty;
+    try out.appendSlice(self.allocator, shared);
+    try out.appendSlice(self.allocator, "\n");
+    var pm = std.ArrayList(u8).empty;
+    defer pm.deinit(self.allocator);
+    try present_moment.appendObservation(self, &pm, null, null);
+    try out.appendSlice(self.allocator, pm.items);
+    if (present_moment.contactWindowOpen(self)) {
+        try out.appendSlice(self.allocator, "recent_contact: open — contact already answered; inner work over voluntary say unless a new salient need appears.\n");
+    }
+    return out.toOwnedSlice(self.allocator);
 }
 
 fn psycheSharedInputs(self: *Brain, io: std.Io, state: maintenance.AutonomyState) !psyche_mod.SharedInputs {
@@ -139,6 +157,13 @@ fn psycheSharedInputs(self: *Brain, io: std.Io, state: maintenance.AutonomyState
         .autonomy_max_capacity = state.max_capacity,
         .autonomy_sleeping = state.sleeping,
     });
+    const affordances = try autonomyAffordanceCatalog(self);
+    defer self.allocator.free(affordances);
+    var affordances_out = std.ArrayList(u8).empty;
+    try affordances_out.appendSlice(self.allocator, affordances);
+    try self.appendFacialExpressionCatalogObservation(&affordances_out);
+    try process_recipe_memory.appendKnownWorkingProcessesBlock(self, &affordances_out);
+    const affordances_with_catalog = try affordances_out.toOwnedSlice(self.allocator);
     return .{
         .now = try self.timestampNow(),
         .control_capacity = state.control_capacity,
@@ -149,7 +174,7 @@ fn psycheSharedInputs(self: *Brain, io: std.Io, state: maintenance.AutonomyState
         .sleeping = state.sleeping,
         .quiet_hours_active = try inQuietHours(self, io),
         .blocked = try autonomyBlockedReason(self, io, state),
-        .affordances = try autonomyAffordanceCatalog(self),
+        .affordances = affordances_with_catalog,
         .needs = active_needs,
         .relationship_graph = try self.deps.graph.summary(self.allocator, 8),
         .memories = memories,
@@ -164,7 +189,24 @@ pub fn autonomyAffordanceCatalog(self: *Brain) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     for (skills_mod.registry) |skill| {
         switch (skill.autonomy_policy) {
-            .allowed => try out.appendSlice(self.allocator, try std.fmt.allocPrint(self.allocator, "- {s}: {s}; cost={d}\n", .{ skill.name, skill.description, skill.energy_cost orelse return error.MissingAutonomyEnergyCost })),
+            .allowed => {
+                if (!self.actionIsAvailable(skill.id)) {
+                    try out.appendSlice(self.allocator, try std.fmt.allocPrint(self.allocator, "- {s}: unavailable for autonomy\n", .{skill.name}));
+                } else {
+                    const point_cost = try skills_mod.actionAutonomyPointCost(skill.id);
+                    try out.appendSlice(self.allocator, try std.fmt.allocPrint(self.allocator, "- {s}: {s}; cost={d}\n", .{ skill.name, skill.description, @as(u32, @intFromFloat(point_cost)) }));
+                }
+            },
+            .full_allowed => {
+                if (!std.mem.eql(u8, self.cfg.autonomy_mode, "full")) {
+                    try out.appendSlice(self.allocator, try std.fmt.allocPrint(self.allocator, "- {s}: forbidden for autonomy (full mode only)\n", .{skill.name}));
+                } else if (!self.actionIsAvailable(skill.id)) {
+                    try out.appendSlice(self.allocator, try std.fmt.allocPrint(self.allocator, "- {s}: unavailable for autonomy\n", .{skill.name}));
+                } else {
+                    const point_cost = try skills_mod.actionAutonomyPointCost(skill.id);
+                    try out.appendSlice(self.allocator, try std.fmt.allocPrint(self.allocator, "- {s}: {s}; cost={d}\n", .{ skill.name, skill.description, @as(u32, @intFromFloat(point_cost)) }));
+                }
+            },
             .forbidden => try out.appendSlice(self.allocator, try std.fmt.allocPrint(self.allocator, "- {s}: forbidden for autonomy\n", .{skill.name})),
             .invalid => {},
         }
@@ -175,14 +217,58 @@ pub fn autonomyAffordanceCatalog(self: *Brain) ![]const u8 {
 pub fn executeAutonomyTurn(self: *Brain, io: std.Io, state: *maintenance.AutonomyState, turn: autonomy_mod.AutonomyTurn) !void {
     _ = io;
     if (turn.action_pressures.len == 0) {
-        state.last_reason = try self.allocator.dupe(u8, "planner returned no action pressures");
+        const reason = "planner returned no action pressures";
+        state.last_reason = try self.allocator.dupe(u8, reason);
+        try self.logAutonomyStatus("autonomy plan", reason);
         return;
     }
     const pressures: []chat_mod.ActionProposal = @constCast(turn.action_pressures);
     for (pressures) |*proposal| proposal.origin = .autonomy;
     state.last_reason = try self.allocator.dupe(u8, turn.reason);
+    try self.logAutonomyStatus("autonomy plan", turn.reason);
     var observations = std.ArrayList(u8).empty;
     _ = try self.executeRuntimeAutonomyBatch(pressures, &observations);
+}
+
+pub const AutonomyProcessTick = enum {
+    idle,
+    waiting,
+    advanced,
+};
+
+pub fn tickActiveAutonomyProcess(self: *Brain) !AutonomyProcessTick {
+    const process = self.active_process orelse return .idle;
+    if (process.origin != .autonomy) return .idle;
+    switch (process.state) {
+        .waiting_host, .waiting_timer, .waiting_stimulus => return .waiting,
+        .running => {},
+        else => return .idle,
+    }
+    var observations = std.ArrayList(u8).empty;
+    defer observations.deinit(self.allocator);
+    _ = try process_runtime_mod.advanceProcess(self, "", &.{}, process.user_anchor, &observations);
+    return .advanced;
+}
+
+pub fn resumeAutonomyProcessFromHostDelivery(self: *Brain, delivered_line: []const u8) !bool {
+    const process = self.active_process orelse return false;
+    if (process.origin != .autonomy) return false;
+    if (process.state != .waiting_host) return false;
+    var observations = std.ArrayList(u8).empty;
+    defer observations.deinit(self.allocator);
+    try brain_observation_append.appendHostSenseDeliveredObservation(self, &observations, delivered_line);
+    if (try process_runtime_mod.resumeProcess(self, .host_delivery, delivered_line, "", &.{}, &observations)) |_| return true;
+    return false;
+}
+
+pub fn resumeAutonomyProcessFromTimer(self: *Brain, intent_text: []const u8) !bool {
+    const process = self.active_process orelse return false;
+    if (process.origin != .autonomy) return false;
+    if (process.state != .waiting_timer) return false;
+    var observations = std.ArrayList(u8).empty;
+    defer observations.deinit(self.allocator);
+    if (try process_runtime_mod.resumeProcess(self, .timer_fired, intent_text, "", &.{}, &observations)) |_| return true;
+    return false;
 }
 
 pub fn setAutonomySleeping(self: *Brain, sleeping: bool, reason: []const u8) !void {
@@ -199,14 +285,11 @@ pub fn setAutonomySleeping(self: *Brain, sleeping: bool, reason: []const u8) !vo
 }
 
 pub fn speechCooldownActive(self: *Brain, state: maintenance.AutonomyState) bool {
-    _ = self;
-    _ = state;
-    return false;
+    return maintenance.autonomyActionCooldownActive(state, self.now_seconds);
 }
 
-pub fn facialExpressionCooldownActive(self: *Brain) bool {
-    _ = self;
-    return false;
+pub fn facialExpressionCooldownActive(self: *Brain, state: maintenance.AutonomyState) bool {
+    return maintenance.autonomyActionCooldownActive(state, self.now_seconds);
 }
 
 pub fn inQuietHours(self: *Brain, io: std.Io) !bool {

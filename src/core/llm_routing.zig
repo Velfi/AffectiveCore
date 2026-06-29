@@ -139,13 +139,10 @@ pub fn parseRosterFromModelsSpec(allocator: std.mem.Allocator, spec: []const u8)
 }
 
 pub fn defaultEffortTierForSubsystem(subsystem: []const u8) EffortTier {
-    if (std.mem.eql(u8, subsystem, "greeting")) return .basic;
-    if (std.mem.eql(u8, subsystem, "intent")) return .basic;
     if (std.mem.eql(u8, subsystem, "want_achievement")) return .basic;
     if (std.mem.eql(u8, subsystem, "psyche_id")) return .basic;
     if (std.mem.eql(u8, subsystem, "psyche_superego")) return .basic;
     if (std.mem.eql(u8, subsystem, "memory_extraction")) return .standard;
-    if (std.mem.eql(u8, subsystem, "memory_selection")) return .standard;
     if (std.mem.eql(u8, subsystem, "autonomy")) return .standard;
     if (std.mem.eql(u8, subsystem, "conversation")) return .standard;
     if (std.mem.eql(u8, subsystem, "identity_comparison")) return .standard;

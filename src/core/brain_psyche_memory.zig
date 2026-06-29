@@ -12,9 +12,7 @@ const ports = @import("ports.zig");
 const schema = ports.schema;
 const store_mod = ports.store;
 const graph_store = ports.graph_store;
-const intent_mod = ports.intent;
 const openai = ports.openai;
-const greeting_client = ports.greeting;
 const speech_mod = ports.speech;
 const chat_mod = ports.chat;
 const skills_mod = ports.skills;
@@ -183,6 +181,10 @@ pub fn reinforceAchievedWant(self: *Brain, want: schema.MemoryRecord, match: wan
     const strength = helpers.wantReinforcementStrength(want);
     const existing_appraisals = try self.deps.store.loadAppraisals(self.allocator);
     const tags = try helpers.cloneConstStringSlice(self.allocator, &[_][]const u8{ "self_model", "self_want", "want_achievement", "positive_reinforcement", "flexible_identity" });
+    const action_tendency_text = if (wantRelatesToInteractionSharing(want))
+        try self.allocator.dupe(u8, "acknowledge achievement in speech when user is present")
+    else
+        try self.allocator.dupe(u8, "integrate achievement and reconsider self-definition");
     const appraisal = schema.Appraisal{
         .appraisal_id = try std.fmt.allocPrint(self.allocator, "appraisal_want_achievement_{d}_{d}_{s}", .{ self.now_seconds, existing_appraisals.len, want.memory_id }),
         .impression_id = null,
@@ -195,7 +197,7 @@ pub fn reinforceAchievedWant(self: *Brain, want: schema.MemoryRecord, match: wan
         .curiosity = 0.40 + 0.35 * strength,
         .stress = 0.05,
         .feeling_label = try self.allocator.dupe(u8, "reinforced satisfaction"),
-        .action_tendency = try self.allocator.dupe(u8, "integrate achievement and reconsider self-definition"),
+        .action_tendency = action_tendency_text,
         .expression = try self.allocator.dupe(u8, "open and warm"),
         .dynamics = try self.allocator.dupe(u8, "positive reinforcement opens a short flexible identity period until dream reconciliation"),
         .freeform = try std.fmt.allocPrint(self.allocator, "Achieving this want lands positively with reinforcement_strength={d:.3}; the brain should carry this into flexible identity dreaming. evidence={s}", .{ strength, match.evidence }),
@@ -233,7 +235,7 @@ pub fn reinforceAchievedWant(self: *Brain, want: schema.MemoryRecord, match: wan
     pending.valence = 0.35 + strength * 0.45;
     pending.interpretation = try std.fmt.allocPrint(self.allocator, "pending flexible identity from achieved want {s}: {s}", .{ want.memory_id, match.evidence });
     try self.deps.store.saveMemoryRecord(pending);
-    try self.recordExperienceLogEvent(.{
+    _ = try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "brain",
         .title = "want_achievement",
@@ -248,6 +250,18 @@ pub fn reinforceAchievedWant(self: *Brain, want: schema.MemoryRecord, match: wan
         .created_memory_id = pending.memory_id,
         .tags = pending.tags,
     });
+}
+
+fn wantRelatesToInteractionSharing(want: schema.MemoryRecord) bool {
+    for (want.tags) |tag| {
+        if (std.mem.eql(u8, tag, "express") or std.mem.eql(u8, tag, "share")) return true;
+    }
+    const text = helpers.memoryInterpretation(want);
+    return std.mem.indexOf(u8, text, "share") != null
+        or std.mem.indexOf(u8, text, "connect") != null
+        or std.mem.indexOf(u8, text, "interact") != null
+        or std.mem.indexOf(u8, text, "speak") != null
+        or std.mem.indexOf(u8, text, "talk") != null;
 }
 
 pub fn thinkAbout(self: *Brain, query: []const u8, tags: []const []const u8) ![]const u8 {
@@ -279,7 +293,7 @@ pub fn thinkAbout(self: *Brain, query: []const u8, tags: []const []const u8) ![]
         memory.tags,
     );
     try self.deps.store.saveMemoryRecord(memory);
-    try self.recordExperienceLogEvent(.{
+    _ = try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "memory",
         .title = "thought",
@@ -336,7 +350,7 @@ pub fn defineSelf(self: *Brain, kind: SelfDirectiveKind, text: []const u8, tags:
         memory.tags,
     );
     try self.deps.store.saveMemoryRecord(memory);
-    try self.recordExperienceLogEvent(.{
+    _ = try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "brain",
         .title = @tagName(kind),
@@ -378,7 +392,7 @@ pub fn editSelf(self: *Brain, kind: SelfDirectiveKind, memory_id: []const u8, te
     var updated = existing;
     updated.text = try self.allocator.dupe(u8, trimmed_text);
     updated.interpretation = try std.fmt.allocPrint(self.allocator, "self-defined {s}: {s}", .{ @tagName(kind), trimmed_text });
-    updated.vector = try vector_index.embedQuery(self.allocator, trimmed_text, directive_tags);
+    updated.vector = try vector_index.embedQuery(self.allocator, self.deps.embedding_service, trimmed_text, directive_tags);
     updated.confidence = @max(existing.confidence, 0.78);
     updated.salience = @max(existing.salience, emotion.estimateSalience(trimmed_text, directive_tags));
     updated.tags = directive_tags;
@@ -406,7 +420,7 @@ pub fn editSelf(self: *Brain, kind: SelfDirectiveKind, memory_id: []const u8, te
         updated.tags,
     );
     try self.deps.store.saveMemoryRecord(updated);
-    try self.recordExperienceLogEvent(.{
+    _ = try self.recordExperienceLogEvent(.{
         .kind = .memory_mutation,
         .source = "brain",
         .title = @tagName(kind),
@@ -470,7 +484,9 @@ fn deriveTopPriority(self: *Brain) !DerivedFocus {
         .autonomy_max_capacity = if (autonomy_state) |state| state.max_capacity else self.cfg.autonomy_full_max_capacity,
         .autonomy_sleeping = if (autonomy_state) |state| state.sleeping else null,
     });
+    defer needs_mod.freeNeeds(self.allocator, active_needs);
     for (active_needs) |need| {
+        if (std.mem.eql(u8, need.need_id, "conversation_reply")) continue;
         if (need.urgency == .urgent or need.urgency == .need) {
             return .{
                 .priority = "self_need",
@@ -643,12 +659,13 @@ pub fn recallMemories(self: *Brain, query: []const u8, tags: []const []const u8)
     const memories = try self.deps.store.loadMemoryRecords(self.allocator);
     var out = std.ArrayList(u8).empty;
     try out.appendSlice(self.allocator, "memory_recall:\n");
-    const results = try vector_index.search(self.allocator, memories, query, tags, 8);
+    const results = try vector_index.search(self.allocator, self.deps.embedding_service, memories, query, tags, 8);
+    const expected_dimensions = self.deps.embedding_service.dimensions();
     for (results) |result| {
         const memory = memories[result.memory_index];
         var updated = memory;
-        if (updated.vector.len != vector_index.dimensions) {
-            updated.vector = try vector_index.embedMemory(self.allocator, updated);
+        if (updated.vector.len != expected_dimensions) {
+            updated.vector = try vector_index.embedMemory(self.allocator, self.deps.embedding_service, updated);
         }
         updated.access_count += 1;
         updated.score += 2;
@@ -716,7 +733,7 @@ pub fn logSimple(self: *Brain, state: state_mod.BrainState, image: ?[]const u8, 
     _ = image;
     _ = person_id;
     const interpretation = brain_text orelse update;
-    try self.recordExperienceLogEvent(.{
+    _ = try self.recordExperienceLogEvent(.{
         .kind = .state_change,
         .source = "brain",
         .title = state.jsonName(),

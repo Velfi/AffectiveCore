@@ -19,6 +19,7 @@ pub const JsonMemoryStore = struct {
     memory_path: []const u8,
     capture_dir: []const u8,
     cached: ?schema.CognitiveFile = null,
+    persist_deferred: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, memory_path: []const u8) JsonMemoryStore {
         return initWithCaptureDir(allocator, io, memory_path, default_capture_dir);
@@ -95,6 +96,8 @@ pub const JsonMemoryStore = struct {
             .loadActivityStackFn = loadActivityStack,
             .appendActivityHistoryFn = appendActivityHistory,
             .loadActivityHistoryFn = loadActivityHistory,
+            .beginDeferredPersistFn = beginDeferredPersist,
+            .endDeferredPersistFn = endDeferredPersist,
         };
     }
 
@@ -122,11 +125,24 @@ pub const JsonMemoryStore = struct {
     }
 
     fn persistCached(self: *JsonMemoryStore) !void {
+        if (self.persist_deferred > 0) return;
         const data = self.cached orelse return error.MissingCachedCognitiveFile;
         try persistence.validateCognitiveFile(data);
         const json = try std.json.Stringify.valueAlloc(self.allocator, data, .{ .whitespace = .indent_2 });
         defer self.allocator.free(json);
         try persistence.writeCognitiveJson(self.allocator, self.io, self.memory_path, json);
+    }
+
+    fn beginDeferredPersist(ctx: *anyopaque) !void {
+        const self: *JsonMemoryStore = @ptrCast(@alignCast(ctx));
+        self.persist_deferred += 1;
+    }
+
+    fn endDeferredPersist(ctx: *anyopaque) !void {
+        const self: *JsonMemoryStore = @ptrCast(@alignCast(ctx));
+        if (self.persist_deferred == 0) return error.DeferredPersistNotActive;
+        self.persist_deferred -= 1;
+        if (self.persist_deferred == 0) try self.persistCached();
     }
 
 

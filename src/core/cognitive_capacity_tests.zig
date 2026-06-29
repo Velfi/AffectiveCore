@@ -62,7 +62,7 @@ const MemoryFileSystem = struct {
 
 test "validateCapacityConfig rejects invalid memory selection bounds" {
     var cfg = config.CapacityConfig{};
-    cfg.memory_selected_max = 20;
+    cfg.memory_selected_max = 60;
     try std.testing.expectError(error.MemorySelectedExceedsPrefilter, cognitive_capacity.validate(cfg));
 }
 
@@ -80,7 +80,7 @@ test "parseRuntimeOptionsConfig round-trips capacity block" {
     );
     try std.testing.expectEqual(@as(usize, 6), parsed.capacity.activity_stack_max);
     try std.testing.expectEqual(@as(usize, 4), parsed.capacity.memory_selected_max);
-    try std.testing.expectEqual(@as(usize, 15), parsed.capacity.memory_prefilter_max);
+    try std.testing.expectEqual(@as(usize, 50), parsed.capacity.memory_prefilter_max);
 }
 
 test "loadForBrain applies runtime llm_quality over llm providers file" {

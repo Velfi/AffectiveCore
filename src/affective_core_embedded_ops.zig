@@ -10,19 +10,48 @@ const schema = @import("core/port_schema.zig");
 const input_mod = @import("platform/common/input.zig");
 
 const AffectiveCoreEmbedded = embedded.AffectiveCoreEmbedded;
+const brain_facial_expression = @import("core/brain_facial_expression.zig");
+
+fn logConnectFailure(comptime step: []const u8, err: anyerror) void {
+    std.debug.print("embedded connect failed at {s}: {s}\n", .{ step, @errorName(err) });
+}
 
 pub fn connect(ctx: *AffectiveCoreEmbedded) !read_models.Snapshot {
-    _ = try ctx.brain.recordSimpleExperienceEvent("Host.Connected", .host, "connect");
-    try appendMiseEnScene(ctx);
-    return try ctx.brain.readModelsSnapshot(ctx.allocator());
+    _ = ctx.brain.recordSimpleExperienceEvent("Host.Connected", .host, "connect") catch |err| {
+        logConnectFailure("record_host_connected", err);
+        return err;
+    };
+    if (ctx.brain.deps.facial_expression_output != null and ctx.host_capabilities.facial_expression_output) {
+        _ = ctx.brain.refreshFacialExpressionCatalog() catch |err| {
+            logConnectFailure("refresh_facial_expression_catalog", err);
+            return err;
+        };
+    }
+    appendMiseEnScene(ctx) catch |err| {
+        logConnectFailure("append_mise_en_scene", err);
+        return err;
+    };
+    ctx.brain.refreshPersonaVoiceFromSeed() catch |err| {
+        logConnectFailure("refresh_persona_voice_from_seed", err);
+        return err;
+    };
+    try ctx.brain.refreshPersonaDirectiveFromStore();
+    _ = @import("core/brain_memory_backfill.zig").embedBackfillMemories(&ctx.brain) catch |err| {
+        logConnectFailure("embed_backfill_memories", err);
+        return err;
+    };
+    return ctx.brain.readModelsSnapshot(ctx.dispatchScratch()) catch |err| {
+        logConnectFailure("read_models_snapshot", err);
+        return err;
+    };
 }
 
 pub fn appendMiseEnScene(ctx: *AffectiveCoreEmbedded) !void {
     const effects = ctx.host_effects orelse return error.MissingHostEffects;
     const scene = try mise_en_scene.resolve(&ctx.brain);
     defer {
-        ctx.allocator().free(scene.name);
-        if (scene.theme_color) |color| ctx.allocator().free(color);
+        ctx.brainAllocator().free(scene.name);
+        if (scene.theme_color) |color| ctx.brainAllocator().free(color);
     }
     try effects.appendMiseEnScene(scene.name, scene.theme_color);
 }
@@ -34,8 +63,8 @@ pub fn hostAttach(ctx: *AffectiveCoreEmbedded, args: std.json.Value) !schema.Hos
         .platform = getString(args, "platform") orelse "",
         .app_version = getString(args, "app_version") orelse "",
         .attached_at_ms = ctx.brain.now_seconds * 1000,
-        .permissions = try getStringArray(ctx.allocator(), args, "permissions"),
-        .capability_ids = try getStringArray(ctx.allocator(), args, "capability_ids"),
+        .permissions = try getStringArray(ctx.dispatchScratch(), args, "permissions"),
+        .capability_ids = try getStringArray(ctx.dispatchScratch(), args, "capability_ids"),
         .provider_availability = getString(args, "provider_availability") orelse "",
         .sensor_quality = getString(args, "sensor_quality") orelse "",
         .local_policy = getString(args, "local_policy") orelse "",
@@ -45,20 +74,34 @@ pub fn hostAttach(ctx: *AffectiveCoreEmbedded, args: std.json.Value) !schema.Hos
     return binding;
 }
 
-pub fn hostCapabilityManifest(ctx: *AffectiveCoreEmbedded, args: std.json.Value) !usize {
-    const host_id = getString(args, "host_id") orelse try ctx.allocator().dupe(u8, ctx.brain.currentHostId());
-    const ids = try getStringArray(ctx.allocator(), args, "capability_ids");
-    try ctx.brain.recordManifestStatuses(host_id, ids);
-    return ids.len;
+const capabilities = @import("core/capabilities.zig");
+
+pub const HostCapabilityManifestResult = struct {
+    capability_count: usize,
+    manifest_timings: []capabilities.ManifestStatusTiming,
+};
+
+pub fn hostCapabilityManifest(ctx: *AffectiveCoreEmbedded, args: std.json.Value) !HostCapabilityManifestResult {
+    const host_id = getString(args, "host_id") orelse try ctx.dispatchScratch().dupe(u8, ctx.brain.currentHostId());
+    const ids = try getStringArray(ctx.dispatchScratch(), args, "capability_ids");
+    const manifest_timings = try ctx.brain.recordManifestStatuses(host_id, ids);
+    return .{
+        .capability_count = ids.len,
+        .manifest_timings = manifest_timings,
+    };
+}
+
+pub fn refreshFacialExpressionCatalog(ctx: *AffectiveCoreEmbedded) !brain_facial_expression.FacialExpressionCatalogSnapshot {
+    return try ctx.brain.refreshFacialExpressionCatalog();
 }
 
 pub fn sendExperienceEvent(ctx: *AffectiveCoreEmbedded, args: std.json.Value) !schema.ExperienceEvent {
     const kind = try requireString(args, "kind");
     const payload = getString(args, "payload") orelse "";
     const event: schema.ExperienceEvent = .{
-        .id = getString(args, "id") orelse try std.fmt.allocPrint(ctx.allocator(), "host_evt_{d}_{s}", .{ ctx.brain.now_seconds * 1000, kind }),
+        .id = getString(args, "id") orelse try std.fmt.allocPrint(ctx.dispatchScratch(), "host_evt_{d}_{s}", .{ ctx.brain.now_seconds * 1000, kind }),
         .brain_id = ctx.brain.cfg.brain_id,
-        .host_id = getString(args, "host_id") orelse try ctx.allocator().dupe(u8, ctx.brain.currentHostId()),
+        .host_id = getString(args, "host_id") orelse try ctx.dispatchScratch().dupe(u8, ctx.brain.currentHostId()),
         .timestamp_ms = getInteger(args, "timestamp_ms") orelse ctx.brain.now_seconds * 1000,
         .source = experienceEventSourceFromString(getString(args, "source") orelse "host"),
         .kind = kind,
@@ -68,7 +111,7 @@ pub fn sendExperienceEvent(ctx: *AffectiveCoreEmbedded, args: std.json.Value) !s
         .valence = getF32(args, "valence") orelse 0.0,
         .arousal = getF32(args, "arousal") orelse 0.0,
         .uncertainty = getF32(args, "uncertainty") orelse 0.30,
-        .causal_parent_ids = try getStringArray(ctx.allocator(), args, "causal_parent_ids"),
+        .causal_parent_ids = try getStringArray(ctx.dispatchScratch(), args, "causal_parent_ids"),
         .retention = retentionFromString(getString(args, "retention") orelse "episode"),
         .visibility = visibilityFromString(getString(args, "visibility") orelse "internal"),
     };
@@ -87,23 +130,23 @@ pub fn brainMode(ctx: *AffectiveCoreEmbedded) !schema.BrainMode {
 }
 
 pub fn readModelsSnapshot(ctx: *AffectiveCoreEmbedded) !read_models.Snapshot {
-    return try ctx.brain.readModelsSnapshot(ctx.allocator());
+    return try ctx.brain.readModelsSnapshot(ctx.dispatchScratch());
 }
 
 pub fn mailboxList(ctx: *AffectiveCoreEmbedded) ![]schema.MailboxItem {
-    return try ctx.brain.deps.store.loadMailboxItems(ctx.allocator());
+    return try ctx.brain.deps.store.loadMailboxItems(ctx.dispatchScratch());
 }
 
 pub fn mailboxMarkRead(ctx: *AffectiveCoreEmbedded, args: std.json.Value) ![]schema.MailboxItem {
     const mailbox_id = try requireString(args, "mailbox_id");
     _ = try ctx.brain.markMailboxRead(mailbox_id);
-    return try ctx.brain.deps.store.loadMailboxItems(ctx.allocator());
+    return try ctx.brain.deps.store.loadMailboxItems(ctx.dispatchScratch());
 }
 
 pub fn capabilityStatus(ctx: *AffectiveCoreEmbedded, args: std.json.Value) !schema.CapabilityStatus {
     const status: schema.CapabilityStatus = .{
         .capability_id = try requireString(args, "capability_id"),
-        .host_id = getString(args, "host_id") orelse try ctx.allocator().dupe(u8, ctx.brain.currentHostId()),
+        .host_id = getString(args, "host_id") orelse try ctx.dispatchScratch().dupe(u8, ctx.brain.currentHostId()),
         .permission = permissionFromString(getString(args, "permission") orelse "unknown"),
         .availability = availabilityFromString(getString(args, "availability") orelse "unavailable"),
         .quality = getF32(args, "quality") orelse 0.0,
@@ -120,7 +163,7 @@ pub fn capabilityStatus(ctx: *AffectiveCoreEmbedded, args: std.json.Value) !sche
 
 pub fn exportBrain(ctx: *AffectiveCoreEmbedded, args: std.json.Value) !brain_container.BrainManifest {
     const path = try requireString(args, "brain_file_path");
-    const manifest = try brain_container.exportBrain(ctx.allocator(), ctx.io(), ctx.brain.cfg, path);
+    const manifest = try brain_container.exportBrain(ctx.dispatchScratch(), ctx.io(), ctx.brain.cfg, path);
     _ = try ctx.brain.recordSimpleExperienceEvent("Brain.Exported", .system, path);
     return manifest;
 }
@@ -140,9 +183,9 @@ pub fn importBrain(ctx: *AffectiveCoreEmbedded, args: std.json.Value) !brain_con
     try embedded.reloadEmbeddedBrain(ctx, manifest.brain_id, brain_root);
     const host_id = getString(args, "host_id") orelse ctx.brain.currentHostId();
     const payload = if (host_id.len > 0)
-        try std.fmt.allocPrint(ctx.allocator(), "brain_id={s}; brain_root={s}; host_id={s}", .{ manifest.brain_id, brain_root, host_id })
+        try std.fmt.allocPrint(ctx.dispatchScratch(), "brain_id={s}; brain_root={s}; host_id={s}", .{ manifest.brain_id, brain_root, host_id })
     else
-        try std.fmt.allocPrint(ctx.allocator(), "brain_id={s}; brain_root={s}", .{ manifest.brain_id, brain_root });
+        try std.fmt.allocPrint(ctx.dispatchScratch(), "brain_id={s}; brain_root={s}", .{ manifest.brain_id, brain_root });
     _ = try ctx.brain.recordSimpleExperienceEvent("Brain.Imported", .system, payload);
     if (host_id.len > 0) _ = try ctx.brain.recordSimpleExperienceEvent("Host.BindingChangedAfterImport", .host, host_id);
     return manifest;
@@ -154,7 +197,7 @@ pub fn shortTouchActivation(ctx: *AffectiveCoreEmbedded) !app_core.ActionExecuti
         if (try ctx.brain.handleTouchStimulusError(err)) {
             return .{
                 .action = .unknown,
-                .observation = try observations.toOwnedSlice(ctx.allocator()),
+                .observation = try observations.toOwnedSlice(ctx.dispatchScratch()),
                 .spoken_text = null,
                 .ended_with_speech = false,
                 .interrupted_by = null,
@@ -165,7 +208,7 @@ pub fn shortTouchActivation(ctx: *AffectiveCoreEmbedded) !app_core.ActionExecuti
     const spoken_text = if (conversation) |turn| turn.spoken_text else null;
     return .{
         .action = .unknown,
-        .observation = try observations.toOwnedSlice(ctx.allocator()),
+        .observation = try observations.toOwnedSlice(ctx.dispatchScratch()),
         .spoken_text = spoken_text,
         .ended_with_speech = spoken_text != null and spoken_text.?.len > 0,
         .interrupted_by = null,
@@ -177,7 +220,7 @@ pub fn longTouchActivation(ctx: *AffectiveCoreEmbedded) !app_core.ActionExecutio
     const spoken_text = if (conversation) |turn| turn.spoken_text else null;
     return .{
         .action = .unknown,
-        .observation = try ctx.allocator().dupe(u8, ""),
+        .observation = try ctx.dispatchScratch().dupe(u8, ""),
         .spoken_text = spoken_text,
         .ended_with_speech = spoken_text != null and spoken_text.?.len > 0,
         .interrupted_by = null,

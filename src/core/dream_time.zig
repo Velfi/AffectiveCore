@@ -3,6 +3,7 @@ const brain_mod = @import("brain.zig");
 const belief_updates = @import("belief_updates.zig");
 const experience_kinds = @import("experience_kinds.zig");
 const brain_dream_memory = @import("brain_dream_memory.zig");
+const helpers = @import("brain_helpers.zig");
 const ports = @import("ports.zig");
 const schema = ports.schema;
 const Brain = brain_mod.Brain;
@@ -65,7 +66,6 @@ pub fn requestDreamTime(self: *Brain, prompt: ?[]const u8) !schema.MailboxItem {
         try std.fmt.allocPrint(self.allocator, "I dreamed over {d} remembered traces and {d} capability failures from today.", .{ source_ids.len, residue.failure_capability_ids.len })
     else
         try std.fmt.allocPrint(self.allocator, "I dreamed over {d} remembered traces and let the day settle into quieter patterns.", .{source_ids.len});
-    const waking = try std.fmt.allocPrint(self.allocator, "I may ask more carefully where uncertainty is high, and trust repeated outcomes more than single impressions.", .{});
     const mailbox_id = try std.fmt.allocPrint(self.allocator, "mail_dream_{d}", .{self.now_seconds * 1000});
     const dream_id = try std.fmt.allocPrint(self.allocator, "dream_time_{d}", .{self.now_seconds * 1000});
     const spec: schema.DreamImageSpec = .{
@@ -113,9 +113,36 @@ pub fn requestDreamTime(self: *Brain, prompt: ?[]const u8) !schema.MailboxItem {
     });
     const disposition_id = try std.fmt.allocPrint(self.allocator, "disp_dream_uncertainty_{d}", .{self.now_seconds});
     const generated_artifact_id = try generateDreamImageArtifact(self, spec, prompt);
+    const disposition_tendency = "ask a clarifying question before acting certain";
+    const persona_residue = try collectPersonaResidue(self, memories, source_ids, residue);
+    defer freePersonaResidue(self.allocator, persona_residue);
+    const persona_directive = try self.synthesizeDreamPersonaDirective(
+        belief_proposition,
+        disposition_tendency,
+        reconciliation_count,
+        persona_residue,
+    );
+    defer persona_directive.deinit(self.allocator);
+    try self.setPersonaDirective(persona_directive);
+    const waking = try self.allocator.dupe(u8, persona_directive.short_term);
+    const persona_directive_event = try self.recordSimpleExperienceEvent(
+        experience_kinds.dream_time_persona_directive_synthesized,
+        .dream_time,
+        dream_id,
+    );
+    const dream_source_event_ids = try combineEventIds(
+        self.allocator,
+        source_event_ids,
+        &[_][]const u8{persona_directive_event.id},
+        &.{},
+    );
+    defer {
+        for (dream_source_event_ids) |id| self.allocator.free(id);
+        self.allocator.free(dream_source_event_ids);
+    }
     var dream_record: schema.DreamTimeRecord = .{
         .dream_id = dream_id,
-        .source_event_ids = source_event_ids,
+        .source_event_ids = try cloneEventIds(self.allocator, dream_source_event_ids),
         .source_memory_ids = source_ids,
         .updated_belief_ids = try cloneEventIds(self.allocator, &[_][]const u8{belief_id}),
         .self_trust_change_ids = try cloneEventIds(self.allocator, &[_][]const u8{self_trust_id}),
@@ -126,6 +153,9 @@ pub fn requestDreamTime(self: *Brain, prompt: ?[]const u8) !schema.MailboxItem {
         .title = title,
         .text = text,
         .waking_thought = waking,
+        .persona = try self.allocator.dupe(u8, persona_directive.persona),
+        .short_term = try self.allocator.dupe(u8, persona_directive.short_term),
+        .long_term = try self.allocator.dupe(u8, persona_directive.long_term),
         .image_spec = spec,
         .created_at_ms = self.now_seconds * 1000,
     };
@@ -350,6 +380,31 @@ fn experienceEventExists(self: *Brain, event_id: []const u8) !bool {
         if (std.mem.eql(u8, event.id, event_id)) return true;
     }
     return false;
+}
+
+fn collectPersonaResidue(
+    self: *Brain,
+    memories: []const schema.MemoryRecord,
+    source_ids: []const []const u8,
+    residue: DayResidue,
+) !brain_dream_memory.DreamPersonaResidue {
+    var interpretations = std.ArrayList([]const u8).empty;
+    for (source_ids) |memory_id| {
+        for (memories) |memory| {
+            if (!std.mem.eql(u8, memory.memory_id, memory_id)) continue;
+            try interpretations.append(self.allocator, try self.allocator.dupe(u8, helpers.memoryInterpretation(memory)));
+            break;
+        }
+    }
+    return .{
+        .failure_capability_ids = residue.failure_capability_ids,
+        .memory_interpretations = try interpretations.toOwnedSlice(self.allocator),
+    };
+}
+
+fn freePersonaResidue(allocator: std.mem.Allocator, residue: brain_dream_memory.DreamPersonaResidue) void {
+    for (residue.memory_interpretations) |interpretation| allocator.free(interpretation);
+    if (residue.memory_interpretations.len > 0) allocator.free(residue.memory_interpretations);
 }
 
 fn selectMemoryIds(allocator: std.mem.Allocator, memories: []const schema.MemoryRecord, residue: DayResidue) ![][]const u8 {

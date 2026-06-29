@@ -49,6 +49,7 @@ pub const RandomProviderMemoryExtractionService = struct {
             .response_validator = validateExtractionCandidates,
             .bad_response_logger = reportExtractionParseError,
         });
+        defer self.provider_client.freeHttpResponse(allocator, content);
         return parseExtractionCandidates(allocator, content);
     }
 };

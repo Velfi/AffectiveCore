@@ -38,16 +38,26 @@ pub const SeedEntry = struct {
 pub const SeedDocument = struct {
     name: []const u8,
     entries: []const SeedEntry,
+    voice_lines: []const []const u8 = &.{},
 };
 
 const Section = enum {
     other,
     core_values,
     operating_tendencies,
+    voice,
     wants,
     goals,
     superego_principles,
 };
+
+pub fn freeSeedDocument(allocator: std.mem.Allocator, doc: SeedDocument) void {
+    allocator.free(doc.name);
+    for (doc.entries) |entry| allocator.free(entry.text);
+    if (doc.entries.len > 0) allocator.free(doc.entries);
+    for (doc.voice_lines) |line| allocator.free(line);
+    if (doc.voice_lines.len > 0) allocator.free(doc.voice_lines);
+}
 
 pub fn readSeedFile(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, path: []const u8) !SeedDocument {
     const bytes = try fs.readFileAllocPath(io, path, allocator, .limited(128 * 1024));
@@ -55,10 +65,59 @@ pub fn readSeedFile(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, pa
     return parseSeedMarkdown(allocator, bytes);
 }
 
+pub fn freeSeedVoiceLines(allocator: std.mem.Allocator, lines: []const []const u8) void {
+    if (lines.len == 0) return;
+    for (lines) |line| allocator.free(line);
+    allocator.free(lines);
+}
+
+pub fn readSeedVoiceLines(allocator: std.mem.Allocator, fs: FileSystem, io: std.Io, path: []const u8) ![]const []const u8 {
+    const bytes = fs.readFileAllocPath(io, path, allocator, .limited(128 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    return parseSeedVoiceMarkdown(allocator, bytes);
+}
+
+pub fn parseSeedVoiceMarkdown(allocator: std.mem.Allocator, markdown: []const u8) ![]const []const u8 {
+    var section: Section = .other;
+    var voice_lines = std.ArrayList([]const u8).empty;
+
+    var lines = std.mem.splitScalar(u8, markdown, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \r\t");
+        if (line.len == 0) continue;
+
+        if (std.mem.startsWith(u8, line, "# ")) {
+            section = .other;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, line, "## ")) {
+            const heading = std.mem.trim(u8, line[3..], " \r\t");
+            section = if (std.ascii.eqlIgnoreCase(heading, "Voice"))
+                .voice
+            else
+                .other;
+            continue;
+        }
+
+        if (section != .voice) continue;
+        if (!std.mem.startsWith(u8, line, "- ")) return error.InvalidSeedBullet;
+        const text = std.mem.trim(u8, line[2..], " \r\t");
+        if (text.len == 0) return error.EmptySeedBullet;
+        try voice_lines.append(allocator, try allocator.dupe(u8, text));
+    }
+
+    return try voice_lines.toOwnedSlice(allocator);
+}
+
 pub fn parseSeedMarkdown(allocator: std.mem.Allocator, markdown: []const u8) !SeedDocument {
     var name: ?[]const u8 = null;
     var section: Section = .other;
     var entries = std.ArrayList(SeedEntry).empty;
+    var voice_lines = std.ArrayList([]const u8).empty;
     var core_count: usize = 0;
     var tendency_count: usize = 0;
     var want_count: usize = 0;
@@ -85,6 +144,8 @@ pub fn parseSeedMarkdown(allocator: std.mem.Allocator, markdown: []const u8) !Se
                 .core_values
             else if (std.ascii.eqlIgnoreCase(heading, "Operating Tendencies"))
                 .operating_tendencies
+            else if (std.ascii.eqlIgnoreCase(heading, "Voice"))
+                .voice
             else if (std.ascii.eqlIgnoreCase(heading, "Wants"))
                 .wants
             else if (std.ascii.eqlIgnoreCase(heading, "Goals"))
@@ -97,6 +158,12 @@ pub fn parseSeedMarkdown(allocator: std.mem.Allocator, markdown: []const u8) !Se
         }
 
         switch (section) {
+            .voice => {
+                if (!std.mem.startsWith(u8, line, "- ")) return error.InvalidSeedBullet;
+                const text = std.mem.trim(u8, line[2..], " \r\t");
+                if (text.len == 0) return error.EmptySeedBullet;
+                try voice_lines.append(allocator, try allocator.dupe(u8, text));
+            },
             .core_values, .operating_tendencies, .wants, .goals, .superego_principles => {
                 if (!std.mem.startsWith(u8, line, "- ")) return error.InvalidSeedBullet;
                 const text = std.mem.trim(u8, line[2..], " \r\t");
@@ -107,7 +174,7 @@ pub fn parseSeedMarkdown(allocator: std.mem.Allocator, markdown: []const u8) !Se
                     .wants => .want,
                     .goals => .goal,
                     .superego_principles => .superego_principle,
-                    .other => unreachable,
+                    .other, .voice => unreachable,
                 };
                 const index = switch (kind) {
                     .core_value => blk: {
@@ -150,6 +217,7 @@ pub fn parseSeedMarkdown(allocator: std.mem.Allocator, markdown: []const u8) !Se
     return .{
         .name = name.?,
         .entries = try entries.toOwnedSlice(allocator),
+        .voice_lines = try voice_lines.toOwnedSlice(allocator),
     };
 }
 
@@ -200,4 +268,23 @@ test "parse seed markdown requires core values" {
         \\## Notes
         \\No core values here.
     ));
+}
+
+test "parse seed voice markdown ignores missing core values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const voice_lines = try parseSeedVoiceMarkdown(arena.allocator(),
+        \\# Mara Seed Orientation
+        \\
+        \\## Wants
+        \\- Continue existing.
+        \\
+        \\## Goals
+        \\- Figure out who I am.
+        \\
+        \\## Voice
+        \\- Speak plainly and warmly.
+    );
+    try std.testing.expectEqual(@as(usize, 1), voice_lines.len);
+    try std.testing.expectEqualStrings("Speak plainly and warmly.", voice_lines[0]);
 }

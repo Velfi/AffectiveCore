@@ -8,6 +8,16 @@ pub fn isDeferredControlFlow(err: anyerror) bool {
     return isAwaitedHostSense(err);
 }
 
+pub fn isRecoverableSkillFailure(err: anyerror) bool {
+    return switch (err) {
+        error.MissingEmoteOutput,
+        error.MissingFacialExpressionOutput,
+        error.DisplayBudgetExceeded,
+        => true,
+        else => false,
+    };
+}
+
 pub fn name(err: anyerror) []const u8 {
     return @errorName(err);
 }
@@ -32,7 +42,6 @@ pub fn detail(err: anyerror) []const u8 {
         error.LocalServiceRequestRejected => "A remote provider rejected the request as invalid or unauthorized.",
         error.LocalServiceResponseInvalid => "A remote provider response was missing, malformed, or not JSON.",
         error.SyntaxError => "JSON parsing failed for a provider or host response.",
-        error.MissingMemorySelectionService => "Conversation memory selection requires a configured memory selection LLM service.",
         error.StreamTooLong => "An HTTP or process response exceeded the configured size limit.",
         error.HttpStatusFailed => "An HTTP request returned a non-success status code.",
         error.KnownRecognitionMissingPersonId => "Recognition reported a known match but did not include person_id.",
@@ -50,6 +59,8 @@ pub fn detail(err: anyerror) []const u8 {
         error.MissingRuntimeChatTurnSummary => "The conversation turn finished without chat summaries even though the runtime already spoke a recovery message.",
         error.RuntimeMissingChatTurn => "The runtime completed a turn pass but language interpretation never produced a chat turn.",
         error.RuntimeExecutionIncomplete => "The runtime created action proposals but did not finish executing or suppressing them before the turn ended.",
+        error.MissingFacialExpressionOutput => "Facial expression output is not configured on this host.",
+        error.DisplayBudgetExceeded => "Visible affect display budget exceeded for the current 5 second window (max 5000ms scheduled display time).",
         else => "",
     };
 }

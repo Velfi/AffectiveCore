@@ -290,3 +290,32 @@ test "runtime options override persisted preferences" {
     try std.testing.expectEqual(@as(f32, 0.9), cfg.known_threshold);
     try std.testing.expectEqualStrings("data/custom_state.json", cfg.maintenance_state_path);
 }
+
+test "resolveSeedPath maps embedded brain defaults to brain-local seed.md" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const default_cfg = try (Config{
+        .brain_root = try allocator.dupe(u8, "data/test/embedded_seed"),
+    }).resolveSeedPath(allocator);
+    try std.testing.expectEqualStrings("data/test/embedded_seed/seed.md", default_cfg.seed_path);
+
+    const relative_cfg = try (Config{
+        .brain_root = try allocator.dupe(u8, "data/test/embedded_seed"),
+        .seed_path = try allocator.dupe(u8, "seed.md"),
+    }).resolveSeedPath(allocator);
+    try std.testing.expectEqualStrings("data/test/embedded_seed/seed.md", relative_cfg.seed_path);
+
+    const stale_absolute_cfg = try (Config{
+        .brain_root = try allocator.dupe(u8, "data/test/embedded_seed"),
+        .seed_path = try allocator.dupe(u8, "/Users/dev/AffectiveCore/data/seeds/default.md"),
+    }).resolveSeedPath(allocator);
+    try std.testing.expectEqualStrings("data/test/embedded_seed/seed.md", stale_absolute_cfg.seed_path);
+
+    const repo_relative_cfg = try (Config{
+        .brain_root = try allocator.dupe(u8, "data/test/embedded_seed"),
+        .seed_path = try allocator.dupe(u8, "data/seeds/otto.md"),
+    }).resolveSeedPath(allocator);
+    try std.testing.expectEqualStrings("data/test/embedded_seed/seed.md", repo_relative_cfg.seed_path);
+}

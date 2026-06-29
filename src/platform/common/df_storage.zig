@@ -3,7 +3,7 @@ const process = @import("process.zig");
 const senses_mod = @import("system_senses.zig");
 
 pub fn readMount(allocator: std.mem.Allocator, io: std.Io, mount_path: []const u8) !senses_mod.StorageSnapshot {
-    const out = try process.runCapture(allocator, io, &.{ "df", "-kP", mount_path });
+    const out = try process.runCapture(allocator, io, &.{ "/bin/df", "-kP", mount_path });
     defer allocator.free(out);
 
     const volume = try parseDfKilobytePosix(allocator, out);
@@ -60,4 +60,19 @@ test "parses POSIX df storage output" {
     try std.testing.expectEqual(@as(u64, 1_024_000), volume.total_bytes);
     try std.testing.expectEqual(@as(u64, 256_000), volume.available_bytes);
     try std.testing.expectEqual(@as(u8, 75), volume.used_percent);
+}
+
+test "parses macOS df storage output" {
+    const text =
+        \\Filesystem     1024-blocks      Used Available Capacity  Mounted on
+        \\/dev/disk3s1s1   971350180  12275816 180905432     7%    /
+    ;
+    const volume = try parseDfKilobytePosix(std.testing.allocator, text);
+    defer std.testing.allocator.free(volume.name);
+    defer std.testing.allocator.free(volume.mount_path);
+    try std.testing.expectEqualStrings("/dev/disk3s1s1", volume.name);
+    try std.testing.expectEqualStrings("/", volume.mount_path);
+    try std.testing.expectEqual(@as(u64, 971_350_180 * 1024), volume.total_bytes);
+    try std.testing.expectEqual(@as(u64, 180_905_432 * 1024), volume.available_bytes);
+    try std.testing.expectEqual(@as(u8, 7), volume.used_percent);
 }

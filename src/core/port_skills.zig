@@ -40,6 +40,7 @@ pub const SkillId = enum {
     consolidate_memory,
     sleep_autonomy,
     wake_autonomy,
+    emote,
     facial_expression,
     unknown,
 };
@@ -169,6 +170,7 @@ pub const SenseSet = struct {
 
 pub const AutonomyPolicy = enum {
     allowed,
+    full_allowed,
     forbidden,
     invalid,
 };
@@ -181,6 +183,8 @@ pub const SkillSpec = struct {
     requires_skills: []const SkillId = &.{},
     autonomy_policy: AutonomyPolicy = .invalid,
     energy_cost: ?u8 = null,
+    /// When set, autonomy-origin actions use this tier instead of energy_cost.
+    autonomy_energy_cost: ?u8 = null,
     failure_hint: []const u8 = "",
     developer_title: ?[]const u8 = null,
     developer_symbol_name: ?[]const u8 = null,
@@ -195,13 +199,13 @@ pub const ActionSpec = struct {
 };
 
 pub const registry = [_]SkillSpec{
-    .{ .id = .say, .name = "say", .description = "speak aloud. Include text—the words to say, not a promise to say them later.", .requires_senses = &.{.speech_output}, .autonomy_policy = .allowed, .energy_cost = 5, .failure_hint = "Check speech output and speaker configuration." },
-    .{ .id = .take_picture, .name = "take_picture", .description = "gather a fresh visual observation of the room.", .requires_senses = &.{ .live_camera, .visual_description }, .autonomy_policy = .forbidden, .failure_hint = "Check camera and visual description configuration." },
-    .{ .id = .describe_image, .name = "describe_image", .description = "describe visible content from a fresh camera image, or from the latest uploaded image when no live camera is available. Optional text/query narrows what to describe.", .requires_senses = &.{.visual_description}, .autonomy_policy = .forbidden, .failure_hint = "Provide a live camera or upload an image, and configure visual description." },
-    .{ .id = .compare_images, .name = "compare_images", .description = "compare the latest stored visual observation with a fresh image. Optional text/query narrows what differences to look for.", .requires_senses = &.{ .live_camera, .visual_comparison, .stored_image_read }, .autonomy_policy = .forbidden, .failure_hint = "Capture or upload an image first, then ensure camera and visual comparison are configured." },
-    .{ .id = .recognize, .name = "recognize", .description = "use your identity-recognition skill to see who you are talking to, returning match status, name, confidence, and people count.", .requires_senses = &.{ .live_camera, .identity_recognition, .stored_memory_read, .stored_memory_write }, .autonomy_policy = .forbidden, .failure_hint = "Check camera, recognizer, and memory configuration.", .developer_title = "Recognize", .developer_symbol_name = "person.crop.square", .developer_mirror_to_chat = true, .developer_requires_camera = true },
+    .{ .id = .say, .name = "say", .description = "speak aloud. Include text—the words to say, not a promise to say them later.", .requires_senses = &.{.speech_output}, .autonomy_policy = .allowed, .energy_cost = 5, .autonomy_energy_cost = 3, .failure_hint = "Check speech output and speaker configuration." },
+    .{ .id = .take_picture, .name = "take_picture", .description = "gather a fresh visual observation of the room.", .requires_senses = &.{ .live_camera, .visual_description }, .autonomy_policy = .full_allowed, .energy_cost = 3, .failure_hint = "Check camera and visual description configuration." },
+    .{ .id = .describe_image, .name = "describe_image", .description = "describe visible content from a fresh camera image, or from the latest uploaded image when no live camera is available. Optional text/query narrows what to describe.", .requires_senses = &.{.visual_description}, .autonomy_policy = .full_allowed, .energy_cost = 3, .failure_hint = "Provide a live camera or upload an image, and configure visual description." },
+    .{ .id = .compare_images, .name = "compare_images", .description = "compare the latest stored visual observation with a fresh image. Optional text/query narrows what differences to look for.", .requires_senses = &.{ .live_camera, .visual_comparison, .stored_image_read }, .autonomy_policy = .full_allowed, .energy_cost = 4, .failure_hint = "Capture or upload an image first, then ensure camera and visual comparison are configured." },
+    .{ .id = .recognize, .name = "recognize", .description = "use your identity-recognition skill to see who you are talking to, returning match status, name, confidence, and people count.", .requires_senses = &.{ .live_camera, .identity_recognition, .stored_memory_read, .stored_memory_write }, .autonomy_policy = .full_allowed, .energy_cost = 4, .failure_hint = "Check camera, recognizer, and memory configuration.", .developer_title = "Recognize", .developer_symbol_name = "person.crop.square", .developer_mirror_to_chat = true, .developer_requires_camera = true },
     .{ .id = .get_time, .name = "get_time", .description = "observe the current date/time only.", .requires_senses = &.{.time_lookup}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check time lookup configuration." },
-    .{ .id = .request_orientation, .name = "request_orientation", .description = "ask the Apple host for a one-shot device orientation observation.", .requires_senses = &.{.orientation_query}, .autonomy_policy = .forbidden, .failure_hint = "Ask for host orientation only when the user has allowed orientation sensing." },
+    .{ .id = .request_orientation, .name = "request_orientation", .description = "ask the Apple host for a one-shot device orientation observation.", .requires_senses = &.{.orientation_query}, .autonomy_policy = .full_allowed, .energy_cost = 2, .failure_hint = "Ask for host orientation only when the user has allowed orientation sensing." },
     .{ .id = .get_power, .name = "get_power", .description = "observe battery levels and whether external power is plugged in.", .requires_senses = &.{.power_status}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check power status sensing configuration." },
     .{ .id = .get_storage, .name = "get_storage", .description = "observe storage fullness for mounted local filesystems.", .requires_senses = &.{.storage_fullness}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check storage fullness sensing configuration." },
     .{ .id = .get_database_stats, .name = "get_database_stats", .description = "observe SQLite database size, page, freelist, and table counts for memory stores.", .requires_senses = &.{.database_stats}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check database statistics sensing configuration." },
@@ -228,13 +232,14 @@ pub const registry = [_]SkillSpec{
     .{ .id = .send_email, .name = "send_email", .description = "send a plain-text email. Include to, subject, and text. Use only when the user clearly asks for email or explicitly consents to sending one.", .requires_senses = &.{.email_delivery}, .autonomy_policy = .invalid, .failure_hint = "Configure data/email.json and email delivery service." },
     .{ .id = .choose_attention, .name = "choose_attention", .description = "notice what currently seems worth attention.", .requires_senses = &.{.stored_memory_read}, .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Check memory read configuration.", .developer_title = "Attention", .developer_symbol_name = "scope", .developer_mirror_to_chat = true },
     .{ .id = .set_focus, .name = "set_focus", .description = "set a short plan as your current focus (working memory). Include text. Your focus leads your context while it stays fresh, then fades.", .autonomy_policy = .allowed, .energy_cost = 1, .failure_hint = "Provide non-empty focus text." },
-    .{ .id = .clear_focus, .name = "clear_focus", .description = "drop your current focus and return to deriving attention from what is happening now.", .autonomy_policy = .allowed, .energy_cost = 0, .failure_hint = "Focus can be cleared without extra host capability." },
-    .{ .id = .begin_subtask, .name = "begin_subtask", .description = "pause the current activity and open a child subtask without losing the main goal. Include text as the subtask goal. Run other skills after this in the same turn when needed; call resume_parent when the subtask is done.", .autonomy_policy = .allowed, .energy_cost = 0, .failure_hint = "Requires an active parent activity and non-empty subtask text." },
-    .{ .id = .resume_parent, .name = "resume_parent", .description = "mark the current child subtask complete and resume the paused parent activity from the activity stack.", .autonomy_policy = .allowed, .energy_cost = 0, .failure_hint = "Requires an open child subtask with a paused parent on the activity stack." },
+    .{ .id = .clear_focus, .name = "clear_focus", .description = "drop your current focus and return to deriving attention from what is happening now.", .autonomy_policy = .allowed, .energy_cost = @as(u8, 0), .failure_hint = "Focus can be cleared without extra host capability." },
+    .{ .id = .begin_subtask, .name = "begin_subtask", .description = "pause the current activity and open a child subtask without losing the main goal. Include text as the subtask goal. Run other skills after this in the same turn when needed; call resume_parent when the subtask is done.", .autonomy_policy = .allowed, .energy_cost = @as(u8, 0), .failure_hint = "Requires an active parent activity and non-empty subtask text." },
+    .{ .id = .resume_parent, .name = "resume_parent", .description = "mark the current child subtask complete and resume the paused parent activity from the activity stack.", .autonomy_policy = .allowed, .energy_cost = @as(u8, 0), .failure_hint = "Requires an open child subtask with a paused parent on the activity stack." },
     .{ .id = .consolidate_memory, .name = "consolidate_memory", .description = "enter internal dream time to consolidate memory and integrate the day's traces. Use when the user asks to dream, nap internally, or enter dream time now.", .requires_senses = &.{ .stored_memory_read, .stored_memory_write }, .autonomy_policy = .allowed, .energy_cost = 2, .failure_hint = "Check memory read/write configuration.", .developer_title = "Consolidate", .developer_symbol_name = "square.stack.3d.up" },
-    .{ .id = .sleep_autonomy, .name = "sleep_autonomy", .description = "pause self-directed autonomy actions until wake_autonomy is chosen. Optional text records why.", .autonomy_policy = .allowed, .energy_cost = 0, .failure_hint = "Autonomy sleep can be set without extra host capability." },
-    .{ .id = .wake_autonomy, .name = "wake_autonomy", .description = "resume self-directed autonomy actions after sleep_autonomy. Optional text records why.", .autonomy_policy = .allowed, .energy_cost = 0, .failure_hint = "Autonomy wake can be set without extra host capability." },
-    .{ .id = .facial_expression, .name = "facial_expression", .description = "silently show a WebView facial expression. Include eyes and mouth sprite names; optional duration_ms defaults to 3000 and may not exceed 5000. Eye sprites: neutral, stern, narrow, surprised, upward, concerned, unfocused, focused. Mouth sprites: smile_closed, smile_teeth, frown, kiss, grimace, open, disgust, smirk, uneasy_right, flat, parted, neutral_closed.", .requires_senses = &.{.facial_expression_output}, .autonomy_policy = .allowed, .energy_cost = 0, .failure_hint = "Use the macOS WebView activation mode and provide valid eyes and mouth sprite names." },
+    .{ .id = .sleep_autonomy, .name = "sleep_autonomy", .description = "pause self-directed autonomy actions until wake_autonomy is chosen. Optional text records why.", .autonomy_policy = .allowed, .energy_cost = @as(u8, 0), .failure_hint = "Autonomy sleep can be set without extra host capability." },
+    .{ .id = .wake_autonomy, .name = "wake_autonomy", .description = "resume self-directed autonomy actions after sleep_autonomy. Optional text records why.", .autonomy_policy = .allowed, .energy_cost = @as(u8, 0), .failure_hint = "Autonomy wake can be set without extra host capability." },
+    .{ .id = .emote, .name = "emote", .description = "silently show a brief third-person gesture in plain language; the host renders it as *text* in chat. Include text; optional duration_ms defaults to 3000 and may not exceed 5000. Use when facial_expression is unavailable or when a gesture fits text better than avatar sprites.", .autonomy_policy = .allowed, .energy_cost = @as(u8, 0), .failure_hint = "Provide non-empty emote text in plain language." },
+    .{ .id = .facial_expression, .name = "facial_expression", .description = "silently show a facial expression on the avatar. Set eyes, mouth, or both from facial_expression_catalog; unspecified eyes or mouth default to neutral sprites. Or set text to a preset id from that catalog; optional duration_ms defaults to 3000 and may not exceed 5000. Use introspect query=skill/facial_expression for the sprite menu. When facial expression output or catalog is unavailable, use emote for visible affect instead.", .requires_senses = &.{.facial_expression_output}, .autonomy_policy = .allowed, .energy_cost = @as(u8, 1), .failure_hint = "Provide valid eyes and/or mouth sprite names from facial_expression_catalog, or set text to a preset id; unspecified aspects default to neutral; otherwise use emote." },
 };
 
 pub fn spec(id: SkillId) ?SkillSpec {
@@ -340,11 +345,24 @@ pub fn senseUnavailableReason(sense: Sense) []const u8 {
     };
 }
 
-pub fn autonomySkillNames(allocator: std.mem.Allocator) ![]const u8 {
+pub fn autonomyPolicyAllowed(policy: AutonomyPolicy, autonomy_mode: []const u8) bool {
+    return switch (policy) {
+        .allowed => true,
+        .full_allowed => std.mem.eql(u8, autonomy_mode, "full"),
+        .forbidden, .invalid => false,
+    };
+}
+
+pub fn autonomyAllowed(id: SkillId, autonomy_mode: []const u8) bool {
+    const entry = spec(id) orelse return false;
+    return autonomyPolicyAllowed(entry.autonomy_policy, autonomy_mode);
+}
+
+pub fn autonomySkillNames(allocator: std.mem.Allocator, autonomy_mode: []const u8) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     var first = true;
     for (registry) |entry| {
-        if (entry.autonomy_policy != .allowed) continue;
+        if (!autonomyPolicyAllowed(entry.autonomy_policy, autonomy_mode)) continue;
         if (!first) try out.appendSlice(allocator, ", ");
         first = false;
         try out.appendSlice(allocator, entry.name);
@@ -352,12 +370,12 @@ pub fn autonomySkillNames(allocator: std.mem.Allocator) ![]const u8 {
     return out.toOwnedSlice(allocator);
 }
 
-pub fn autonomyActionEnumJson(allocator: std.mem.Allocator) ![]const u8 {
+pub fn autonomyActionEnumJson(allocator: std.mem.Allocator, autonomy_mode: []const u8) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     try out.append(allocator, '[');
     var first = true;
     for (registry) |entry| {
-        if (entry.autonomy_policy != .allowed) continue;
+        if (!autonomyPolicyAllowed(entry.autonomy_policy, autonomy_mode)) continue;
         if (!first) try out.append(allocator, ',');
         first = false;
         try out.appendSlice(allocator, try std.json.Stringify.valueAlloc(allocator, entry.name, .{}));
@@ -392,24 +410,52 @@ pub fn interactionActionEnumJson(allocator: std.mem.Allocator) ![]const u8 {
     return out.toOwnedSlice(allocator);
 }
 
-pub fn autonomyEnergyCost(id: SkillId) !u8 {
+pub fn actionEnergyTier(id: SkillId) !u8 {
     const entry = spec(id) orelse return error.UnknownSkill;
-    if (entry.autonomy_policy != .allowed) return switch (entry.autonomy_policy) {
-        .forbidden => error.ProactiveCameraCaptureForbidden,
-        .invalid => error.InvalidAutonomyAction,
-        .allowed => unreachable,
-    };
     return entry.energy_cost orelse return error.MissingAutonomyEnergyCost;
 }
 
-pub fn autonomyCostCatalog(allocator: std.mem.Allocator) ![]const u8 {
+pub fn actionAutonomyEnergyTier(id: SkillId) !u8 {
+    const entry = spec(id) orelse return error.UnknownSkill;
+    if (entry.autonomy_energy_cost) |tier| return tier;
+    return entry.energy_cost orelse return error.MissingAutonomyEnergyCost;
+}
+
+pub fn actionPointCost(id: SkillId) !f32 {
+    return autonomyPointCost(try actionEnergyTier(id));
+}
+
+pub fn actionAutonomyPointCost(id: SkillId) !f32 {
+    return autonomyPointCost(try actionAutonomyEnergyTier(id));
+}
+
+pub fn autonomyPointCost(energy_tier: u8) f32 {
+    if (energy_tier == 0) return 0;
+    if (energy_tier == 1) return 1;
+    return fibonacci(energy_tier + 1);
+}
+
+pub fn autonomyEnergyCost(id: SkillId, autonomy_mode: []const u8) !u8 {
+    const entry = spec(id) orelse return error.UnknownSkill;
+    if (!autonomyPolicyAllowed(entry.autonomy_policy, autonomy_mode)) return switch (entry.autonomy_policy) {
+        .forbidden, .full_allowed => error.ProactiveCameraCaptureForbidden,
+        .invalid => error.InvalidAutonomyAction,
+        .allowed => unreachable,
+    };
+    return try actionAutonomyEnergyTier(id);
+}
+
+pub fn autonomyCostCatalog(allocator: std.mem.Allocator, autonomy_mode: []const u8) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     try out.appendSlice(allocator, "planner=1");
     for (registry) |entry| {
-        if (entry.autonomy_policy != .allowed) continue;
-        try out.print(allocator, " {s}={d}", .{ entry.name, entry.energy_cost orelse return error.MissingAutonomyEnergyCost });
+        if (!autonomyPolicyAllowed(entry.autonomy_policy, autonomy_mode)) continue;
+        const point_cost = try actionAutonomyPointCost(entry.id);
+        try out.print(allocator, " {s}={d}", .{ entry.name, @as(u32, @intFromFloat(point_cost)) });
     }
-    try out.appendSlice(allocator, " visual_camera=forbidden");
+    if (!std.mem.eql(u8, autonomy_mode, "full")) {
+        try out.appendSlice(allocator, " host_sense_pulls=full_only");
+    }
     return out.toOwnedSlice(allocator);
 }
 
@@ -419,6 +465,32 @@ pub fn affordanceCatalog(allocator: std.mem.Allocator) ![]const u8 {
         try out.print(allocator, "- {s}: {s}\n", .{ entry.name, entry.description });
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn fibonacci(index: u8) f32 {
+    var a: f32 = 1;
+    var b: f32 = 1;
+    var step: u8 = 2;
+    while (step < index) : (step += 1) {
+        const next = a + b;
+        a = b;
+        b = next;
+    }
+    return b;
+}
+
+test "autonomy point costs follow basic and fibonacci tiers" {
+    try std.testing.expectEqual(@as(f32, 0), autonomyPointCost(0));
+    try std.testing.expectEqual(@as(f32, 1), autonomyPointCost(1));
+    try std.testing.expectEqual(@as(f32, 2), autonomyPointCost(2));
+    try std.testing.expectEqual(@as(f32, 3), autonomyPointCost(3));
+    try std.testing.expectEqual(@as(f32, 5), autonomyPointCost(4));
+    try std.testing.expectEqual(@as(f32, 8), autonomyPointCost(5));
+}
+
+test "say costs less for autonomy than interaction" {
+    try std.testing.expectEqual(@as(f32, 8), try actionPointCost(.say));
+    try std.testing.expectEqual(@as(f32, 3), try actionAutonomyPointCost(.say));
 }
 
 test "skill registry is complete and valid" {
@@ -448,9 +520,13 @@ test "skill registry rejects cyclic skill dependencies" {
     try std.testing.expectError(error.CyclicSkillDependency, validateSpecs(&entries));
 }
 
-test "autonomy registry keeps camera skills forbidden" {
-    try std.testing.expect((spec(.take_picture) orelse return error.MissingSkillSpec).autonomy_policy == .forbidden);
-    try std.testing.expect((spec(.describe_image) orelse return error.MissingSkillSpec).autonomy_policy == .forbidden);
-    try std.testing.expect((spec(.compare_images) orelse return error.MissingSkillSpec).autonomy_policy == .forbidden);
-    try std.testing.expect((spec(.recognize) orelse return error.MissingSkillSpec).autonomy_policy == .forbidden);
+test "autonomy registry keeps host sense pulls full-only" {
+    try std.testing.expect((spec(.take_picture) orelse return error.MissingSkillSpec).autonomy_policy == .full_allowed);
+    try std.testing.expect((spec(.describe_image) orelse return error.MissingSkillSpec).autonomy_policy == .full_allowed);
+    try std.testing.expect((spec(.compare_images) orelse return error.MissingSkillSpec).autonomy_policy == .full_allowed);
+    try std.testing.expect((spec(.recognize) orelse return error.MissingSkillSpec).autonomy_policy == .full_allowed);
+    try std.testing.expect((spec(.request_orientation) orelse return error.MissingSkillSpec).autonomy_policy == .full_allowed);
+    try std.testing.expect(!autonomyAllowed(.take_picture, "limited"));
+    try std.testing.expect(autonomyAllowed(.take_picture, "full"));
+    try std.testing.expect(!autonomyAllowed(.recognize, "off"));
 }

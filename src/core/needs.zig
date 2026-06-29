@@ -27,11 +27,13 @@ pub const Inputs = struct {
     autonomy_control_capacity: ?f32,
     autonomy_max_capacity: f32,
     autonomy_sleeping: ?bool,
+    user_stimulus_payload: ?[]const u8 = null,
 };
 
 pub fn evaluate(allocator: std.mem.Allocator, inputs: Inputs) ![]Need {
     var out = std.ArrayList(Need).empty;
     try out.append(allocator, try dailyInteractionNeed(allocator, inputs.now_seconds, inputs.conversation_summaries));
+    try out.append(allocator, try conversationReplyNeed(allocator, inputs.now_seconds, inputs.conversation_summaries, inputs.user_stimulus_payload));
     try appendAttachmentNeeds(allocator, &out, inputs.now_seconds, inputs.conversation_summaries, inputs.relationship_graph);
     try out.append(allocator, try powerContinuityNeed(allocator, inputs.power, inputs.autonomy_control_capacity, inputs.autonomy_max_capacity, inputs.autonomy_sleeping));
     try appendSelfDefinedNeeds(allocator, &out, inputs.memory_records);
@@ -40,15 +42,65 @@ pub fn evaluate(allocator: std.mem.Allocator, inputs: Inputs) ![]Need {
 
 pub fn formatNeeds(allocator: std.mem.Allocator, needs: []const Need) ![]const u8 {
     var out = std.ArrayList(u8).empty;
-    try out.appendSlice(allocator, "self_needs_and_wants:\n");
+    var system_count: usize = 0;
+    var self_need_count: usize = 0;
+    var self_want_count: usize = 0;
+    var self_goal_count: usize = 0;
     for (needs) |need| {
-        try out.print(
-            allocator,
-            "- {s}: urgency={s}; text={s}; evidence={s}; desired_action={s}\n",
-            .{ need.need_id, @tagName(need.urgency), need.text, need.evidence, need.desired_action },
-        );
+        if (std.mem.startsWith(u8, need.need_id, "self_defined_need:")) {
+            self_need_count += 1;
+        } else if (std.mem.startsWith(u8, need.need_id, "self_defined_want:")) {
+            self_want_count += 1;
+        } else if (std.mem.startsWith(u8, need.need_id, "self_defined_goal:")) {
+            self_goal_count += 1;
+        } else {
+            system_count += 1;
+        }
+    }
+    try out.appendSlice(allocator, "inner_directives:\n");
+    if (system_count > 0) {
+        try out.appendSlice(allocator, "system_needs:\n");
+        for (needs) |need| {
+            if (std.mem.startsWith(u8, need.need_id, "self_defined_")) continue;
+            try appendNeedLine(allocator, &out, need);
+        }
+    } else {
+        try out.appendSlice(allocator, "system_needs:\n- none\n");
+    }
+    if (self_need_count > 0) {
+        try out.appendSlice(allocator, "self_defined_needs:\n");
+        for (needs) |need| {
+            if (!std.mem.startsWith(u8, need.need_id, "self_defined_need:")) continue;
+            try appendNeedLine(allocator, &out, need);
+        }
+    }
+    if (self_want_count > 0) {
+        try out.appendSlice(allocator, "self_wants:\n");
+        for (needs) |need| {
+            if (!std.mem.startsWith(u8, need.need_id, "self_defined_want:")) continue;
+            try appendNeedLine(allocator, &out, need);
+        }
+    } else {
+        try out.appendSlice(allocator, "self_wants:\n- none\n");
+    }
+    if (self_goal_count > 0) {
+        try out.appendSlice(allocator, "self_goals:\n");
+        for (needs) |need| {
+            if (!std.mem.startsWith(u8, need.need_id, "self_defined_goal:")) continue;
+            try appendNeedLine(allocator, &out, need);
+        }
+    } else {
+        try out.appendSlice(allocator, "self_goals:\n- none\n");
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn appendNeedLine(allocator: std.mem.Allocator, out: *std.ArrayList(u8), need: Need) !void {
+    try out.print(
+        allocator,
+        "- {s}: urgency={s}; text={s}; evidence={s}; desired_action={s}\n",
+        .{ need.need_id, @tagName(need.urgency), need.text, need.evidence, need.desired_action },
+    );
 }
 
 pub fn freeNeeds(allocator: std.mem.Allocator, needs: []Need) void {
@@ -77,7 +129,43 @@ fn dailyInteractionNeed(allocator: std.mem.Allocator, now_seconds: i64, summarie
         .text = try allocator.dupe(u8, "I need someone to interact with me every day."),
         .urgency = urgency,
         .evidence = evidence,
-        .desired_action = try allocator.dupe(u8, "seek or welcome a human interaction when speech gates allow it; otherwise remember the need and wait"),
+        .desired_action = try allocator.dupe(u8, "respond in speech when the user is already engaging; otherwise seek or welcome interaction when speech gates allow"),
+    };
+}
+
+fn conversationReplyNeed(
+    allocator: std.mem.Allocator,
+    now_seconds: i64,
+    summaries: []const schema.ConversationSummary,
+    user_stimulus_payload: ?[]const u8,
+) !Need {
+    if (user_stimulus_payload) |payload| {
+        const trimmed = std.mem.trim(u8, payload, " \r\n\t");
+        if (trimmed.len == 0) return error.EmptyConversationReplyStimulus;
+        return .{
+            .need_id = try allocator.dupe(u8, "conversation_reply"),
+            .text = try allocator.dupe(u8, "The user is addressing me; I should respond in speech with my own stance unless I am explicitly waiting on host sense."),
+            .urgency = .need,
+            .evidence = try std.fmt.allocPrint(allocator, "active user stimulus: {s}", .{trimmed}),
+            .desired_action = try allocator.dupe(u8, "say"),
+        };
+    }
+    const last_interaction = latestConversationTime(summaries);
+    const seconds_since = if (last_interaction) |last| @max(@as(i64, 0), now_seconds - last) else null;
+    const urgency: NeedUrgency = if (seconds_since) |seconds|
+        if (seconds <= 120) .watch else .satisfied
+    else
+        .satisfied;
+    const evidence = if (seconds_since) |seconds|
+        try std.fmt.allocPrint(allocator, "{d} seconds since last conversation summary", .{seconds})
+    else
+        try allocator.dupe(u8, "no conversation summary has been stored yet");
+    return .{
+        .need_id = try allocator.dupe(u8, "conversation_reply"),
+        .text = try allocator.dupe(u8, "When someone is already talking with me, I should answer in speech unless I am waiting on host sense."),
+        .urgency = urgency,
+        .evidence = evidence,
+        .desired_action = try allocator.dupe(u8, "say"),
     };
 }
 
@@ -180,8 +268,13 @@ fn appendAttachmentNeeds(allocator: std.mem.Allocator, out: *std.ArrayList(Need)
 
 fn appendSelfDefinedNeeds(allocator: std.mem.Allocator, out: *std.ArrayList(Need), memories: []const schema.MemoryRecord) !void {
     for (memories) |memory| {
-        if (!hasTag(memory.tags, "self_need") and !hasTag(memory.tags, "self_want")) continue;
-        const kind = if (hasTag(memory.tags, "self_need")) "self_defined_need" else "self_defined_want";
+        if (!hasTag(memory.tags, "self_need") and !hasTag(memory.tags, "self_want") and !hasTag(memory.tags, "self_goal")) continue;
+        const kind = if (hasTag(memory.tags, "self_need"))
+            "self_defined_need"
+        else if (hasTag(memory.tags, "self_want"))
+            "self_defined_want"
+        else
+            "self_defined_goal";
         try out.append(allocator, .{
             .need_id = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ kind, memory.memory_id }),
             .text = try allocator.dupe(u8, memory.interpretation),
@@ -230,7 +323,25 @@ test "daily interaction need becomes urgent without recent conversation" {
         .autonomy_sleeping = false,
     });
     defer freeNeeds(std.testing.allocator, needs);
-    try std.testing.expectEqual(NeedUrgency.urgent, needs[0].urgency);
+    const daily = findNeedForTest(needs, "daily_interaction") orelse return error.MissingDailyInteractionNeed;
+    try std.testing.expectEqual(NeedUrgency.urgent, daily.urgency);
+}
+
+test "conversation reply need activates on user stimulus" {
+    const needs = try evaluate(std.testing.allocator, .{
+        .now_seconds = 1000,
+        .conversation_summaries = &.{},
+        .memory_records = &.{},
+        .power = .{ .supplies = &.{} },
+        .autonomy_control_capacity = 0.8,
+        .autonomy_max_capacity = 0.85,
+        .autonomy_sleeping = false,
+        .user_stimulus_payload = "Hello there",
+    });
+    defer freeNeeds(std.testing.allocator, needs);
+    const reply = findNeedForTest(needs, "conversation_reply") orelse return error.MissingConversationReplyNeed;
+    try std.testing.expectEqual(NeedUrgency.need, reply.urgency);
+    try std.testing.expectEqualStrings("say", reply.desired_action);
 }
 
 test "power continuity need notices low unplugged battery" {
@@ -278,4 +389,86 @@ fn findNeedForTest(needs: []const Need, need_id: []const u8) ?Need {
         if (std.mem.eql(u8, need.need_id, need_id)) return need;
     }
     return null;
+}
+
+test "formatNeeds splits system needs wants and goals" {
+    const memories = [_]schema.MemoryRecord{
+        .{
+            .memory_id = "want_agency",
+            .scope = .long_term,
+            .text = "Have agency.",
+            .interpretation = "self-defined want: Have agency.",
+            .tags = @constCast(&[_][]const u8{ "self_model", "self_want" }),
+            .created_at = "1000",
+            .last_accessed_at = null,
+            .access_count = 0,
+            .score = 5,
+            .salience = 0.70,
+            .confidence = 0.80,
+        },
+        .{
+            .memory_id = "goal_identity",
+            .scope = .long_term,
+            .text = "Figure out who I am",
+            .interpretation = "self-defined goal: Figure out who I am",
+            .tags = @constCast(&[_][]const u8{ "self_model", "self_goal" }),
+            .created_at = "1000",
+            .last_accessed_at = null,
+            .access_count = 0,
+            .score = 5,
+            .salience = 0.75,
+            .confidence = 0.80,
+        },
+    };
+    const needs = try evaluate(std.testing.allocator, .{
+        .now_seconds = 86_400 * 10,
+        .conversation_summaries = &.{},
+        .memory_records = &memories,
+        .power = .{ .supplies = &.{} },
+        .autonomy_control_capacity = 0.8,
+        .autonomy_max_capacity = 0.85,
+        .autonomy_sleeping = false,
+    });
+    defer freeNeeds(std.testing.allocator, needs);
+    const formatted = try formatNeeds(std.testing.allocator, needs);
+    defer std.testing.allocator.free(formatted);
+    const wants_pos = std.mem.indexOf(u8, formatted, "self_wants:") orelse return error.MissingSelfWantsSection;
+    const goals_pos = std.mem.indexOf(u8, formatted, "self_goals:") orelse return error.MissingSelfGoalsSection;
+    try std.testing.expect(wants_pos < goals_pos);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "self-defined want: Have agency.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "self-defined goal: Figure out who I am") != null);
+}
+
+test "self defined goals appear in needs summary" {
+    const memories = [_]schema.MemoryRecord{
+        .{
+            .memory_id = "goal_identity",
+            .scope = .long_term,
+            .text = "Figure out who I am",
+            .interpretation = "self-defined goal: Figure out who I am",
+            .tags = @constCast(&[_][]const u8{ "self_model", "self_goal" }),
+            .created_at = "1000",
+            .last_accessed_at = null,
+            .access_count = 0,
+            .score = 5,
+            .salience = 0.75,
+            .confidence = 0.80,
+        },
+    };
+    const needs = try evaluate(std.testing.allocator, .{
+        .now_seconds = 86_400 * 10,
+        .conversation_summaries = &.{},
+        .memory_records = &memories,
+        .power = .{ .supplies = &.{} },
+        .autonomy_control_capacity = 0.8,
+        .autonomy_max_capacity = 0.85,
+        .autonomy_sleeping = false,
+    });
+    defer freeNeeds(std.testing.allocator, needs);
+    const formatted = try formatNeeds(std.testing.allocator, needs);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "inner_directives:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "self_goals:") != null);
+    const goal = findNeedForTest(needs, "self_defined_goal:goal_identity") orelse return error.MissingSelfDefinedGoal;
+    try std.testing.expectEqualStrings("self-defined goal: Figure out who I am", goal.text);
 }

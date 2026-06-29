@@ -46,9 +46,45 @@ pub fn shouldRetry(err: anyerror, attempt: usize) bool {
     return err == error.RemoteServiceFailed and attempt + 1 < remote_retry_attempts;
 }
 
+pub fn shouldRetryChatParse(err: anyerror, attempt: usize) bool {
+    if (attempt + 1 >= remote_retry_attempts) return false;
+    return switch (err) {
+        error.LocalServiceResponseInvalid,
+        error.InvalidChatAction,
+        => true,
+        else => false,
+    };
+}
+
+pub fn shouldRetryAutonomyParse(err: anyerror, attempt: usize) bool {
+    if (attempt + 1 >= remote_retry_attempts) return false;
+    return switch (err) {
+        error.MissingAutonomyField,
+        error.InvalidAutonomyJson,
+        error.InvalidAutonomyField,
+        error.InvalidAutonomySalience,
+        => true,
+        else => false,
+    };
+}
+
 pub fn logRemoteRetry(subsystem: []const u8, provider: []const u8, model: []const u8, attempt: usize) void {
     std.debug.print(
         "{s} remote service failure from {s}/{s}; retrying attempt {d}/{d}\n",
+        .{ subsystem, provider, model, attempt + 2, remote_retry_attempts },
+    );
+}
+
+pub fn logChatParseRetry(subsystem: []const u8, provider: []const u8, model: []const u8, attempt: usize) void {
+    std.debug.print(
+        "{s} chat parse failure from {s}/{s}; retrying attempt {d}/{d}\n",
+        .{ subsystem, provider, model, attempt + 2, remote_retry_attempts },
+    );
+}
+
+pub fn logAutonomyParseRetry(subsystem: []const u8, provider: []const u8, model: []const u8, attempt: usize) void {
+    std.debug.print(
+        "{s} autonomy parse failure from {s}/{s}; retrying attempt {d}/{d}\n",
         .{ subsystem, provider, model, attempt + 2, remote_retry_attempts },
     );
 }
@@ -188,4 +224,19 @@ test "classifies invalid provider request as local request rejection" {
 
 test "classifies malformed provider response as local shape failure" {
     try std.testing.expectEqual(error.LocalServiceResponseInvalid, responseShapeError(std.testing.allocator, "not json"));
+}
+
+test "chat parse retry stops after configured attempts" {
+    try std.testing.expect(shouldRetryChatParse(error.LocalServiceResponseInvalid, 0));
+    try std.testing.expect(shouldRetryChatParse(error.InvalidChatAction, 1));
+    try std.testing.expect(!shouldRetryChatParse(error.LocalServiceResponseInvalid, 2));
+    try std.testing.expect(!shouldRetryChatParse(error.InvalidChatAction, 2));
+    try std.testing.expect(!shouldRetryChatParse(error.RemoteServiceFailed, 0));
+}
+
+test "autonomy parse retry stops after configured attempts" {
+    try std.testing.expect(shouldRetryAutonomyParse(error.MissingAutonomyField, 0));
+    try std.testing.expect(shouldRetryAutonomyParse(error.InvalidAutonomyJson, 1));
+    try std.testing.expect(!shouldRetryAutonomyParse(error.MissingAutonomyField, 2));
+    try std.testing.expect(!shouldRetryAutonomyParse(error.InvalidAutonomyAction, 0));
 }

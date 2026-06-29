@@ -1,13 +1,14 @@
 const std = @import("std");
 const chat = @import("chat_client.zig");
+const llm_tester_scenario = @import("../harness/llm_tester/scenario.zig");
 const context_tokens = @import("../core/context_tokens.zig");
-const greeting = @import("greeting_client.zig");
 const want_achievement = @import("want_achievement_client.zig");
 const ActionProposalType = chat.ActionProposalType;
 const ReasoningEffort = chat.ReasoningEffort;
 const max_chat_context_tokens = chat.max_chat_context_tokens;
 const actionSpec = chat.actionSpec;
 const parseChatTurn = chat.parseChatTurn;
+const validateChatDeliveryContext = chat.validateChatDeliveryContext;
 const buildChatPrompt = chat.buildChatPrompt;
 const chatUserPrompt = chat.chatUserPrompt;
 const chatPromptWithinBudget = chat.chatPromptWithinBudget;
@@ -16,7 +17,6 @@ const chatSystemPrompt = chat.chatSystemPrompt;
 
 test "provider API surface does not expose alternate services" {
     try std.testing.expect(!@hasDecl(chat, "UnconfiguredChatService"));
-    try std.testing.expect(!@hasDecl(greeting, "TestGreetingService"));
     try std.testing.expect(!@hasDecl(want_achievement, "ScriptedWantAchievementDetector"));
 }
 
@@ -203,6 +203,74 @@ test "parseChatTurn accepts compact say action without null placeholders" {
     try std.testing.expect(turn.action_pressures[0].memory_id == null);
 }
 
+test "parseChatTurn rejects observation labels used as actions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectError(error.InvalidChatAction, parseChatTurn(allocator,
+        \\{"action_pressures":[{"action":"host_sense_pull_requested","origin":"autonomy","delay_ms":null,"scale":"full","text":null,"query":null,"memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"to":null,"subject":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]}],"user_summary":"delivery","brain_summary":"integrated","effort_tier":"basic","reasoning_effort":null,"turn_complete":true}
+    , ""));
+}
+
+test "parseChatTurn rejects recognize with echoed speech text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectError(error.InvalidChatAction, parseChatTurn(allocator,
+        \\{"action_pressures":[{"action":"recognize","origin":"interaction","delay_ms":null,"scale":"full","text":"Hello there","query":null,"memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"to":null,"subject":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]}],"user_summary":"hello","brain_summary":"looked","effort_tier":"basic","reasoning_effort":null,"turn_complete":true}
+    , "Hello there"));
+}
+
+test "validateChatDeliveryContext rejects actions on low-materiality delivery" {
+    const observations =
+        \\deferred_coherence:
+        \\- delivery_materiality: low
+    ;
+    try std.testing.expectError(error.InvalidChatAction, validateChatDeliveryContext(.host_sense_delivery, observations, 1));
+    try validateChatDeliveryContext(.host_sense_delivery, observations, 0);
+    try validateChatDeliveryContext(.heard_speech, observations, 1);
+}
+
+test "parseChatTurn accepts recognize host pull action" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const turn = try parseChatTurn(allocator,
+        \\{"action_pressures":[{"action":"recognize","origin":"interaction","delay_ms":null,"scale":"full","text":null,"query":null,"memory_id":null,"schedule":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"tags":["host_pull"]}],"user_summary":"Asked whether I recognize them.","brain_summary":"Need a camera frame from this host before answering; recognize will pause for host delivery.","effort_tier":"standard","reasoning_effort":null,"turn_complete":true}
+    , "Do you recognize me?");
+    try std.testing.expectEqual(ActionProposalType.recognize, turn.action_pressures[0].action);
+    try std.testing.expectEqual(chat.ActionOrigin.interaction, turn.action_pressures[0].origin);
+    try std.testing.expectEqualStrings("Asked whether I recognize them.", turn.user_summary);
+    try std.testing.expect(std.mem.indexOf(u8, turn.brain_summary, "camera") != null or std.mem.indexOf(u8, turn.brain_summary, "recognize") != null);
+    try std.testing.expect(turn.turn_complete);
+}
+
+test "llm tester scenarios include conversation examples" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const scenarios = try chat.llmTesterScenarios(allocator);
+    defer llm_tester_scenario.freeScenarios(allocator, scenarios);
+    try std.testing.expectEqual(@as(usize, 4), scenarios.len);
+    var found_host_sense = false;
+    var found_greet_first = false;
+    for (scenarios) |scenario| {
+        if (std.mem.eql(u8, scenario.id, "conversation_host_sense_pull")) {
+            found_host_sense = true;
+            try std.testing.expect(std.mem.indexOf(u8, scenario.user_prompt, "Do you recognize me?") != null);
+            try std.testing.expect(std.mem.indexOf(u8, scenario.user_prompt, "host_capability_activations:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, scenario.user_prompt, "recognize:12/14 ok") != null);
+        }
+        if (std.mem.eql(u8, scenario.id, "conversation_greeting_camera_available")) {
+            found_greet_first = true;
+            try std.testing.expect(std.mem.indexOf(u8, scenario.user_prompt, "Stimulus (heard speech): \"Hello!\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, scenario.user_prompt, "recognize:available") != null);
+        }
+    }
+    try std.testing.expect(found_host_sense);
+    try std.testing.expect(found_greet_first);
+}
+
 test "parseChatTurn accepts minimal say action objects" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -238,12 +306,29 @@ test "chat prompt frames the current utterance as heard speech" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const prompt = try chatUserPrompt(allocator, "memory", "hey here's my message", "none", max_chat_context_tokens);
+    const prompt = try chatUserPrompt(allocator, "memory", "hey here's my message", "none", max_chat_context_tokens, .heard_speech);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "# Compact Memory\nmemory") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "# User Input\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "# Observations\nnone") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Stimulus: \"hey here's my message\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Stimulus (heard speech): \"hey here's my message\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "User said:") == null);
+}
+
+test "chat prompt includes silent-integration planning cue for low-materiality delivery" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const observations =
+        \\present_moment:
+        \\  in_flight:
+        \\    - recognize camera 12s for "Hello Geisha"
+        \\deferred_coherence:
+        \\- delivery_materiality: low
+    ;
+    const prompt = try chatUserPrompt(allocator, "memory", "Hello Geisha", observations, max_chat_context_tokens, .host_sense_delivery);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "# Planning\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "action_pressures must be []") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Stimulus (awaited sense delivery):") != null);
 }
 
 test "chat prompt uses unified stimulus framing for host resume context" {
@@ -252,8 +337,8 @@ test "chat prompt uses unified stimulus framing for host resume context" {
     const allocator = arena.allocator();
     const observations =
         "host_sense_delivered:\n- note: you have what you were waiting for; pick up where you left off.\n";
-    const prompt = try chatUserPrompt(allocator, "memory", "self-defined want: Continue existing.", observations, max_chat_context_tokens);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Stimulus: \"self-defined want: Continue existing.\"") != null);
+    const prompt = try chatUserPrompt(allocator, "memory", "self-defined want: Continue existing.", observations, max_chat_context_tokens, .heard_speech);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Stimulus (heard speech): \"self-defined want: Continue existing.\"") != null);
 }
 
 test "chat prompt budget fails loudly" {
@@ -264,9 +349,9 @@ test "chat prompt budget fails loudly" {
     const oversized = try allocator.alloc(u8, context_tokens.minBytesExceedingTokenBudget(max_chat_context_tokens));
     @memset(oversized, 'x');
 
-    try std.testing.expectError(error.ContextBudgetExceeded, buildChatPrompt(allocator, oversized, "hello", "", max_chat_context_tokens));
-    try std.testing.expect(!try chatPromptWithinBudget(allocator, oversized, "hello", "", max_chat_context_tokens));
-    try std.testing.expect(try chatPromptWithinBudget(allocator, "memory", "hello", "observations", max_chat_context_tokens));
+    try std.testing.expectError(error.ContextBudgetExceeded, buildChatPrompt(allocator, oversized, "hello", "", max_chat_context_tokens, .heard_speech));
+    try std.testing.expect(!try chatPromptWithinBudget(allocator, oversized, "hello", "", max_chat_context_tokens, .heard_speech));
+    try std.testing.expect(try chatPromptWithinBudget(allocator, "memory", "hello", "observations", max_chat_context_tokens, .heard_speech));
 }
 
 test "chat prompt audit succeeds when prompt exceeds budget" {
@@ -277,9 +362,9 @@ test "chat prompt audit succeeds when prompt exceeds budget" {
     const oversized = try allocator.alloc(u8, context_tokens.minBytesExceedingTokenBudget(max_chat_context_tokens));
     @memset(oversized, 'x');
 
-    const audit = try auditChatPrompt(allocator, oversized, "hello", "");
+    const audit = try auditChatPrompt(allocator, oversized, "hello", "", .heard_speech);
     try std.testing.expect(audit.user_prompt_tokens > max_chat_context_tokens);
-    try std.testing.expectError(error.ContextBudgetExceeded, buildChatPrompt(allocator, oversized, "hello", "", max_chat_context_tokens));
+    try std.testing.expectError(error.ContextBudgetExceeded, buildChatPrompt(allocator, oversized, "hello", "", max_chat_context_tokens, .heard_speech));
 }
 
 test "chat prompt audit reports rendered byte counts" {
@@ -290,8 +375,8 @@ test "chat prompt audit reports rendered byte counts" {
     const memory = "memory index";
     const user_text = "hello";
     const observations = "observations";
-    const prompt = try buildChatPrompt(allocator, memory, user_text, observations, max_chat_context_tokens);
-    const audit = try auditChatPrompt(allocator, memory, user_text, observations);
+    const prompt = try buildChatPrompt(allocator, memory, user_text, observations, max_chat_context_tokens, .heard_speech);
+    const audit = try auditChatPrompt(allocator, memory, user_text, observations, .heard_speech);
 
     try std.testing.expectEqual(chatSystemPrompt().len, audit.system_prompt_bytes);
     try std.testing.expectEqual(memory.len, audit.compact_memory_bytes);
@@ -307,6 +392,6 @@ test "32KB chat prompt stays within 120K token budget" {
 
     const memory = try allocator.alloc(u8, 32 * 1024);
     @memset(memory, 'm');
-    try std.testing.expect(try chatPromptWithinBudget(allocator, memory, "hello", "observations", max_chat_context_tokens));
-    _ = try buildChatPrompt(allocator, memory, "hello", "observations", max_chat_context_tokens);
+    try std.testing.expect(try chatPromptWithinBudget(allocator, memory, "hello", "observations", max_chat_context_tokens, .heard_speech));
+    _ = try buildChatPrompt(allocator, memory, "hello", "observations", max_chat_context_tokens, .heard_speech);
 }

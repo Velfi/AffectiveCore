@@ -35,7 +35,6 @@ const ScriptedRecallChatService = support.ScriptedRecallChatService;
 const ScriptedClarificationChatService = support.ScriptedClarificationChatService;
 const ScriptedHardErrorRecoveryChatService = support.ScriptedHardErrorRecoveryChatService;
 const HeardSpeechObservationChatService = support.HeardSpeechObservationChatService;
-const FailingIdentityClaimIntentService = support.FailingIdentityClaimIntentService;
 const ScriptedContinuingChatService = support.ScriptedContinuingChatService;
 const makeBrain = support.makeBrain;
 const addMara = support.addMara;
@@ -366,6 +365,76 @@ test "host sense follow-up restores orchestration framing" {
     try std.testing.expectEqualStrings("Continuing the activity.", resumed.spoken_text);
     try std.testing.expectEqual(@as(usize, 1), chat.calls);
     try std.testing.expect(!brain.conversationAwaitingHost());
+}
+
+test "unknown face after hello skips follow-up deliberation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/unknown_01.jpg", &.{}, &store, &desc);
+    var pull_camera = support.FrontendPullCamera{};
+    brain.deps.camera = pull_camera.camera();
+    var chat = support.ScriptedRecognizeThenSayChatService{ .say_text = "Hello." };
+    brain.deps.chat_service = chat.service();
+
+    _ = try brain.handleConversationText(try input_mod.HeardSpeech.typed(allocator, "Hello Geisha"), .{});
+    try std.testing.expect(brain.conversationAwaitingHost());
+
+    const visual_line = try brain.recognizeFromCapturedPath("fixtures/visitors/unknown_01.jpg");
+    const resumed = brain.continueConversationAfterAwaitedVisual(visual_line);
+    try std.testing.expectError(error.NoActiveActivity, resumed);
+    try std.testing.expectEqual(@as(usize, 1), chat.calls);
+}
+
+test "overlap while recognize pending blocks duplicate pull" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    var pull_camera = support.FrontendPullCamera{};
+    brain.deps.camera = pull_camera.camera();
+    var chat = support.ScriptedRecognizeThenSayChatService{};
+    brain.deps.chat_service = chat.service();
+
+    _ = try brain.handleConversationText(try input_mod.HeardSpeech.typed(allocator, "Hello Geisha"), .{});
+    try std.testing.expect(brain.awaitedHostRequestActive());
+    const request_id = brain.awaited_host_request.?.request_id;
+
+    const overlap_text = "Can you see who I am?";
+    const overlap = @import("present_moment.zig").detectRequestOverlap(&brain, overlap_text);
+    try std.testing.expect(overlap != null);
+    try std.testing.expectEqualStrings("recognize", overlap.?.in_flight_kind);
+
+    var observations = std.ArrayList(u8).empty;
+    defer observations.deinit(allocator);
+    var proposals = [_]chat_mod.ActionProposal{.{ .action = .recognize }};
+    const batch = try brain.executeActionProposals(&proposals, &observations);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "recognition_in_flight:") != null);
+    try std.testing.expect(batch.spoken_text == null);
+    try std.testing.expect(brain.awaitedHostRequestActive());
+    try std.testing.expectEqualStrings(request_id, brain.awaited_host_request.?.request_id);
+}
+
+test "present moment observation includes last spoken text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    try brain_process.ensureActiveActivity(&brain, "Hello Geisha", "req_test", .user_speech);
+    if (brain.active_activity) |*active| {
+        active.state.last_spoken_text = try allocator.dupe(u8, "Hello.");
+    }
+    var observations = std.ArrayList(u8).empty;
+    defer observations.deinit(allocator);
+    try @import("present_moment.zig").appendObservation(&brain, &observations, "Hello Geisha", null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "Hello Geisha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "Hello.") != null);
 }
 
 test "known person gets warm greeting and sighting" {

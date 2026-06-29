@@ -5,6 +5,9 @@ const sqlite3 = opaque {};
 const sqlite3_stmt = opaque {};
 
 extern fn sqlite3_open(filename: [*:0]const u8, ppDb: *?*sqlite3) c_int;
+extern fn sqlite3_open_v2(filename: [*:0]const u8, ppDb: *?*sqlite3, flags: c_int, vfs: ?[*:0]const u8) c_int;
+
+const SQLITE_OPEN_READONLY = 1;
 extern fn sqlite3_close(db: *sqlite3) c_int;
 extern fn sqlite3_exec(db: *sqlite3, sql: [*:0]const u8, callback: ?*const fn (?*anyopaque, c_int, ?[*]?[*:0]u8, ?[*]?[*:0]u8) callconv(.c) c_int, arg: ?*anyopaque, errmsg: *?[*:0]u8) c_int;
 extern fn sqlite3_free(ptr: ?*anyopaque) void;
@@ -27,7 +30,7 @@ pub fn readDatabase(allocator: std.mem.Allocator, label: []const u8, path: []con
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
     var maybe_db: ?*sqlite3 = null;
-    if (sqlite3_open(path_z.ptr, &maybe_db) != SQLITE_OK) return error.SqliteOpenFailed;
+    if (sqlite3_open_v2(path_z.ptr, &maybe_db, SQLITE_OPEN_READONLY, null) != SQLITE_OK) return error.SqliteOpenFailed;
     const db = maybe_db orelse return error.SqliteOpenFailed;
     defer _ = sqlite3_close(db);
 

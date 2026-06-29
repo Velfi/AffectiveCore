@@ -17,6 +17,7 @@ const time_mod = @import("time.zig");
 const experience_kinds = @import("experience_kinds.zig");
 const brain_autonomy = @import("brain_autonomy.zig");
 const process_goal_resolver = @import("process_goal_resolver.zig");
+const process_recipe_memory = @import("process_recipe_memory.zig");
 const helpers = @import("brain_helpers.zig");
 const read_models = @import("read_models.zig");
 const subsystems = @import("subsystems.zig");
@@ -33,6 +34,7 @@ const TestIdMonitor = support.TestIdMonitor;
 const TestInterruptSource = support.TestInterruptSource;
 const TestEventLog = support.TestEventLog;
 const TestFacialExpressionOutput = support.TestFacialExpressionOutput;
+const TestClock = support.TestClock;
 const ScriptedRememberPersonChatService = support.ScriptedRememberPersonChatService;
 const ScriptedIdentityClaimChatService = support.ScriptedIdentityClaimChatService;
 const ScriptedForgetPersonChatService = support.ScriptedForgetPersonChatService;
@@ -40,9 +42,13 @@ const ScriptedRecallChatService = support.ScriptedRecallChatService;
 const ScriptedClarificationChatService = support.ScriptedClarificationChatService;
 const ScriptedHardErrorRecoveryChatService = support.ScriptedHardErrorRecoveryChatService;
 const HeardSpeechObservationChatService = support.HeardSpeechObservationChatService;
-const FailingIdentityClaimIntentService = support.FailingIdentityClaimIntentService;
 const ScriptedContinuingChatService = support.ScriptedContinuingChatService;
 const makeBrain = support.makeBrain;
+const writeAndRefreshFacialExpressionCatalog = support.writeAndRefreshFacialExpressionCatalog;
+
+const test_avatar_json_autonomy_expressions =
+    \\{"canvas":{"width":512,"height":512},"layers":[],"eyeSprites":[{"frame":0,"row":0,"column":0,"name":"neutral"},{"frame":0,"row":0,"column":1,"name":"stern"}],"mouthSprites":[{"frame":0,"row":0,"column":0,"name":"open"},{"frame":0,"row":0,"column":1,"name":"frown"}]}
+;
 const addMara = support.addMara;
 const addZelda = support.addZelda;
 const countOccurrences = support.countOccurrences;
@@ -66,15 +72,15 @@ test "introspection reports autonomy control state" {
     brain.deps.io = std.testing.io;
     try maintenance.saveAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, .{
         .sleeping = false,
-        .control_capacity = 0.65,
-        .max_capacity = 0.85,
+        .control_capacity = 40,
+        .max_capacity = 50,
         .social_engagement = 0.30,
         .consecutive_voluntary_speech = 2,
     });
 
     const text = try brain.introspect("autonomy");
     try std.testing.expect(std.mem.indexOf(u8, text, "autonomy: mode=full") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "control_capacity=0.65/0.85") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "control_capacity=40.00/50.00") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "voluntary_speech_streak=2") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "autonomy_effort_catalog") != null);
 }
@@ -114,7 +120,7 @@ test "autonomy replenishes control capacity over time" {
     brain.deps.io = std.testing.io;
     try maintenance.saveAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, .{
         .sleeping = false,
-        .control_capacity = 0.05,
+        .control_capacity = 5,
         .max_capacity = brain.cfg.autonomy_full_max_capacity,
         .last_capacity_replenish_at = brain.now_seconds - 10,
     });
@@ -124,24 +130,22 @@ test "autonomy replenishes control capacity over time" {
         .limited_max_capacity = brain.cfg.autonomy_limited_max_capacity,
         .full_max_capacity = brain.cfg.autonomy_full_max_capacity,
     });
-    try std.testing.expect(state.control_capacity > 0.05);
+    try std.testing.expect(state.control_capacity > 5);
 }
 
 test "autonomy replenish rate follows active mode" {
     const limited_cfg = config_mod.Config{
         .autonomy_mode = "limited",
-        .autonomy_limited_replenish_actions_per_minute = 1.0,
-        .autonomy_full_replenish_actions_per_minute = 4.0,
-        .autonomy_planner_min_capacity = 0.12,
+        .autonomy_limited_replenish_actions_per_minute = 2.0,
+        .autonomy_full_replenish_actions_per_minute = 8.0,
     };
     const full_cfg = config_mod.Config{
         .autonomy_mode = "full",
-        .autonomy_limited_replenish_actions_per_minute = 1.0,
-        .autonomy_full_replenish_actions_per_minute = 4.0,
-        .autonomy_planner_min_capacity = 0.12,
+        .autonomy_limited_replenish_actions_per_minute = 2.0,
+        .autonomy_full_replenish_actions_per_minute = 8.0,
     };
-    try std.testing.expectApproxEqAbs(@as(f32, 0.002), brain_autonomy.autonomyReplenishRatePerSecond(limited_cfg), 0.000001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.008), brain_autonomy.autonomyReplenishRatePerSecond(full_cfg), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 60.0), brain_autonomy.autonomyReplenishRatePerSecond(limited_cfg), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0 / 60.0), brain_autonomy.autonomyReplenishRatePerSecond(full_cfg), 0.000001);
 }
 
 test "waking autonomy can plan immediately when capacity is available" {
@@ -157,7 +161,7 @@ test "waking autonomy can plan immediately when capacity is available" {
     brain.deps.io = std.testing.io;
     try maintenance.saveAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, .{
         .sleeping = true,
-        .control_capacity = 0.75,
+        .control_capacity = 40,
         .max_capacity = brain.cfg.autonomy_full_max_capacity,
         .last_capacity_replenish_at = brain.now_seconds - 3600,
     });
@@ -202,6 +206,7 @@ test "autonomy tick spends control capacity for quiet action" {
     };
     brain.deps.autonomy_planner = scripted.planner();
     brain.deps.psyche_service = psyche.service();
+    brain.cfg.psyche_mode = "on";
     try seedDueAutonomyState(allocator, &brain, state_path, brain.cfg.autonomy_full_max_capacity);
 
     try brain.runAutonomyTick(std.testing.io);
@@ -217,23 +222,27 @@ test "autonomy tick spends control capacity for quiet action" {
     try std.testing.expectEqual(@as(usize, 1), store.memories.items.len);
 }
 
-test "autonomy facial expression uses threshold gating without cooldown hard gate" {
+test "autonomy facial expression respects action cooldown" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const state_path = "data/test/autonomy_expression_state.json";
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
+    var clock = TestClock{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.deps.clock = clock.clock();
+    brain.deps.io = std.testing.io;
     var expression_output = TestFacialExpressionOutput{};
     defer expression_output.deinit();
     brain.deps.facial_expression_output = expression_output.output();
+    try writeAndRefreshFacialExpressionCatalog(&brain, allocator, std.testing.io, "/tmp/test-brain-autonomy-expression", test_avatar_json_autonomy_expressions);
     brain.cfg.autonomy_mode = "full";
     brain.cfg.psyche_mode = "off";
     brain.cfg.maintenance_state_path = state_path;
     brain.deps.io = std.testing.io;
     var scripted = autonomy_mod.ScriptedAutonomyPlanner{ .turns = &[_]autonomy_mod.AutonomyTurn{
-        .{ .action_pressures = &[_]chat_mod.ActionProposal{.{ .action = .facial_expression, .origin = .autonomy, .eyes = "neutral", .mouth = "open", .duration_ms = 5000 }}, .salience = .low, .reason = "visible reaction" },
+        .{ .action_pressures = &[_]chat_mod.ActionProposal{.{ .action = .facial_expression, .origin = .autonomy, .eyes = "neutral", .mouth = "open", .duration_ms = 3000 }}, .salience = .low, .reason = "visible reaction" },
         .{ .action_pressures = &[_]chat_mod.ActionProposal{.{ .action = .facial_expression, .origin = .autonomy, .eyes = "stern", .mouth = "frown", .duration_ms = 1000 }}, .salience = .low, .reason = "second expression" },
     } };
     brain.deps.autonomy_planner = scripted.planner();
@@ -247,8 +256,14 @@ test "autonomy facial expression uses threshold gating without cooldown hard gat
         .full_max_capacity = brain.cfg.autonomy_full_max_capacity,
     });
     try std.testing.expect(state.control_capacity < state.max_capacity);
+    try std.testing.expect(state.last_autonomy_action_at != null);
 
-    brain.now_seconds += 1;
+    clock.now_seconds += 1;
+    try brain.runAutonomyTick(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 1), scripted.calls);
+    try std.testing.expectEqual(@as(usize, 1), expression_output.calls);
+
+    clock.now_seconds += maintenance.autonomy_action_cooldown_seconds;
     try brain.runAutonomyTick(std.testing.io);
     state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, "full", .{
         .limited_max_capacity = brain.cfg.autonomy_limited_max_capacity,
@@ -376,7 +391,10 @@ test "autonomy expands process goals before execution" {
     try std.testing.expectEqual(@as(usize, 1), scripted.calls);
     try std.testing.expectEqual(@as(usize, 1), composer.calls);
     try std.testing.expectEqualStrings("investigate_touch", composer.last_goal);
-    try std.testing.expectEqual(@as(usize, 1), store.memories.items.len);
+    const recipe = try process_recipe_memory.lookupRecipe(&brain, "investigate_touch", .autonomy);
+    defer if (recipe) |loaded| process_recipe_memory.freeRecipe(allocator, loaded);
+    try std.testing.expect(recipe != null);
+    try std.testing.expect(store.memories.items.len >= 1);
     try std.testing.expectEqual(@as(u64, 1), brain.context_stats.total_process_goal_count);
     try std.testing.expectEqual(@as(u64, 1), brain.context_stats.total_composed_steps);
 }
@@ -396,7 +414,7 @@ test "autonomy tick skips planner when control capacity is overdrawn" {
     brain.deps.autonomy_planner = scripted.planner();
     try maintenance.saveAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, .{
         .sleeping = false,
-        .control_capacity = -0.05,
+        .control_capacity = -5,
         .max_capacity = brain.cfg.autonomy_full_max_capacity,
         .last_capacity_replenish_at = brain.now_seconds - 3600,
     });
@@ -409,6 +427,35 @@ test "autonomy tick skips planner when control capacity is overdrawn" {
     try std.testing.expectEqual(@as(usize, 0), scripted.calls);
     try std.testing.expect(!state.sleeping);
     try std.testing.expectEqualStrings("autonomy waiting: overdrawn", state.last_reason.?);
+}
+
+test "autonomy overdrawn logs blocked status to developer event log" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const state_path = "data/test/autonomy_exhausted_event_log_state.json";
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.cfg.autonomy_mode = "full";
+    brain.cfg.maintenance_state_path = state_path;
+    brain.deps.io = std.testing.io;
+    var log = TestEventLog{};
+    defer log.deinit();
+    brain.deps.event_log = log.log();
+    var scripted = autonomy_mod.ScriptedAutonomyPlanner{ .turns = &[_]autonomy_mod.AutonomyTurn{} };
+    brain.deps.autonomy_planner = scripted.planner();
+    try maintenance.saveAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, .{
+        .sleeping = false,
+        .control_capacity = -5,
+        .max_capacity = brain.cfg.autonomy_full_max_capacity,
+        .last_capacity_replenish_at = brain.now_seconds - 3600,
+    });
+
+    try brain.runAutonomyTick(std.testing.io);
+    try std.testing.expectEqualStrings("state", log.kind.?);
+    try std.testing.expectEqualStrings("autonomy blocked", log.title.?);
+    try std.testing.expectEqualStrings("autonomy waiting: overdrawn", log.body.?);
 }
 
 test "dream time request delivers mailbox item" {
@@ -468,6 +515,15 @@ test "dream time persists causal belief self trust disposition and mailbox chain
     try std.testing.expect(store.artifacts.items[0].source_event_ids.len > 0);
     try std.testing.expect(dream.source_event_ids.len >= 4);
     try std.testing.expect(stringSliceContains(dream.source_event_ids, residue_event.id));
+    var persona_directive_event_id: ?[]const u8 = null;
+    for (store.experience_events.items) |event| {
+        if (std.mem.eql(u8, event.kind, experience_kinds.dream_time_persona_directive_synthesized)) {
+            persona_directive_event_id = event.id;
+            break;
+        }
+    }
+    const persona_event_id = persona_directive_event_id orelse return error.MissingPersonaDirectiveEvent;
+    try std.testing.expect(stringSliceContains(dream.source_event_ids, persona_event_id));
     try std.testing.expectEqual(@as(usize, 1), dream.source_memory_ids.len);
     try std.testing.expectEqualStrings("memory_day_residue", dream.source_memory_ids[0]);
     try std.testing.expectEqual(@as(usize, 1), dream.updated_belief_ids.len);
@@ -492,6 +548,41 @@ test "dream time persists causal belief self trust disposition and mailbox chain
     try std.testing.expectEqualStrings(store.beliefs.items[0].belief_id, snapshot.belief_model.salient.?.belief_id);
     try std.testing.expectEqualStrings(store.self_trust.items[0].self_trust_id, snapshot.self_trust_model.strongest.?.self_trust_id);
     try std.testing.expectEqualStrings(store.dispositions.items[0].disposition_id, snapshot.disposition_model.strongest.?.disposition_id);
+    try std.testing.expect(dream.persona.len > 0);
+    try std.testing.expect(dream.short_term.len > 0);
+    try std.testing.expect(dream.long_term.len > 0);
+    try std.testing.expect(brain.persona_directive != null);
+    try std.testing.expectEqualStrings(dream.persona, brain.persona_directive.?.persona);
+    try std.testing.expectEqualStrings(dream.short_term, item.waking_thought);
+    try std.testing.expectEqual(@as(usize, 1), store.persona_synthesizer.calls);
+}
+
+test "dream persona synthesis consults psyche when enabled" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const state_path = "data/test/dream_persona_psyche_state.json";
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.cfg.psyche_mode = "on";
+    brain.cfg.autonomy_mode = "full";
+    brain.cfg.maintenance_state_path = state_path;
+    brain.deps.io = std.testing.io;
+    var psyche = psyche_client.ScriptedPsycheService{
+        .id_turn = .{ .top_need = "stabilize identity", .urges = &[_][]const u8{"ask before guessing"}, .random_thoughts = &[_][]const u8{"hallway"}, .desired_action_bias = "clarify recognition", .salience = .medium, .reason = "uncertainty lingered" },
+        .superego_turn = .{ .concerns = &[_][]const u8{"avoid false certainty"}, .vetoes = &[_][]const u8{}, .preferred_restraints = &[_][]const u8{"ask first"}, .values_to_preserve = &[_][]const u8{"honesty"}, .salience = .medium, .reason = "repair over performance" },
+    };
+    brain.deps.psyche_service = psyche.service();
+    try seedDueAutonomyState(allocator, &brain, state_path, brain.cfg.autonomy_full_max_capacity);
+
+    _ = try brain.requestDreamTime("consolidate uncertain recognition");
+
+    try std.testing.expectEqual(@as(usize, 1), psyche.id_calls);
+    try std.testing.expectEqual(@as(usize, 1), psyche.superego_calls);
+    try std.testing.expect(std.mem.indexOf(u8, store.persona_synthesizer.last_context, "psyche_consult:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, store.persona_synthesizer.last_context, "stabilize identity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, psyche.last_id_context, "dream_consolidation:") != null);
 }
 
 test "action pressures are proposed selected suppressed and visible in read models" {
@@ -748,15 +839,14 @@ test "conversation expands process goals before executing skills" {
     defer allocator.free(result.spoken_text);
     defer allocator.free(result.user_summary);
     defer allocator.free(result.brain_summary);
-    try std.testing.expectEqualStrings("process goal requested", result.brain_summary);
     try std.testing.expectEqual(@as(usize, 1), composer.calls);
     try std.testing.expectEqualStrings("investigate_touch", composer.last_goal);
-    try std.testing.expect(store.memories.items.len >= 1);
     try std.testing.expect(result.spoken_text.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, result.spoken_text, "That touch felt intentional.") != null);
     try std.testing.expectEqual(@as(u64, 1), brain.context_stats.total_process_goal_count);
     try std.testing.expectEqual(@as(u64, 2), brain.context_stats.total_composed_steps);
     try std.testing.expect(brain.context_stats.operations.get("process_composition.interaction") != null);
+    try std.testing.expect(brain.active_process == null);
 }
 
 test "conversation process goal composition records stats" {
@@ -788,7 +878,9 @@ test "conversation process goal composition records stats" {
     try std.testing.expectEqual(@as(usize, 1), composer.calls);
     try std.testing.expectEqualStrings("investigate_touch", composer.last_goal);
     try std.testing.expectEqual(process_goal_mod.ComposeMode.interaction, composer.last_mode.?);
-    try std.testing.expectEqual(chat_mod.ActionProposalType.think_about, expanded_turn.action_pressures[0].action);
+    try std.testing.expectEqual(@as(usize, 0), expanded_turn.action_pressures.len);
+    try std.testing.expect(brain.active_process != null);
+    try std.testing.expectEqualStrings("investigate_touch", brain.active_process.?.goal);
     try std.testing.expectEqual(@as(u64, 1), brain.context_stats.total_process_goal_count);
     try std.testing.expectEqual(@as(u64, 1), brain.context_stats.total_composed_steps);
     try std.testing.expect(brain.context_stats.operations.get("process_composition.interaction") != null);

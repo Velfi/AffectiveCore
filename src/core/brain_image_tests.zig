@@ -25,7 +25,6 @@ const ScriptedRecallChatService = support.ScriptedRecallChatService;
 const ScriptedClarificationChatService = support.ScriptedClarificationChatService;
 const ScriptedHardErrorRecoveryChatService = support.ScriptedHardErrorRecoveryChatService;
 const HeardSpeechObservationChatService = support.HeardSpeechObservationChatService;
-const FailingIdentityClaimIntentService = support.FailingIdentityClaimIntentService;
 const ScriptedContinuingChatService = support.ScriptedContinuingChatService;
 const makeBrain = support.makeBrain;
 const addMara = support.addMara;
@@ -71,6 +70,43 @@ test "describe image prefers uploaded visual observation over live camera" {
     try std.testing.expect(std.mem.indexOf(u8, text, "image: data/test/image.png") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Focus: colors") != null);
     try std.testing.expect(brain.last_visual_observation_uploaded);
+}
+
+test "describe image reuses host-delivered frame on pull camera without recapturing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.last_visual_observation_path = "fixtures/visitors/known_01.jpg";
+    brain.last_visual_update_seconds = brain.now_seconds;
+    brain.last_visual_observation_uploaded = false;
+    var pull_camera = support.FrontendPullCamera{};
+    brain.deps.camera = pull_camera.camera();
+
+    const text = try brain.describeImageForObservation("expression");
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "image_description:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fixtures/visitors/known_01.jpg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Focus: expression") != null);
+}
+
+test "describe image requests host pull when pull camera has no remembered frame" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    var pull_camera = support.FrontendPullCamera{};
+    brain.deps.camera = pull_camera.camera();
+
+    const text = try brain.describeImageForObservation("desk");
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "host_sense_pull_requested:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "purpose: describe_image") != null);
+    try std.testing.expect(brain.awaitedHostRequestMatches("camera", "describe_image"));
 }
 
 test "describe image uses uploaded visual observation when live camera is unavailable" {

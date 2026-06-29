@@ -11,9 +11,7 @@ const ports = @import("ports.zig");
 const schema = ports.schema;
 const store_mod = ports.store;
 const graph_store = ports.graph_store;
-const intent_mod = ports.intent;
 const openai = ports.openai;
-const greeting_client = ports.greeting;
 const speech_mod = ports.speech;
 const chat_mod = ports.chat;
 const skills_mod = ports.skills;
@@ -250,8 +248,20 @@ pub fn describeImageForObservation(self: *Brain, prompt: []const u8) ![]const u8
             remembered_image = true;
             break :blk self.last_visual_observation_path orelse return error.NoImageToDescribe;
         }
+        if (self.awaitedHostRequestMatches("camera", "describe_image")) {
+            return try self.allocator.dupe(u8, "host_sense_pull_pending: camera describe_image already requested; waiting for host delivery.\n");
+        }
         try self.logState(.Capture);
-        const capture = try self.deps.camera.capture(self.allocator);
+        const capture = self.deps.camera.capture(self.allocator) catch |err| switch (err) {
+            error.FrontendCaptureRequested => {
+                if (self.last_visual_observation_path) |path| {
+                    remembered_image = true;
+                    break :blk path;
+                }
+                return @import("awaited_host_request.zig").pullRequestedObservation(self, "camera", "describe_image");
+            },
+            else => return err,
+        };
         self.rememberVisualUpdate(capture.path);
         self.last_visual_observation_uploaded = false;
         self.outputImageCapture(capture);
@@ -540,7 +550,7 @@ pub fn rememberCreatorAttachment(self: *Brain, person: schema.Person) !void {
         .text = text,
         .original_text = text,
         .interpretation = text,
-        .vector = try vector_index.embedQuery(self.allocator, text, &[_][]const u8{ "identity", "creator", "attachment" }),
+        .vector = try vector_index.embedQuery(self.allocator, self.deps.embedding_service, text, &[_][]const u8{ "identity", "creator", "attachment" }),
         .confidence = 1.0,
         .valence = 0.85,
         .salience = 1.0,
@@ -607,6 +617,10 @@ pub fn say(self: *Brain, text: []const u8) !void {
     try self.deps.speaker.playFile(self.allocator, audio.path);
     self.trace("speech.play.done");
     self.trace("speech.log.start");
-    try self.appendEventLog("brain", "Brain", text);
+    if (self.deps.event_log) |event_log| {
+        try event_log.append("brain", "Brain", text);
+    } else {
+        try self.appendEventLog("brain", "Brain", text);
+    }
     self.trace("speech.log.done");
 }

@@ -6,6 +6,8 @@ const ports = @import("ports.zig");
 const schema = ports.schema;
 const chat_mod = ports.chat;
 const openai = ports.openai;
+const process_recipe_memory = @import("process_recipe_memory.zig");
+const conversation_context = @import("conversation_context.zig");
 const input_mod = ports.input;
 
 const maintenance = @import("maintenance.zig");
@@ -34,7 +36,6 @@ const ScriptedRecallChatService = support.ScriptedRecallChatService;
 const ScriptedClarificationChatService = support.ScriptedClarificationChatService;
 const ScriptedHardErrorRecoveryChatService = support.ScriptedHardErrorRecoveryChatService;
 const HeardSpeechObservationChatService = support.HeardSpeechObservationChatService;
-const FailingIdentityClaimIntentService = support.FailingIdentityClaimIntentService;
 const ScriptedContinuingChatService = support.ScriptedContinuingChatService;
 const makeBrain = support.makeBrain;
 const addMara = support.addMara;
@@ -113,7 +114,8 @@ test "introspection summarizes memory and senses" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Drill-down topics:") != null);
 
     const needs = try brain.introspect("needs");
-    try std.testing.expect(std.mem.indexOf(u8, needs, "self_needs_and_wants:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, needs, "inner_directives:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, needs, "self_wants:") != null);
     try std.testing.expect(std.mem.indexOf(u8, needs, "self_defined_want:want_music") != null);
 
     const senses = try brain.introspect("senses");
@@ -121,6 +123,38 @@ test "introspection summarizes memory and senses" {
     try std.testing.expect(std.mem.indexOf(u8, senses, "battery level") != null);
     try std.testing.expect(std.mem.indexOf(u8, senses, "plugged-in power state") != null);
     try std.testing.expect(std.mem.indexOf(u8, senses, "database statistics") != null);
+}
+
+test "compact memory includes known_processes from stored recipes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    var pressures = [_]chat_mod.ActionProposal{
+        .{ .action = .feel_about, .origin = .autonomy, .query = "touch" },
+    };
+    try process_recipe_memory.recordOutcome(&brain, "investigate_touch", .autonomy, .{
+        .action_pressures = &pressures,
+        .reason = "cached",
+        .step_kinds = &.{},
+    }, .success, &.{}, null);
+    const blocks = try brain.buildConversationMemoryBlocks(null, null, .heard_speech);
+    defer conversation_context.freeMemoryBlocks(allocator, blocks);
+    var found = false;
+    for (blocks) |block| {
+        switch (block.kind) {
+            .memory => |kind| {
+                if (kind == .known_processes) {
+                    found = true;
+                    try std.testing.expect(std.mem.indexOf(u8, block.text, "investigate_touch") != null);
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "unavailable introspection records command result without forming brain memory" {
@@ -318,7 +352,7 @@ test "startup seeds markdown document once as long term memories" {
     try std.testing.expectEqualStrings("Grow patient knowledge.", core.text);
     try std.testing.expect(tagInSlice(core.tags, "core_value"));
     try std.testing.expect(std.mem.indexOf(u8, core.interpretation, "seed Garden Seed core value:") != null);
-    try std.testing.expectEqual(vector_index.dimensions, core.vector.len);
+    try std.testing.expectEqual(brain.deps.embedding_service.dimensions(), core.vector.len);
 
     const tendency = findMemoryById(store.memories.items, "seed_garden_seed_seed_operating_tendency_1") orelse return error.MissingOperatingTendencySeed;
     try std.testing.expectEqualStrings("Ask before interrupting.", tendency.text);
