@@ -183,6 +183,33 @@ pub fn cloneCapabilityStatus(allocator: std.mem.Allocator, status: schema.Capabi
     };
 }
 
+pub const max_capability_id_bytes: usize = 128;
+pub const max_host_id_bytes: usize = 128;
+pub const max_unavailable_reason_bytes: usize = 512;
+
+pub const InvalidCapabilityStatusBorrow = error{
+    CapabilityIdTooLong,
+    HostIdTooLong,
+    UnavailableReasonTooLong,
+};
+
+pub fn validateCapabilityStatusBorrow(status: schema.CapabilityStatus) InvalidCapabilityStatusBorrow!void {
+    if (status.capability_id.len > max_capability_id_bytes) return error.CapabilityIdTooLong;
+    if (status.host_id.len > max_host_id_bytes) return error.HostIdTooLong;
+    if (status.unavailable_reason.len > max_unavailable_reason_bytes) return error.UnavailableReasonTooLong;
+}
+
+pub fn cloneCapabilityStatusValidated(allocator: std.mem.Allocator, status: schema.CapabilityStatus) !schema.CapabilityStatus {
+    try validateCapabilityStatusBorrow(status);
+    return try cloneCapabilityStatus(allocator, status);
+}
+
+pub fn freeCapabilityStatus(allocator: std.mem.Allocator, status: schema.CapabilityStatus) void {
+    allocator.free(status.capability_id);
+    allocator.free(status.host_id);
+    allocator.free(status.unavailable_reason);
+}
+
 pub fn cloneCapabilityRequest(allocator: std.mem.Allocator, request: schema.CapabilityRequest) !schema.CapabilityRequest {
     return .{
         .request_id = try cloneString(allocator, request.request_id),

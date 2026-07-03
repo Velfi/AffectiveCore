@@ -236,7 +236,7 @@ pub const registry = [_]SkillSpec{
     .{ .id = .begin_subtask, .name = "begin_subtask", .description = "pause the current activity and open a child subtask without losing the main goal. Include text as the subtask goal. Run other skills after this in the same turn when needed; call resume_parent when the subtask is done.", .autonomy_policy = .allowed, .energy_cost = @as(u8, 0), .failure_hint = "Requires an active parent activity and non-empty subtask text." },
     .{ .id = .resume_parent, .name = "resume_parent", .description = "mark the current child subtask complete and resume the paused parent activity from the activity stack.", .autonomy_policy = .allowed, .energy_cost = @as(u8, 0), .failure_hint = "Requires an open child subtask with a paused parent on the activity stack." },
     .{ .id = .consolidate_memory, .name = "consolidate_memory", .description = "enter internal dream time to consolidate memory and integrate the day's traces. Use when the user asks to dream, nap internally, or enter dream time now.", .requires_senses = &.{ .stored_memory_read, .stored_memory_write }, .autonomy_policy = .allowed, .energy_cost = 2, .failure_hint = "Check memory read/write configuration.", .developer_title = "Consolidate", .developer_symbol_name = "square.stack.3d.up" },
-    .{ .id = .sleep_autonomy, .name = "sleep_autonomy", .description = "pause self-directed autonomy actions until wake_autonomy is chosen. Optional text records why.", .autonomy_policy = .allowed, .energy_cost = @as(u8, 0), .failure_hint = "Autonomy sleep can be set without extra host capability." },
+    .{ .id = .sleep_autonomy, .name = "sleep_autonomy", .description = "pause self-directed autonomy actions until wake_autonomy is chosen or a salient stimulus (speech, touch, strong sense) wakes me; declined for a short hold after such a wake. Optional text records why.", .autonomy_policy = .allowed, .energy_cost = @as(u8, 0), .failure_hint = "Autonomy sleep can be set without extra host capability." },
     .{ .id = .wake_autonomy, .name = "wake_autonomy", .description = "resume self-directed autonomy actions after sleep_autonomy. Optional text records why.", .autonomy_policy = .allowed, .energy_cost = @as(u8, 0), .failure_hint = "Autonomy wake can be set without extra host capability." },
     .{ .id = .emote, .name = "emote", .description = "silently show a brief third-person gesture in plain language; the host renders it as *text* in chat. Include text; optional duration_ms defaults to 3000 and may not exceed 5000. Use when facial_expression is unavailable or when a gesture fits text better than avatar sprites.", .autonomy_policy = .allowed, .energy_cost = @as(u8, 0), .failure_hint = "Provide non-empty emote text in plain language." },
     .{ .id = .facial_expression, .name = "facial_expression", .description = "silently show a facial expression on the avatar. Set eyes, mouth, or both from facial_expression_catalog; unspecified eyes or mouth default to neutral sprites. Or set text to a preset id from that catalog; optional duration_ms defaults to 3000 and may not exceed 5000. Use introspect query=skill/facial_expression for the sprite menu. When facial expression output or catalog is unavailable, use emote for visible affect instead.", .requires_senses = &.{.facial_expression_output}, .autonomy_policy = .allowed, .energy_cost = @as(u8, 1), .failure_hint = "Provide valid eyes and/or mouth sprite names from facial_expression_catalog, or set text to a preset id; unspecified aspects default to neutral; otherwise use emote." },
@@ -314,41 +314,43 @@ fn findSpec(entries: []const SkillSpec, id: SkillId) ?SkillSpec {
 }
 
 pub fn senseUnavailableReason(sense: Sense) []const u8 {
+    const llm_voice = @import("llm_voice.zig");
     return switch (sense) {
-        .live_camera => "no live camera is configured for this body",
-        .button_activation => "button activation is not configured for this body",
-        .button_hold_state => "button hold sensing is not configured for this body",
-        .visual_description => "visual description is not configured",
-        .visual_comparison => "visual comparison is not configured",
-        .identity_recognition => "identity recognition is not configured",
-        .stored_memory_read => "stored memory reading is not configured",
-        .stored_memory_write => "stored memory writing is not configured",
-        .stored_image_read => "stored image reading is not configured",
-        .introspection => "introspection is not configured",
-        .time_lookup => "time lookup is not configured",
-        .orientation_query => "orientation query is not configured",
-        .power_status => "power status sensing is not configured",
-        .storage_fullness => "storage fullness sensing is not configured",
-        .database_stats => "database statistics sensing is not configured",
-        .speech_output => "speech output is not configured",
-        .user_input => "user input is not configured",
-        .reminder_io => "reminder storage is not configured",
-        .image_generation => "image generation is not configured",
-        .face_picture_update => "face recognition picture updates are not configured",
-        .email_delivery => "email delivery is not configured",
-        .local_process_io => "local process I/O is not configured",
-        .uploaded_media_read => "uploaded media reading is not configured",
-        .audio_classification => "audio classification is not configured",
-        .audio_transcription => "audio transcription is not configured",
-        .video_inspection => "video inspection is not configured",
-        .facial_expression_output => "facial expression output is only available in the macOS WebView",
+        .live_camera => llm_voice.camera_unavailable,
+        .button_activation => llm_voice.button_activation_unavailable,
+        .button_hold_state => llm_voice.button_hold_unavailable,
+        .visual_description => llm_voice.visual_description_unavailable,
+        .visual_comparison => llm_voice.visual_comparison_unavailable,
+        .identity_recognition => llm_voice.identity_recognition_unavailable,
+        .stored_memory_read => llm_voice.stored_memory_read_unavailable,
+        .stored_memory_write => llm_voice.stored_memory_write_unavailable,
+        .stored_image_read => llm_voice.stored_image_read_unavailable,
+        .introspection => llm_voice.introspection_unavailable,
+        .time_lookup => llm_voice.time_lookup_unavailable,
+        .orientation_query => llm_voice.orientation_unavailable,
+        .power_status => llm_voice.power_status_unavailable,
+        .storage_fullness => llm_voice.storage_unavailable,
+        .database_stats => llm_voice.database_stats_unavailable,
+        .speech_output => llm_voice.speech_output_unavailable,
+        .user_input => llm_voice.user_input_unavailable,
+        .reminder_io => llm_voice.reminder_io_unavailable,
+        .image_generation => llm_voice.image_generation_unavailable,
+        .face_picture_update => llm_voice.face_picture_update_unavailable,
+        .email_delivery => llm_voice.email_delivery_unavailable,
+        .local_process_io => llm_voice.local_process_io_unavailable,
+        .uploaded_media_read => llm_voice.uploaded_media_read_unavailable,
+        .audio_classification => llm_voice.audio_classification_unavailable,
+        .audio_transcription => llm_voice.audio_transcription_unavailable,
+        .video_inspection => llm_voice.video_inspection_unavailable,
+        .facial_expression_output => llm_voice.facial_expression_unavailable,
     };
 }
 
 pub fn autonomyPolicyAllowed(policy: AutonomyPolicy, autonomy_mode: []const u8) bool {
+    _ = autonomy_mode;
     return switch (policy) {
         .allowed => true,
-        .full_allowed => std.mem.eql(u8, autonomy_mode, "full"),
+        .full_allowed => true,
         .forbidden, .invalid => false,
     };
 }
@@ -438,9 +440,9 @@ pub fn autonomyPointCost(energy_tier: u8) f32 {
 pub fn autonomyEnergyCost(id: SkillId, autonomy_mode: []const u8) !u8 {
     const entry = spec(id) orelse return error.UnknownSkill;
     if (!autonomyPolicyAllowed(entry.autonomy_policy, autonomy_mode)) return switch (entry.autonomy_policy) {
-        .forbidden, .full_allowed => error.ProactiveCameraCaptureForbidden,
+        .forbidden => error.ProactiveCameraCaptureForbidden,
         .invalid => error.InvalidAutonomyAction,
-        .allowed => unreachable,
+        .allowed, .full_allowed => unreachable,
     };
     return try actionAutonomyEnergyTier(id);
 }
@@ -452,9 +454,6 @@ pub fn autonomyCostCatalog(allocator: std.mem.Allocator, autonomy_mode: []const 
         if (!autonomyPolicyAllowed(entry.autonomy_policy, autonomy_mode)) continue;
         const point_cost = try actionAutonomyPointCost(entry.id);
         try out.print(allocator, " {s}={d}", .{ entry.name, @as(u32, @intFromFloat(point_cost)) });
-    }
-    if (!std.mem.eql(u8, autonomy_mode, "full")) {
-        try out.appendSlice(allocator, " host_sense_pulls=full_only");
     }
     return out.toOwnedSlice(allocator);
 }
@@ -520,13 +519,13 @@ test "skill registry rejects cyclic skill dependencies" {
     try std.testing.expectError(error.CyclicSkillDependency, validateSpecs(&entries));
 }
 
-test "autonomy registry keeps host sense pulls full-only" {
+test "agency registry leaves host sense pulls to capability policy" {
     try std.testing.expect((spec(.take_picture) orelse return error.MissingSkillSpec).autonomy_policy == .full_allowed);
     try std.testing.expect((spec(.describe_image) orelse return error.MissingSkillSpec).autonomy_policy == .full_allowed);
     try std.testing.expect((spec(.compare_images) orelse return error.MissingSkillSpec).autonomy_policy == .full_allowed);
     try std.testing.expect((spec(.recognize) orelse return error.MissingSkillSpec).autonomy_policy == .full_allowed);
     try std.testing.expect((spec(.request_orientation) orelse return error.MissingSkillSpec).autonomy_policy == .full_allowed);
-    try std.testing.expect(!autonomyAllowed(.take_picture, "limited"));
+    try std.testing.expect(autonomyAllowed(.take_picture, "limited"));
     try std.testing.expect(autonomyAllowed(.take_picture, "full"));
-    try std.testing.expect(!autonomyAllowed(.recognize, "off"));
+    try std.testing.expect(autonomyAllowed(.recognize, "off"));
 }

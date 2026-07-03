@@ -57,6 +57,10 @@ pub fn runWithArgs(init: std.process.Init, forwarded: []const []const u8) !void 
             i += 1;
             if (i >= forwarded.len) return error.MissingConversationModels;
             options.conversation_models = forwarded[i];
+        } else if (std.mem.eql(u8, arg, "--host")) {
+            i += 1;
+            if (i >= forwarded.len) return error.MissingHostMode;
+            options.host_mode = parseHostMode(forwarded[i]) orelse return error.InvalidHostMode;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             try positionals.append(allocator, arg);
         } else if (command == null) {
@@ -71,46 +75,46 @@ pub fn runWithArgs(init: std.process.Init, forwarded: []const []const u8) !void 
         return error.MissingCommand;
     };
     if (std.mem.eql(u8, cmd, "dispatch")) {
-        try runDispatch(init.io, allocator, options, positionals.items);
+        try runDispatch(init.io, init.environ_map, allocator, options, positionals.items);
         return;
     }
     if (std.mem.eql(u8, cmd, "drain")) {
-        try runDrain(init.io, options);
+        try runDrain(init.io, init.environ_map, options);
         return;
     }
     if (std.mem.eql(u8, cmd, "setup")) {
-        try runSetup(init.io, options);
+        try runSetup(init.io, init.environ_map, options);
         return;
     }
     if (std.mem.eql(u8, cmd, "run")) {
-        try runScript(init.io, allocator, options, positionals.items);
+        try runScript(init.io, init.environ_map, allocator, options, positionals.items);
         return;
     }
     if (std.mem.eql(u8, cmd, "connect")) {
-        try runNamedDispatch(init.io, options, try requests.connect("cli-connect"), false);
+        try runNamedDispatch(init.io, init.environ_map, options, try requests.connect("cli-connect"), false);
         return;
     }
     if (std.mem.eql(u8, cmd, "host_attach")) {
         const host_id = flagValue(positionals.items, "--host-id") orelse "mcp-host";
-        try runNamedDispatch(init.io, options, try requests.hostAttach("cli-host-attach", host_id), false);
+        try runNamedDispatch(init.io, init.environ_map, options, try requests.hostAttach("cli-host-attach", host_id), false);
         return;
     }
     if (std.mem.eql(u8, cmd, "user_text")) {
         const text = flagValue(positionals.items, "--text") orelse return error.MissingText;
-        try runNamedDispatch(init.io, options, try requests.userText("cli-user-text", text), true);
+        try runNamedDispatch(init.io, init.environ_map, options, try requests.userText("cli-user-text", text), true);
         return;
     }
     if (std.mem.eql(u8, cmd, "short_touch")) {
-        try runNamedDispatch(init.io, options, try requests.shortTouch("cli-short-touch"), true);
+        try runNamedDispatch(init.io, init.environ_map, options, try requests.shortTouch("cli-short-touch"), true);
         return;
     }
     if (std.mem.eql(u8, cmd, "sense_observation")) {
         const image = flagValue(positionals.items, "--image") orelse return error.MissingImagePath;
-        try runNamedDispatch(init.io, options, try requests.senseObservationCamera("cli-sense-observation", image), true);
+        try runNamedDispatch(init.io, init.environ_map, options, try requests.senseObservationCamera("cli-sense-observation", image), true);
         return;
     }
     if (std.mem.eql(u8, cmd, "read_models_snapshot")) {
-        try runNamedDispatch(init.io, options, try requests.readModelsSnapshot("cli-read-models"), true);
+        try runNamedDispatch(init.io, init.environ_map, options, try requests.readModelsSnapshot("cli-read-models"), true);
         return;
     }
 
@@ -118,9 +122,9 @@ pub fn runWithArgs(init: std.process.Init, forwarded: []const []const u8) !void 
     return error.UnknownCommand;
 }
 
-fn runNamedDispatch(io: std.Io, options: Options, request_json: []const u8, with_setup: bool) !void {
+fn runNamedDispatch(io: std.Io, env: *const std.process.Environ.Map, options: Options, request_json: []const u8, with_setup: bool) !void {
     defer std.heap.page_allocator.free(request_json);
-    var session = try session_mod.Session.open(io, options);
+    var session = try session_mod.Session.openWithEnv(io, env, options);
     defer session.deinit();
     if (with_setup) try session.setupHost();
     const response = try session.dispatch(request_json);
@@ -136,25 +140,31 @@ fn flagValue(args: []const []const u8, flag: []const u8) ?[]const u8 {
     return null;
 }
 
-fn runDispatch(io: std.Io, allocator: std.mem.Allocator, options: Options, rest: []const []const u8) !void {
+fn parseHostMode(value: []const u8) ?Options.HostMode {
+    if (std.mem.eql(u8, value, "mock")) return .mock;
+    if (std.mem.eql(u8, value, "live")) return .live;
+    return null;
+}
+
+fn runDispatch(io: std.Io, env: *const std.process.Environ.Map, allocator: std.mem.Allocator, options: Options, rest: []const []const u8) !void {
     const request_json = try readRequestJson(io, allocator, rest);
-    var session = try session_mod.Session.open(io, options);
+    var session = try session_mod.Session.openWithEnv(io, env, options);
     defer session.deinit();
     const response = try session.dispatch(request_json);
     try writeStdout(io, response);
     try writeStdout(io, "\n");
 }
 
-fn runDrain(io: std.Io, options: Options) !void {
-    var session = try session_mod.Session.open(io, options);
+fn runDrain(io: std.Io, env: *const std.process.Environ.Map, options: Options) !void {
+    var session = try session_mod.Session.openWithEnv(io, env, options);
     defer session.deinit();
     const response = try session.drain();
     try writeStdout(io, response);
     try writeStdout(io, "\n");
 }
 
-fn runSetup(io: std.Io, options: Options) !void {
-    var session = try session_mod.Session.open(io, options);
+fn runSetup(io: std.Io, env: *const std.process.Environ.Map, options: Options) !void {
+    var session = try session_mod.Session.openWithEnv(io, env, options);
     defer session.deinit();
     try session.setupHost();
     const response = try session.dispatch(
@@ -164,11 +174,11 @@ fn runSetup(io: std.Io, options: Options) !void {
     try writeStdout(io, "\n");
 }
 
-fn runScript(io: std.Io, allocator: std.mem.Allocator, options: Options, rest: []const []const u8) !void {
+fn runScript(io: std.Io, env: *const std.process.Environ.Map, allocator: std.mem.Allocator, options: Options, rest: []const []const u8) !void {
     if (rest.len == 0) return error.MissingFlowPath;
     const flow_path = rest[0];
     const flow_bytes = try readPath(io, allocator, flow_path);
-    var session = try session_mod.Session.open(io, options);
+    var session = try session_mod.Session.openWithEnv(io, env, options);
     defer session.deinit();
 
     if (std.mem.endsWith(u8, flow_path, ".json")) {
@@ -271,6 +281,7 @@ fn printUsage() void {
         \\  --brain-id ID         default: mcp-host
         \\  --manifest PATH       default: fixtures/embedded_api/manifest_macos.json
         \\  --models SPEC         default: openai:gpt-4.1-nano
+        \\  --host mock|live      default: mock; live uses env-var provider credentials
         \\  --scenario NAME       default | resume_invalid_llm | enrollment_without_remember_person
         \\                        | upstream_rejected | scripted_recognize_resume | unknown_want_achievement
         \\  --fresh               delete brain-root before opening session

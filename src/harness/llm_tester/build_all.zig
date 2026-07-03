@@ -6,6 +6,7 @@ const extraction_client = @import("../../api/extraction_client.zig");
 const psyche_client = @import("../../api/psyche_client.zig");
 const want_achievement_client = @import("../../api/want_achievement_client.zig");
 const persona_directive_client = @import("../../api/persona_directive_client.zig");
+const dream_image_client = @import("../../api/dream_image_client.zig");
 const process_composition_client = @import("../../api/process_composition_client.zig");
 const openai_identity_client = @import("../../api/openai_identity_client.zig");
 
@@ -23,6 +24,7 @@ const sources = [_]ScenarioSource{
     .{ .name = "psyche", .loadFn = psyche_client.llmTesterScenarios },
     .{ .name = "want_achievement", .loadFn = want_achievement_client.llmTesterScenarios },
     .{ .name = "persona_directive", .loadFn = persona_directive_client.llmTesterScenarios },
+    .{ .name = "dream_image", .loadFn = dream_image_client.llmTesterScenarios },
     .{ .name = "process_composition", .loadFn = process_composition_client.llmTesterScenarios },
     .{ .name = "identity_comparison", .loadFn = openai_identity_client.llmTesterScenarios },
 };
@@ -115,7 +117,7 @@ test "buildAllScenarios covers every text subsystem with non-empty prompts" {
     const allocator = arena.allocator();
 
     const scenarios = try buildAllScenarios(allocator);
-    try std.testing.expect(scenarios.len >= 9);
+    try std.testing.expect(scenarios.len >= 12);
 
     var ids = std.StringHashMap(void).init(allocator);
     for (scenarios) |item| {
@@ -123,9 +125,13 @@ test "buildAllScenarios covers every text subsystem with non-empty prompts" {
         try std.testing.expect(item.label.len > 0);
         try std.testing.expect(item.description.len > 0);
         try std.testing.expect(item.subsystem.len > 0);
-        try std.testing.expect(item.system_prompt.len > 0);
         try std.testing.expect(item.user_prompt.len > 0);
-        try std.testing.expect(item.json_schema.len > 0);
+        if (item.response_format == .image_generation) {
+            try std.testing.expectEqualStrings("dream_image", item.subsystem);
+        } else {
+            try std.testing.expect(item.system_prompt.len > 0);
+            try std.testing.expect(item.json_schema.len > 0);
+        }
         try ids.put(item.id, {});
     }
     try std.testing.expectEqual(scenarios.len, ids.count());

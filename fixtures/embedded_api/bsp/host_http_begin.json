@@ -1,0 +1,9 @@
+{
+  "type": "host.http.begin",
+  "request_id": "host-http-1",
+  "url": "affective-host://llm/complete",
+  "headers_json": "{\"content-type\":\"application/json\"}",
+  "body_b64": "eyJtZXNzYWdlIjoiaGVsbG8ifQ==",
+  "timeout_ms": 30000,
+  "max_response_bytes": 1048576
+}

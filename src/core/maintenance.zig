@@ -24,8 +24,6 @@ const StateFile = struct {
     autonomy: ?AutonomyState = null,
 };
 
-pub const autonomy_action_cooldown_seconds: i64 = 5;
-
 pub const AutonomyState = struct {
     sleeping: bool = false,
     control_capacity: f32 = 0.0,
@@ -34,8 +32,8 @@ pub const AutonomyState = struct {
     consecutive_voluntary_speech: u32 = 0,
     last_user_turn_at: ?i64 = null,
     last_autonomy_tick_at: ?i64 = null,
-    last_autonomy_action_at: ?i64 = null,
     last_capacity_replenish_at: ?i64 = null,
+    last_woken_at: ?i64 = null,
     last_error: ?[]const u8 = null,
     last_reason: ?[]const u8 = null,
 };
@@ -297,8 +295,8 @@ fn cloneAutonomyState(allocator: std.mem.Allocator, autonomy: AutonomyState) !Au
         .consecutive_voluntary_speech = autonomy.consecutive_voluntary_speech,
         .last_user_turn_at = autonomy.last_user_turn_at,
         .last_autonomy_tick_at = autonomy.last_autonomy_tick_at,
-        .last_autonomy_action_at = autonomy.last_autonomy_action_at,
         .last_capacity_replenish_at = autonomy.last_capacity_replenish_at,
+        .last_woken_at = autonomy.last_woken_at,
         .last_error = if (autonomy.last_error) |text| try allocator.dupe(u8, text) else null,
         .last_reason = if (autonomy.last_reason) |text| try allocator.dupe(u8, text) else null,
     };
@@ -367,9 +365,13 @@ pub fn autonomyPlannerReady(state: AutonomyState) bool {
     return !state.sleeping and autonomyBudgetAvailable(state);
 }
 
-pub fn autonomyActionCooldownActive(state: AutonomyState, now_seconds: i64) bool {
-    const last = state.last_autonomy_action_at orelse return false;
-    return now_seconds - last < autonomy_action_cooldown_seconds;
+pub fn autonomyActionsAvailable(state: AutonomyState) bool {
+    return autonomyPlannerReady(state);
+}
+
+pub fn autonomyRemainingActionCount(capacity: f32) u32 {
+    if (capacity <= 0) return 0;
+    return @intFromFloat(capacity);
 }
 
 pub fn spendCapacity(state: *AutonomyState, amount: f32) void {
@@ -377,8 +379,7 @@ pub fn spendCapacity(state: *AutonomyState, amount: f32) void {
 }
 
 fn maxCapacityForMode(mode: []const u8, capacity_cfg: AutonomyCapacityConfig) f32 {
-    if (std.mem.eql(u8, mode, "limited")) return capacity_cfg.limited_max_capacity;
-    if (std.mem.eql(u8, mode, "off")) return capacity_cfg.full_max_capacity;
+    _ = mode;
     return capacity_cfg.full_max_capacity;
 }
 
@@ -579,13 +580,19 @@ test "spend capacity can overdraw autonomy budget" {
     try std.testing.expect(!autonomyPlannerReady(state));
 }
 
-test "autonomy action cooldown blocks until interval elapses" {
+test "autonomy actions stay available when planner is ready" {
     const state = AutonomyState{
-        .last_autonomy_action_at = 100,
+        .control_capacity = 40,
+        .max_capacity = 50,
     };
-    try std.testing.expect(autonomyActionCooldownActive(state, 104));
-    try std.testing.expect(!autonomyActionCooldownActive(state, 105));
-    try std.testing.expect(!autonomyActionCooldownActive(.{}, 200));
+    try std.testing.expect(autonomyPlannerReady(state));
+    try std.testing.expect(autonomyActionsAvailable(state));
+}
+
+test "autonomy remaining action count floors at zero" {
+    try std.testing.expectEqual(@as(u32, 0), autonomyRemainingActionCount(0));
+    try std.testing.expectEqual(@as(u32, 0), autonomyRemainingActionCount(-2.5));
+    try std.testing.expectEqual(@as(u32, 3), autonomyRemainingActionCount(3.9));
 }
 
 test "project control capacity accrues elapsed replenish without persisting" {
@@ -611,7 +618,7 @@ test "replenish recovers from overdrawn autonomy budget" {
     try std.testing.expect(autonomyBudgetAvailable(state));
 }
 
-test "autonomy state clamps capacity to mode max" {
+test "autonomy state ignores legacy mode when choosing agency capacity" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -633,7 +640,7 @@ test "autonomy state clamps capacity to mode max" {
         .full_max_capacity = 50,
     });
     try std.testing.expect(!reset.sleeping);
-    try std.testing.expectEqual(@as(f32, 25), reset.max_capacity);
-    try std.testing.expectEqual(@as(f32, 25), reset.control_capacity);
+    try std.testing.expectEqual(@as(f32, 50), reset.max_capacity);
+    try std.testing.expectEqual(@as(f32, 40), reset.control_capacity);
     try std.testing.expectEqual(@as(f32, 0.7), reset.social_engagement);
 }

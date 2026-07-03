@@ -3,12 +3,14 @@ test {
     _ = @import("affective_core_embedded.zig");
     _ = @import("affective_core_embedded_abi_tests.zig");
     _ = @import("affective_core_embedded_fuzz_tests.zig");
+    _ = @import("geisha_repro_test.zig");
     _ = @import("affective_core_embedded_tests.zig");
     _ = @import("app/app_core.zig");
     _ = @import("app/brain.zig");
     _ = @import("app/brain_container.zig");
     _ = @import("app/brain_tests.zig");
     _ = @import("app/context_gate.zig");
+    _ = @import("app/embedded_protocol_fuzz_tests.zig");
     _ = @import("app/host_adapter.zig");
     _ = @import("app/host_profiles.zig");
     _ = @import("core/brain.zig");
@@ -28,6 +30,7 @@ test {
     _ = @import("core/brain_memory_lifecycle_tests.zig");
     _ = @import("core/brain_memory_recall_tests.zig");
     _ = @import("core/brain_memory_selection_tests.zig");
+    _ = @import("core/brain_crash_prevention_tests.zig");
     _ = @import("core/brain_needs_wants_tests.zig");
     _ = @import("core/brain_psyche_tests.zig");
     _ = @import("core/brain_recognition_tests.zig");
@@ -65,13 +68,18 @@ test {
     _ = @import("core/needs.zig");
     _ = @import("core/psyche.zig");
     _ = @import("core/skill_tree.zig");
-    _ = @import("core/stimulus.zig");
+    _ = @import("core/stimulus_inbox.zig");
+    _ = @import("core/stimulus_ingest.zig");
+    _ = @import("core/attention_scheduler.zig");
+    _ = @import("core/work_registry.zig");
     _ = @import("core/time.zig");
     _ = @import("core/vector_index.zig");
+    _ = @import("core/hash_vector_prop_tests.zig");
     _ = @import("api/autonomy_client.zig");
     _ = @import("api/audio_client.zig");
     _ = @import("api/chat_client.zig");
     _ = @import("api/chat_client_tests.zig");
+    _ = @import("api/chat_client_fuzz_tests.zig");
     _ = @import("core/memory_selection.zig");
     _ = @import("api/email_client.zig");
     _ = @import("api/psyche_client.zig");
@@ -80,6 +88,8 @@ test {
     _ = @import("api/random_provider_client.zig");
     _ = @import("harness/direct_provider_client.zig");
     _ = @import("harness/direct_provider_client_tests.zig");
+    _ = @import("harness/dispatch_deadlock_model.zig");
+    _ = @import("harness/dispatch_deadlock_stress.zig");
     _ = @import("harness/llm_tester/build_all.zig");
     _ = @import("api/service_errors.zig");
     _ = @import("api/skills.zig");
@@ -87,9 +97,14 @@ test {
     _ = @import("harness/direct_image_client.zig");
     _ = @import("api/want_achievement_client.zig");
     _ = @import("api/persona_directive_client.zig");
+    _ = @import("api/dream_image_client.zig");
     _ = @import("api/recognition_client.zig");
     _ = @import("main_mcp_tools.zig");
+    _ = @import("main_affective_mcp_stdio.zig");
     _ = @import("mcp_host/mod.zig");
+    _ = @import("mcp_host/mcp_server_fuzz_tests.zig");
+    _ = @import("session/protocol.zig");
+    _ = @import("session/completion_channel.zig");
     _ = @import("platform/common/df_storage.zig");
     _ = @import("platform/common/macos_power.zig");
     _ = @import("platform/common/host_system_senses.zig");
@@ -100,6 +115,7 @@ test {
     _ = @import("platform/common/voice_input.zig");
     _ = @import("storage/json_store.zig");
     _ = @import("storage/json_store_tests.zig");
+    _ = @import("storage/json_store_fuzz_tests.zig");
     _ = @import("storage/cognitive_pruning.zig");
     _ = @import("storage/graph_store.zig");
 }

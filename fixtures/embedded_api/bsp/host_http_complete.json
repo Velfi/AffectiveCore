@@ -1,0 +1,6 @@
+{
+  "type": "host.http.complete",
+  "request_id": "host-http-1",
+  "status": "complete",
+  "data_b64": "eyJvayI6dHJ1ZX0="
+}

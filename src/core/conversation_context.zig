@@ -17,6 +17,7 @@ const brain_dream_memory = @import("brain_dream_memory.zig");
 const brain_introspection_autonomy = @import("brain_introspection_autonomy.zig");
 const brain_action_execution = @import("brain_action_execution.zig");
 const brain_observation_append = @import("brain_observation_append.zig");
+const stimulus_ingest_mod = @import("stimulus_ingest.zig");
 
 const Brain = brain_mod.Brain;
 const ContextBlock = context_composition.ContextBlock;
@@ -52,6 +53,7 @@ pub const ComposeOptions = struct {
     include_conversation_cotext: bool = false,
     include_present_moment: bool = false,
     include_stimulus_continuity: bool = false,
+    include_stimulus_inbox: bool = false,
     include_waiting_for: bool = false,
     include_memory_selection_obs: bool = false,
     include_associative_recall: bool = false,
@@ -112,6 +114,7 @@ pub fn composeObservations(self: *Brain, opts: ComposeOptions) ![]ContextBlock {
     errdefer freeObservationBlocks(self.allocator, blocks.items);
     var order: usize = 0;
     const allocator = self.allocator;
+    self.trace("conversation.compose_observations.start");
 
     if (opts.preamble) |preamble| {
         const kind = observationKindFromPreamble(preamble);
@@ -132,6 +135,7 @@ pub fn composeObservations(self: *Brain, opts: ComposeOptions) ![]ContextBlock {
         defer buf.deinit(allocator);
         try brain_dream_memory.appendHeardSpeechObservation(self, &buf, heard);
         try appendOwnedBlock(allocator, &blocks, .{ .observation = .heard_speech }, buf.items, opts.stimulus, contact_open, &order, null);
+        self.trace("conversation.compose_observations.heard_speech.done");
     }
 
     if (opts.include_pending_interrupt_coalesce) {
@@ -172,12 +176,14 @@ pub fn composeObservations(self: *Brain, opts: ComposeOptions) ![]ContextBlock {
 
     if (opts.include_affordances) {
         try captureObservation(allocator, &blocks, .skill_library, opts.stimulus, contact_open, &order, brain_introspection_autonomy.appendAffordanceObservation, self);
+        self.trace("conversation.compose_observations.affordances.done");
     }
     if (opts.include_social_context) {
         try captureObservation(allocator, &blocks, .social_context, opts.stimulus, contact_open, &order, brain_observation_append.appendSocialContextObservation, self);
     }
     if (opts.include_read_models) {
         try captureObservation(allocator, &blocks, .read_models_snapshot, opts.stimulus, contact_open, &order, brain_observation_append.appendReadModelsObservation, self);
+        self.trace("conversation.compose_observations.read_models.done");
     }
     if (opts.include_active_activity) {
         try captureObservation(allocator, &blocks, .active_activity, opts.stimulus, contact_open, &order, brain_process.appendActivityObservation, self);
@@ -198,6 +204,9 @@ pub fn composeObservations(self: *Brain, opts: ComposeOptions) ![]ContextBlock {
         try appendOwnedBlock(allocator, &blocks, .{ .observation = .overlap_nudge }, line, opts.stimulus, contact_open, &order, null);
     }
 
+    if (opts.include_stimulus_inbox) {
+        try captureObservation(allocator, &blocks, .other, opts.stimulus, contact_open, &order, stimulus_ingest_mod.appendStimulusInboxObservation, self);
+    }
     if (opts.include_stimulus_continuity) {
         const heard = opts.heard_speech orelse return error.MissingHeardSpeechForStimulusContinuity;
         var buf = std.ArrayList(u8).empty;
@@ -221,23 +230,33 @@ pub fn composeObservations(self: *Brain, opts: ComposeOptions) ![]ContextBlock {
         defer buf.deinit(allocator);
         try experiential_observations.appendAssociativeRecallObservation(self, &buf, user_text);
         try appendOwnedBlock(allocator, &blocks, .{ .observation = .associative_recall }, buf.items, opts.stimulus, contact_open, &order, null);
+        self.trace("conversation.compose_observations.associative_recall.done");
     }
     if (opts.include_host_capability) {
         try captureObservation(allocator, &blocks, .host_capability_summary, opts.stimulus, contact_open, &order, brain_observation_append.appendHostCapabilityObservationIfChanged, self);
+        self.trace("conversation.compose_observations.host_capability.done");
     }
     if (opts.include_host_capability_activation) {
         try captureObservation(allocator, &blocks, .host_capability_activations, opts.stimulus, contact_open, &order, host_capability_activation.appendActivationObservationIfChanged, self);
+        self.trace("conversation.compose_observations.host_capability_activation.done");
     }
     if (opts.include_subsystems) {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(allocator);
+        var turn_source_event_ids: [1][]const u8 = undefined;
+        const source_event_ids: []const []const u8 = if (self.current_turn_event_id) |id| blk: {
+            turn_source_event_ids = .{id};
+            break :blk turn_source_event_ids[0..];
+        } else opts.subsystem_event_ids;
+        self.trace("conversation.compose_observations.subsystems.start");
         try subsystems.appendSubsystemObservations(self, allocator, &buf, .{
-            .source_event_ids = opts.subsystem_event_ids,
+            .source_event_ids = source_event_ids,
             .focus = if (self.current_focus) |focus| focus.text else null,
         });
         if (buf.items.len > 0) {
             try appendOwnedBlock(allocator, &blocks, .{ .observation = .subsystem_pressure_selected }, buf.items, opts.stimulus, contact_open, &order, null);
         }
+        self.trace("conversation.compose_observations.subsystems.done");
     }
     if (opts.pending_hard_error) {
         try captureObservation(allocator, &blocks, .pending_hard_error, opts.stimulus, contact_open, &order, brain_action_execution.appendPendingHardErrorObservation, self);
@@ -246,6 +265,7 @@ pub fn composeObservations(self: *Brain, opts: ComposeOptions) ![]ContextBlock {
         try appendOwnedBlock(allocator, &blocks, .{ .observation = .stimulus_response_nudge }, chat.heard_speech_stimulus_response_nudge_initial, opts.stimulus, contact_open, &order, null);
     }
 
+    self.traceCount("conversation.compose_observations.done", blocks.items.len);
     return try blocks.toOwnedSlice(allocator);
 }
 
@@ -281,7 +301,6 @@ pub fn heardSpeechComposeOptions(
     heard_speech: input_mod.HeardSpeech,
     speaker_memory_line: ?[]const u8,
     memory_selection: memory_selection_mod.ResolvedMemorySelection,
-    turn_event_id: []const u8,
     overlap_nudge: bool,
     pending_hard_error: bool,
 ) ComposeOptions {
@@ -291,7 +310,6 @@ pub fn heardSpeechComposeOptions(
         .heard_speech = heard_speech,
         .speaker_memory_line = speaker_memory_line,
         .memory_selection = memory_selection,
-        .subsystem_event_ids = &[_][]const u8{turn_event_id},
         .overlap_nudge = overlap_nudge,
         .pending_hard_error = pending_hard_error,
         .stimulus_response_nudge_initial = true,
@@ -304,6 +322,7 @@ pub fn heardSpeechComposeOptions(
         .include_active_activity = true,
         .include_conversation_cotext = true,
         .include_present_moment = true,
+        .include_stimulus_inbox = true,
         .include_stimulus_continuity = true,
         .include_waiting_for = true,
         .include_memory_selection_obs = true,
@@ -324,6 +343,7 @@ pub fn hostDeliveryComposeOptions(user_text: ?[]const u8, delivery: HostDelivery
         .include_active_activity = true,
         .include_conversation_cotext = true,
         .include_present_moment = true,
+        .include_stimulus_inbox = true,
         .include_waiting_for = true,
         .include_host_capability = true,
         .include_host_capability_activation = true,
@@ -341,6 +361,7 @@ pub fn reconsiderComposeOptions(user_text: ?[]const u8, preamble: ?[]const u8, i
         .include_active_activity = true,
         .include_conversation_cotext = include_cotext,
         .include_present_moment = true,
+        .include_stimulus_inbox = true,
         .include_waiting_for = true,
         .include_host_capability = true,
         .include_host_capability_activation = true,

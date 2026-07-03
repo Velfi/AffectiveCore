@@ -9,6 +9,9 @@ const brain_context_stats = @import("brain_context_stats.zig");
 const context_tokens = @import("context_tokens.zig");
 const config_mod = @import("config.zig");
 const present_moment = @import("present_moment.zig");
+const needs_mod = @import("needs.zig");
+const dream_time_mod = @import("dream_time.zig");
+const system_senses_mod = ports.system_senses;
 
 const Brain = brain_mod.Brain;
 
@@ -22,6 +25,7 @@ pub const PresentMomentModel = struct {
     user_request_overlap: ?[]const u8 = null,
     overlap_confidence: ?f32 = null,
     deferred_speech_pending: bool = false,
+    stimulus_inbox_pending: usize = 0,
 };
 
 pub const CurrentStimulusModel = struct {
@@ -57,21 +61,61 @@ pub const VisualStateModel = struct {
     awaited_host_purpose: ?[]const u8 = null,
 };
 
+pub const NeedSummary = struct {
+    need_id: []const u8,
+    text: []const u8,
+    urgency: []const u8,
+    desired_action: []const u8,
+    urgency_score: f32,
+};
+
 pub const NeedModel = struct {
     self_defined_need_count: usize = 0,
     self_defined_want_count: usize = 0,
     long_term_memory_count: usize = 0,
     short_term_memory_count: usize = 0,
+    urgent_need_count: usize = 0,
+    top_needs: []NeedSummary = &.{},
 };
 
+pub const AppraisalSummary = struct {
+    valence: f32 = 0,
+    arousal: f32 = 0,
+    salience: f32 = 0,
+    confidence: f32 = 0,
+    summary: ?[]const u8 = null,
+    feeling_label: ?[]const u8 = null,
+    action_tendency: ?[]const u8 = null,
+};
+
+pub const IntentionSummary = struct {
+    goal: []const u8,
+    priority: ?f32 = null,
+    expected_action: ?[]const u8 = null,
+    stopping_condition: ?[]const u8 = null,
+};
+
+pub const InnerStateModel = struct {
+    latest_appraisal: ?AppraisalSummary = null,
+    active_intention: ?IntentionSummary = null,
+};
+
+pub const DreamModel = dream_time_mod.DreamModel;
+
 pub const AutonomyControlModel = struct {
-    mode: []const u8 = "off",
+    mode: []const u8 = "full",
+    background_agency_enabled: bool = true,
     control_capacity: f32 = 0.0,
     max_capacity: f32 = 0.0,
     social_engagement: f32 = 0.0,
+    social_appetite: f32 = 0.0,
+    attention_status: []const u8 = "quietly_observing",
     effective_threshold_bias: f32 = 0.0,
     replenish_points_per_minute: f32 = 0.0,
     last_capacity_replenish_at: ?i64 = null,
+    actions_available: bool = false,
+    blocked_reason: []const u8 = "none",
+    remaining_actions: u32 = 0,
 };
 
 pub const BeliefModel = struct {
@@ -255,6 +299,8 @@ pub const Snapshot = struct {
     focus_model: FocusModel,
     visual_state_model: VisualStateModel,
     need_model: NeedModel,
+    inner_state_model: InnerStateModel,
+    dream_model: DreamModel,
     autonomy_control_model: AutonomyControlModel,
     belief_model: BeliefModel,
     self_trust_model: SelfTrustModel,
@@ -295,6 +341,9 @@ pub fn readModelsSnapshot(self: *Brain, allocator: std.mem.Allocator) !Snapshot 
     const llm_usage = try llmUsageModel(self, allocator);
     const activity = activityModel(self);
     const capacity_model = capacityModel(self, memories.len, activity);
+    const evaluated_needs = try evaluatedNeedModel(allocator, memories);
+    const inner_state = try innerStateModel(self, allocator);
+    const dream_model = try dreamStateModel(self);
     return .{
         .brain_mode = try self.deps.store.loadBrainMode(),
         .llm_policy_model = llm_policy,
@@ -303,7 +352,9 @@ pub fn readModelsSnapshot(self: *Brain, allocator: std.mem.Allocator) !Snapshot 
         .conversation_context_model = conversationContextModel(self, summaries),
         .focus_model = focusModel(self),
         .visual_state_model = visualStateModel(self),
-        .need_model = needModel(memories),
+        .need_model = evaluated_needs,
+        .inner_state_model = inner_state,
+        .dream_model = dream_model,
         .autonomy_control_model = autonomyControlModel(self),
         .belief_model = beliefModel(beliefs),
         .self_trust_model = selfTrustModel(self_trust),
@@ -457,6 +508,7 @@ fn presentMomentModel(self: *Brain) PresentMomentModel {
         .user_request_overlap = if (overlap) |o| o.in_flight_kind else null,
         .overlap_confidence = if (overlap) |o| o.confidence else null,
         .deferred_speech_pending = self.pending_deferred_heard_speech != null,
+        .stimulus_inbox_pending = self.stimulus_inbox.pendingCount(),
     };
 }
 
@@ -584,6 +636,92 @@ fn capacityModel(self: *Brain, memory_total: usize, activity: ActivityModel) Cap
     };
 }
 
+fn needUrgencyScore(urgency: needs_mod.NeedUrgency) f32 {
+    return switch (urgency) {
+        .urgent => 1.0,
+        .need => 0.75,
+        .watch => 0.5,
+        .satisfied => 0.25,
+    };
+}
+
+fn evaluatedNeedModel(allocator: std.mem.Allocator, memories: []const schema.MemoryRecord) !NeedModel {
+    var counts = NeedModel{};
+    for (memories) |memory| {
+        switch (memory.scope) {
+            .long_term => counts.long_term_memory_count += 1,
+            .short_term => counts.short_term_memory_count += 1,
+        }
+        if (hasTag(memory.tags, "need")) counts.self_defined_need_count += 1;
+        if (hasTag(memory.tags, "want")) counts.self_defined_want_count += 1;
+    }
+
+    const active_needs = try needs_mod.evaluate(allocator, .{
+        .memory_records = memories,
+    });
+    defer needs_mod.freeNeeds(allocator, active_needs);
+
+    const RankedNeed = struct { need: needs_mod.Need, score: f32 };
+    var ranked = std.ArrayList(RankedNeed).empty;
+    for (active_needs) |need| {
+        const score = needUrgencyScore(need.urgency);
+        if (need.urgency == .urgent or need.urgency == .need) counts.urgent_need_count += 1;
+        try ranked.append(allocator, .{ .need = need, .score = score });
+    }
+    std.mem.sortUnstable(RankedNeed, ranked.items, {}, struct {
+        fn lessThan(_: void, a: RankedNeed, b: RankedNeed) bool {
+            return a.score > b.score;
+        }
+    }.lessThan);
+
+    const top_count = @min(ranked.items.len, 5);
+    var top_needs = try allocator.alloc(NeedSummary, top_count);
+    for (ranked.items[0..top_count], 0..) |entry, index| {
+        top_needs[index] = .{
+            .need_id = try allocator.dupe(u8, entry.need.need_id),
+            .text = try allocator.dupe(u8, entry.need.text),
+            .urgency = try allocator.dupe(u8, @tagName(entry.need.urgency)),
+            .desired_action = try allocator.dupe(u8, entry.need.desired_action),
+            .urgency_score = entry.score,
+        };
+    }
+    counts.top_needs = top_needs;
+    return counts;
+}
+
+fn innerStateModel(self: *Brain, allocator: std.mem.Allocator) !InnerStateModel {
+    var model: InnerStateModel = .{};
+    const appraisals = try self.deps.store.loadAppraisals(allocator);
+    if (appraisals.len > 0) {
+        const latest = appraisals[appraisals.len - 1];
+        model.latest_appraisal = .{
+            .valence = latest.valence,
+            .arousal = latest.arousal,
+            .salience = latest.stress,
+            .confidence = latest.confidence,
+            .summary = if (latest.freeform.len > 0) try allocator.dupe(u8, latest.freeform) else null,
+            .feeling_label = if (latest.feeling_label.len > 0) try allocator.dupe(u8, latest.feeling_label) else null,
+            .action_tendency = if (latest.action_tendency.len > 0) try allocator.dupe(u8, latest.action_tendency) else null,
+        };
+    }
+    if (self.active_process) |process| {
+        if (process.goal.len > 0) {
+            model.active_intention = .{
+                .goal = try allocator.dupe(u8, process.goal),
+                .priority = null,
+                .expected_action = if (process.user_anchor.len > 0) try allocator.dupe(u8, process.user_anchor) else null,
+                .stopping_condition = if (process.composition_reason) |reason| try allocator.dupe(u8, reason) else null,
+            };
+        }
+    }
+    return model;
+}
+
+fn dreamStateModel(self: *Brain) !DreamModel {
+    const io = self.deps.io orelse return .{};
+    return try dream_time_mod.dreamModel(self, io);
+}
+
 fn needModel(memories: []const schema.MemoryRecord) NeedModel {
     var model = NeedModel{};
     for (memories) |memory| {
@@ -598,46 +736,69 @@ fn needModel(memories: []const schema.MemoryRecord) NeedModel {
 }
 
 fn autonomyControlModel(self: *Brain) AutonomyControlModel {
-    const threshold_bias = if (std.mem.eql(u8, self.cfg.autonomy_mode, "limited"))
-        self.cfg.autonomy_limited_threshold_bias
-    else
-        self.cfg.autonomy_full_threshold_bias;
-    const default_max = if (std.mem.eql(u8, self.cfg.autonomy_mode, "limited"))
-        self.cfg.autonomy_limited_max_capacity
-    else
-        self.cfg.autonomy_full_max_capacity;
+    const threshold_bias = self.cfg.autonomy_full_threshold_bias;
+    const default_max = self.cfg.autonomy_full_max_capacity;
+    const default_remaining = @import("maintenance.zig").autonomyRemainingActionCount(default_max);
     const io = self.deps.io orelse return .{
         .mode = self.cfg.autonomy_mode,
+        .background_agency_enabled = true,
         .max_capacity = default_max,
         .control_capacity = default_max,
+        .social_appetite = 0.0,
+        .attention_status = "quietly_observing",
         .effective_threshold_bias = threshold_bias,
+        .actions_available = true,
+        .blocked_reason = "none",
+        .remaining_actions = default_remaining,
     };
     const fs = self.deps.filesystem orelse return .{
         .mode = self.cfg.autonomy_mode,
+        .background_agency_enabled = true,
         .max_capacity = default_max,
         .control_capacity = default_max,
+        .social_appetite = 0.0,
+        .attention_status = "quietly_observing",
         .effective_threshold_bias = threshold_bias,
+        .actions_available = true,
+        .blocked_reason = "none",
+        .remaining_actions = default_remaining,
     };
-    const state = @import("maintenance.zig").loadAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, self.defaultAutonomySleeping(), self.cfg.autonomy_mode, .{
+    const maintenance_mod = @import("maintenance.zig");
+    var state = maintenance_mod.loadAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, self.defaultAutonomySleeping(), self.cfg.autonomy_mode, .{
         .limited_max_capacity = self.cfg.autonomy_limited_max_capacity,
         .full_max_capacity = self.cfg.autonomy_full_max_capacity,
     }) catch return .{
         .mode = self.cfg.autonomy_mode,
+        .background_agency_enabled = true,
         .max_capacity = default_max,
         .control_capacity = default_max,
+        .social_appetite = 0.0,
+        .attention_status = "waiting",
         .effective_threshold_bias = threshold_bias,
+        .actions_available = false,
+        .blocked_reason = "autonomy_overdrawn",
+        .remaining_actions = 0,
     };
     const brain_autonomy = @import("brain_autonomy.zig");
     const replenish_rate = brain_autonomy.autonomyReplenishRatePerSecond(self.cfg);
-    const effective_capacity = @import("maintenance.zig").projectControlCapacity(state, replenish_rate, self.now_seconds);
+    maintenance_mod.replenishCapacity(&state, replenish_rate, self.now_seconds);
+    const effective_capacity = maintenance_mod.projectControlCapacity(state, replenish_rate, self.now_seconds);
+    const blocked = brain_autonomy.autonomyBlockedReason(self, io, state) catch "autonomy_overdrawn";
+    const remaining_actions = maintenance_mod.autonomyRemainingActionCount(effective_capacity);
     return .{
         .mode = self.cfg.autonomy_mode,
+        .background_agency_enabled = true,
         .control_capacity = effective_capacity,
         .max_capacity = state.max_capacity,
         .social_engagement = state.social_engagement,
+        .social_appetite = state.social_engagement,
+        .attention_status = if (state.sleeping) "resting" else if (self.stimulus_inbox.pendingCount() > 0) "curious" else if (std.mem.eql(u8, blocked, "none")) "quietly_observing" else "waiting",
         .effective_threshold_bias = threshold_bias,
         .replenish_points_per_minute = brain_autonomy.autonomyReplenishPointsPerMinute(self.cfg),
         .last_capacity_replenish_at = self.now_seconds,
+        .actions_available = std.mem.eql(u8, blocked, "none"),
+        .blocked_reason = blocked,
+        .remaining_actions = remaining_actions,
     };
 }
 

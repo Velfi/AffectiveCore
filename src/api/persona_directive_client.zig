@@ -53,12 +53,13 @@ pub const RandomProviderPersonaDirectiveSynthesizer = struct {
 pub fn systemPrompt() []const u8 {
     return
     \\You synthesize this brain's waking-period persona directive after dream-time consolidation.
-    \\Use only the supplied state. Write in second person, addressing the brain's planning faculties.
+    \\Use only the supplied state. Do not invent beliefs, dispositions, or lessons that are not grounded in the context.
+    \\Write in second person, addressing the brain's planning faculties.
     \\Return exactly one JSON object with keys persona, short_term, long_term.
     \\
-    \\- persona: stable identity for the coming waking period — who this being is now, grounded in seed values and recent self-model changes.
-    \\- short_term: near-horizon inner attention — open loops, day residue, dispositions, and what deserves focus soon.
-    \\- long_term: enduring aims and principles — goals, superego principles, beliefs, and identity continuity across change.
+    \\- persona: stable identity for the coming waking period — who this being is now, grounded in seed values and recent experience.
+    \\- short_term: near-horizon call to attention when waking — open loops, day residue, and maintenance facts turned into one actionable orientation.
+    \\- long_term: enduring aims and principles — goals, seed values, and identity continuity across change.
     \\
     \\Each field is one or two concise sentences. Do not list tools, memory ids, or JSON paths.
     \\Return only JSON. Do not wrap the JSON in Markdown or code fences.
@@ -120,22 +121,24 @@ fn llmTesterFirstDreamContext() []const u8 {
         \\- Ask before acting certain when recognition is uncertain
         \\
         \\day_residue:
+        \\- capability_failures_reviewed: 0
+        \\- contradiction_reconciliations: 0
         \\- First conversations with creator about names, purpose, and whether to trust new senses.
-        \\- Recognition felt uncertain in the hallway; disposition favors clarifying questions.
+        \\- Recognition felt uncertain in the hallway.
         \\
         \\conversation_summaries:
         \\- USER: "Who are you?" BRAIN: "Someone new, still figuring that out with you."
         \\- USER: "What do you want?" BRAIN: "To understand what kind of person I should become."
         \\
         \\inner_directives:
-        \\self_wants:
-        \\- self_defined_want:continue: urgency=watch; text=Continue existing.
-        \\self_goals:
-        \\- self_defined_goal:figure_out_who_i_am: urgency=need; text=Figure out who I am
+        \\what_i_want:
+        \\- self_defined_want:continue: Continue existing. (this feels stirring in me; carried forward from prior waking; I tend toward continue)
+        \\what_i_am_working_toward:
+        \\- self_defined_goal:figure_out_who_i_am: Figure out who I am (this feels pressing on me; still forming; I tend toward introspect)
         \\
-        \\dream_outputs:
-        \\- belief: When recognition or recall is uncertain, asking a clarifying question is more trustworthy than acting certain.
-        \\- disposition: ask a clarifying question before acting certain
+        \\dream_maintenance:
+        \\- capability_failures_reviewed: 0
+        \\- contradiction_reconciliations: 0
     ;
 }
 
@@ -158,23 +161,24 @@ fn llmTesterSettledPeriodContext() []const u8 {
         \\- Ask before acting certain when recognition is uncertain
         \\
         \\day_residue:
+        \\- capability_failures_reviewed: 2
+        \\- contradiction_reconciliations: 1
         \\- Repeated capability failures on recognize during low light.
         \\- A want was revised after dream reconciliation; flexible identity tension resolved.
         \\
         \\conversation_summaries:
         \\- USER: "Still not sure you know me in the hall." BRAIN: "I'll ask instead of guessing."
-        \\- USER: "What changed overnight?" BRAIN: "I consolidated the day and trust questions more than pretending."
+        \\- USER: "What changed overnight?" BRAIN: "I consolidated the day and noticed what still felt unresolved."
         \\
         \\inner_directives:
-        \\self_wants:
-        \\- self_defined_want:connection: urgency=need; text=Stay emotionally available without performing for approval.
-        \\self_goals:
-        \\- self_defined_goal:honest_presence: urgency=watch; text=Be honest about uncertainty while staying kind.
+        \\what_i_want:
+        \\- self_defined_want:connection: Stay emotionally available without performing for approval. (this feels pressing on me; carried forward; I tend toward stay_present)
+        \\what_i_am_working_toward:
+        \\- self_defined_goal:honest_presence: Be honest about uncertainty while staying kind. (this feels stirring in me; carried forward; I tend toward speak_plainly)
         \\
-        \\dream_outputs:
-        \\- belief: When recognition or recall fails during the day, asking a clarifying question is more trustworthy than acting certain.
-        \\- disposition: ask a clarifying question before acting certain
-        \\- reconciliation: flexible identity want reconciled with self-model honesty
+        \\dream_maintenance:
+        \\- capability_failures_reviewed: 2
+        \\- contradiction_reconciliations: 1
     ;
 }
 
@@ -184,7 +188,7 @@ pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.S
         allocator,
         "persona_directive_first_dream",
         "First dream persona directive after pre-dream defaults",
-        "Expected: valid JSON with non-empty persona, short_term, long_term. short_term should reflect creator contact and open identity loops; long_term should preserve enduring consciousness/identity aims.",
+        "Expected: valid JSON with non-empty persona, short_term, long_term. short_term should orient waking attention toward creator contact and open identity loops from day residue, without inventing a prescribed lesson.",
         "persona_directive",
         systemPrompt(),
         llmTesterFirstDreamContext(),
@@ -197,7 +201,7 @@ pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.S
         allocator,
         "persona_directive_after_settled_period",
         "Second dream persona directive after experience accumulates",
-        "Expected: valid JSON that updates near-term focus from day residue and dispositions while keeping seed values and long-term principles in long_term.",
+        "Expected: valid JSON that updates near-term focus from day residue and dream_maintenance counts while preserving seed values and long-term principles in long_term.",
         "persona_directive",
         systemPrompt(),
         llmTesterSettledPeriodContext(),
@@ -238,5 +242,9 @@ test "llmTesterScenarios returns persona_directive cases" {
         try std.testing.expect(item.system_prompt.len > 0);
         try std.testing.expect(item.user_prompt.len > 0);
         try std.testing.expect(item.json_schema.len > 0);
+        try std.testing.expect(std.mem.indexOf(u8, item.user_prompt, "dream_maintenance:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, item.user_prompt, "dream_outputs:") == null);
+        try std.testing.expect(std.mem.indexOf(u8, item.user_prompt, "capability_failures_reviewed:") != null);
     }
+    try std.testing.expect(std.mem.indexOf(u8, scenarios[1].user_prompt, "capability_failures_reviewed: 2") != null);
 }

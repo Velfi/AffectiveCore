@@ -10,6 +10,19 @@ pub fn logDone(url: []const u8, response_bytes: usize) void {
 }
 
 pub fn logError(url: []const u8, err: anyerror) void {
+    logErrorWithHostDetail(url, err, null);
+}
+
+pub fn logErrorWithHostDetail(url: []const u8, err: anyerror, host_detail: ?[]const u8) void {
+    if (host_detail) |text| {
+        if (text.len > 0) {
+            std.debug.print(
+                "HTTP error method=POST url={s} error={s} detail=\"{s}\" host_detail=\"{s}\"\n",
+                .{ url, error_descriptions.name(err), error_descriptions.detail(err), text },
+            );
+            return;
+        }
+    }
     std.debug.print(
         "HTTP error method=POST url={s} error={s} detail=\"{s}\"\n",
         .{ url, error_descriptions.name(err), error_descriptions.detail(err) },

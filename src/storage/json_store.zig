@@ -199,7 +199,9 @@ pub const JsonMemoryStore = struct {
         const data = try self.mutateCached();
         for (data.capability_statuses, 0..) |existing, i| {
             if (std.mem.eql(u8, existing.capability_id, status.capability_id) and std.mem.eql(u8, existing.host_id, status.host_id)) {
+                const replaced = data.capability_statuses[i];
                 data.capability_statuses[i] = try cognitive.cloneCapabilityStatus(self.allocator, status);
+                cognitive.freeCapabilityStatus(self.allocator, replaced);
                 try self.persistCached();
                 return;
             }
@@ -208,6 +210,9 @@ pub const JsonMemoryStore = struct {
         try self.persistCached();
     }
 
+    /// Returns a borrow into the store's in-memory cache. Any mutating store call
+    /// may reallocate backing storage and invalidate this slice and any string
+    /// pointers taken from it. Callers must clone before the next mutation.
     fn loadCapabilityStatuses(ctx: *anyopaque, allocator: std.mem.Allocator) ![]schema.CapabilityStatus {
         const self: *JsonMemoryStore = @ptrCast(@alignCast(ctx));
         try self.ensureCached();
@@ -510,6 +515,10 @@ pub const JsonMemoryStore = struct {
         try self.persistCached();
     }
 
+    /// Returns a borrow into the store's in-memory cache. Any mutating store call
+    /// (`saveMemoryRecord`, `addExperienceEvent`, etc.) may reallocate backing
+    /// storage and invalidate this slice and any `MemoryRecord` field pointers
+    /// taken from it. Callers must clone strings or reload before the next mutation.
     fn loadMemoryRecords(ctx: *anyopaque, allocator: std.mem.Allocator) ![]schema.MemoryRecord {
         const self: *JsonMemoryStore = @ptrCast(@alignCast(ctx));
         try self.ensureCached();

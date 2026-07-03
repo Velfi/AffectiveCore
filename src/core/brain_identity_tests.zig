@@ -110,6 +110,7 @@ test "dream arc delivers residue-derived mailbox and dream provenance belief" {
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    support.wireTestIo(&brain);
     const failure_event = try brain.recordSimpleExperienceEvent("Capability.Outcome", .capability, "recognize failed in poor lighting");
 
     try store.store().addCapabilityResult(.{
@@ -132,16 +133,11 @@ test "dream arc delivers residue-derived mailbox and dream provenance belief" {
 
     const item = try brain.requestDreamTime(null);
     try std.testing.expectEqual(@as(usize, 1), store.mailbox_items.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, item.text, "capability failures") != null);
+    try std.testing.expect(std.mem.indexOf(u8, item.text, "capability failures reviewed: 1") != null);
     try std.testing.expect(stringSliceContains(store.dream_time_records.items[0].source_event_ids, failure_event.id));
     try std.testing.expect(std.mem.indexOf(u8, store.dream_time_records.items[0].maintenance_counts_json, "\"capability_failures_reviewed\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, store.dream_time_records.items[0].maintenance_counts_json, "\"source_events_linked\":1") != null);
-    const beliefs = try store.store().loadBeliefs(allocator);
-    var found_dream_belief = false;
-    for (beliefs) |belief| {
-        if (std.mem.eql(u8, belief.provenance, "dream_time")) found_dream_belief = true;
-    }
-    try std.testing.expect(found_dream_belief);
+    try std.testing.expectEqual(@as(usize, 0), store.beliefs.items.len);
     try std.testing.expectEqual(schema.BrainMode.waking, try brain.deps.store.loadBrainMode());
 }
 

@@ -23,6 +23,7 @@ Each chapter opens with a **big picture**, then zooms in with diagrams and short
 | [Sleep and Dreams](06-sleep-and-dreams.md) | Dream Time, consolidation, and the mailbox |
 | [Memory and Forgetting](07-memory-and-forgetting.md) | What sticks, what fades, and who it remembers |
 | [Looking Inward](08-looking-inward.md) | How to ask your brain about itself |
+| [Affective MCP](09-affective-mcp.md) | How LLM clients connect to a TCP-backed brain through MCP |
 | [Glossary](glossary.md) | Key terms in plain language |
 
 ---
@@ -79,13 +80,13 @@ stateDiagram-v2
 
 | Mode | What it feels like (for you) |
 |------|------------------------------|
-| **Waking** | Alert and available — may chat with you, run autonomy ticks, or use senses |
+| **Waking** | Alert and available — may chat with you, notice events, run attention ticks, or use senses |
 | **Drowsy** | Brief transition into internal rest |
 | **Dreaming** | Consolidating memory — not available for normal chat |
 | **Waking up** | Short bridge after a dream before full alertness returns |
 | **Unavailable** | Body or brain not reachable |
 
-While **waking**, you might be in active conversation (present moment live), or the brain may act on its own when autonomy is on and budget allows.
+While **waking**, you might be in active conversation (present moment live), or the brain may quietly observe, think, act, or speak when attention, budget, and boundaries make that appropriate.
 
 ---
 

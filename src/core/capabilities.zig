@@ -6,6 +6,7 @@ const experience_kinds = @import("experience_kinds.zig");
 const host_capability_activation = @import("host_capability_activation.zig");
 const learning = @import("learning.zig");
 const ports = @import("ports.zig");
+const json_store_cognitive = @import("../storage/json_store_cognitive.zig");
 const schema = ports.schema;
 
 const Brain = brain_mod.Brain;
@@ -16,19 +17,24 @@ const capability_quality_delta_threshold: f32 = 0.15;
 
 pub fn recordCapabilityStatus(self: *Brain, status: schema.CapabilityStatus) !void {
     try self.ensureHostBinding(status.host_id);
-    const prior = findCapabilityStatus(self, status.capability_id, status.host_id);
+    var prior_owned: ?schema.CapabilityStatus = null;
+    if (findCapabilityStatus(self, status.capability_id, status.host_id)) |prior| {
+        prior_owned = try json_store_cognitive.cloneCapabilityStatusValidated(self.allocator, prior);
+    }
+    defer if (prior_owned) |owned| json_store_cognitive.freeCapabilityStatus(self.allocator, owned);
     try self.deps.store.upsertCapabilityStatus(status);
     const status_event = try self.recordSimpleExperienceEvent(experience_kinds.capability_status_updated, .host, status.capability_id);
-    const source_event_ids = [_][]const u8{status_event.id};
-    if (prior) |previous| {
+    var source_event_ids_buf: [1][]const u8 = .{status_event.id};
+    const source_event_ids = source_event_ids_buf[0..];
+    if (prior_owned) |previous| {
         const quality_delta = @abs(status.quality - previous.quality);
         const reliability_delta = @abs(status.reliability - previous.reliability);
         if (quality_delta >= capability_quality_delta_threshold or reliability_delta >= capability_quality_delta_threshold) {
             _ = try self.recordSimpleExperienceEvent(experience_kinds.capability_quality_changed, .host, status.capability_id);
-            try belief_updates.onHostCapabilityChange(self, status, previous, &source_event_ids);
+            try belief_updates.onHostCapabilityChange(self, status, previous, source_event_ids);
         }
     } else {
-        try belief_updates.onHostCapabilityChange(self, status, null, &source_event_ids);
+        try belief_updates.onHostCapabilityChange(self, status, null, source_event_ids);
     }
 }
 
@@ -72,6 +78,16 @@ fn manifestTimingStartMs(self: *Brain) i64 {
 }
 
 pub fn recordManifestStatuses(self: *Brain, host_id: []const u8, capability_ids: []const []const u8) ![]ManifestStatusTiming {
+    var persist = try self.deps.store.deferredPersistGuard();
+    const result = recordManifestStatusesInner(self, host_id, capability_ids) catch |err| {
+        persist.cancel() catch return error.DeferredPersistEndFailed;
+        return err;
+    };
+    try persist.commit();
+    return result;
+}
+
+fn recordManifestStatusesInner(self: *Brain, host_id: []const u8, capability_ids: []const []const u8) ![]ManifestStatusTiming {
     var timings = std.ArrayList(ManifestStatusTiming).empty;
     errdefer {
         for (timings.items) |entry| {
@@ -81,8 +97,6 @@ pub fn recordManifestStatuses(self: *Brain, host_id: []const u8, capability_ids:
         }
         timings.deinit(self.allocator);
     }
-    try self.deps.store.beginDeferredPersist();
-    errdefer self.deps.store.endDeferredPersist() catch @panic("manifest deferred persist end failed");
     for (capability_ids) |id| {
         const started_ms = manifestTimingStartMs(self);
         const canonical = capability_registry.canonicalId(id);
@@ -118,7 +132,6 @@ pub fn recordManifestStatuses(self: *Brain, host_id: []const u8, capability_ids:
         });
         logManifestStatusTiming(canonical, duration_ms);
     }
-    try self.deps.store.endDeferredPersist();
     return try timings.toOwnedSlice(self.allocator);
 }
 

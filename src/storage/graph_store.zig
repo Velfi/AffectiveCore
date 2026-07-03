@@ -302,7 +302,7 @@ pub const SqliteGraphStore = struct {
         if (!(try self.stepRow(stmt))) return null;
         return .{
             .type_id = sqlite3_column_int64(stmt, 0),
-            .kind = parseKind(try columnText(allocator, stmt, 1)),
+            .kind = try parseKind(try columnText(allocator, stmt, 1)),
             .name = try columnText(allocator, stmt, 2),
             .description = try columnText(allocator, stmt, 3),
             .created_by = try columnText(allocator, stmt, 4),
@@ -448,10 +448,10 @@ fn readEdge(allocator: std.mem.Allocator, stmt: *sqlite3_stmt) !Edge {
     };
 }
 
-fn parseKind(text: []const u8) TypeKind {
+fn parseKind(text: []const u8) !TypeKind {
     if (std.mem.eql(u8, text, "node")) return .node;
     if (std.mem.eql(u8, text, "edge")) return .edge;
-    @panic("invalid graph type kind from database");
+    return error.InvalidGraphTypeKind;
 }
 
 fn nowTimestamp(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
@@ -484,4 +484,10 @@ test "sqlite graph store upserts edges and records relationship summary" {
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     const text = try graph.summary(arena.allocator(), 4);
     try std.testing.expect(std.mem.indexOf(u8, text, "creator_of") != null);
+}
+
+test "parseKind rejects invalid graph type kind" {
+    try std.testing.expectError(error.InvalidGraphTypeKind, parseKind("bogus"));
+    try std.testing.expectEqual(TypeKind.node, try parseKind("node"));
+    try std.testing.expectEqual(TypeKind.edge, try parseKind("edge"));
 }

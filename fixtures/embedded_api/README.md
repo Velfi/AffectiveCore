@@ -17,7 +17,7 @@ Text input uses the typed `user_text` operation. The legacy `conversation_turn` 
 
 ## Host HTTP route fixtures
 
-The embedded brain calls the host through `AffectiveCoreEmbeddedHostServices.http_post_json`. These JSON files document request/response bodies the host must implement.
+The embedded brain calls the host through async `AffectiveCoreEmbeddedHostServices.http_post_json_begin` and `http_post_json_poll`. These JSON files document request/response bodies the host must implement.
 
 - `recognize_identify_request.json`: POST `affective-host://recognize/identify`
 - `recognize_identify_response_none.json`: identify result when no face is detected
@@ -29,6 +29,15 @@ Other required host routes (no fixture file yet):
 - `affective-host://vision/complete` — image description (`describe_image`) and visual context for recognition
 
 Wire parsing lives in [`src/api/recognition_client.zig`](../../src/api/recognition_client.zig) (`parseHostIdentityResult`) and [`src/api/chat_client.zig`](../../src/api/chat_client.zig) (`parseChatTurn`).
+
+## Brain Session Protocol fixtures
+
+`bsp/*.json` documents the new localhost TCP + NDJSON session frames. Fixture files are pretty-printed for review; the wire format is the same JSON object minified on a single line with a trailing newline.
+
+- `bsp/session_create.json`: host creates a BSP brain session with embedded config fields.
+- `bsp/dispatch.json`: host dispatches an existing embedded request envelope.
+- `bsp/host_http_begin.json`: core asks the host to fulfill a provider HTTP request.
+- `bsp/host_http_complete.json`: host completes that request.
 
 ## Host recognition debug checklist
 

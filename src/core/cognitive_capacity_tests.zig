@@ -204,7 +204,7 @@ test "saveRuntimeOptions round-trips capacity block" {
     try std.testing.expectEqual(@as(usize, 4), parsed.capacity.memory_selected_max);
 }
 
-test "appendCapacityObservation includes attention_capacity header" {
+test "appendCapacityObservation includes how_stretched_i_feel header" {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
     const cfg = config.CapacityConfig{};
@@ -221,6 +221,6 @@ test "appendCapacityObservation includes attention_capacity header" {
         .under_pressure = false,
     };
     try cognitive_capacity.appendCapacityObservation(std.testing.allocator, cfg, model, &out);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "attention_capacity:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "stack=2/8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "how_stretched_i_feel:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "nested steps") != null);
 }

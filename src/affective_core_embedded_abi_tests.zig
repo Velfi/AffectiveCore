@@ -26,8 +26,10 @@ test "embedded C ABI layout matches public header" {
     });
     try expectSameLayout(c.AffectiveCoreEmbeddedHostServices, embedded.AffectiveCoreEmbeddedHostServices, &.{
         "ctx",
-        "http_post_json",
+        "http_post_json_begin",
+        "http_post_json_poll",
         "free_string",
+        "on_host_events",
     });
     try expectPackedStringSlots(embedded.AffectiveCoreEmbeddedConfig, &.{
         "brain_id",

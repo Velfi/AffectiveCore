@@ -68,6 +68,8 @@ pub const BrainDeps = struct {
     process_runner: ?process_mod.ProcessRunner = null,
     interrupt_source: ?interrupt_mod.Source = null,
     id_monitor_sources: []const id_monitor.Source = &.{},
+    stimulus_poll: ?*const fn (?*anyopaque) anyerror!void = null,
+    stimulus_poll_ctx: ?*anyopaque = null,
 };
 
 pub const ActionPressureBatchResult = struct {

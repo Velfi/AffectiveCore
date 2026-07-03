@@ -1,0 +1,18 @@
+{
+  "type": "session.create",
+  "request_id": "session-1",
+  "config": {
+    "brain_id": "default",
+    "brain_root": "/tmp/affective-core/default",
+    "conversation_models": "",
+    "conversation_reasoning_effort": "auto",
+    "image_generation_model": "gemini-3.1-flash-image",
+    "image_generation_output_dir": "/tmp/affective-core/default/generated/images",
+    "memory_path": "/tmp/affective-core/default/memory/people.sqlite",
+    "graph_path": "/tmp/affective-core/default/memory/graph.sqlite",
+    "schedule_path": "/tmp/affective-core/default/maintenance/schedule.json",
+    "maintenance_state_path": "/tmp/affective-core/default/maintenance/state.json",
+    "face_embeddings_dir": "/tmp/affective-core/default/memory/face_embeddings",
+    "host_manifest_json": "{\"capabilities\":[]}"
+  }
+}

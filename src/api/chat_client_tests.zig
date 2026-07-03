@@ -221,6 +221,24 @@ test "parseChatTurn rejects recognize with echoed speech text" {
     , "Hello there"));
 }
 
+test "parseChatTurn rejects say with echoed user text when query holds the reply" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectError(error.InvalidChatAction, parseChatTurn(allocator,
+        \\{"action_pressures":[{"action":"say","origin":"interaction","scale":"tiny","text":"Do you recognize me?","query":"May I ask, who are you?","to":"user","subject":"recognition inquiry","memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]}],"user_summary":"Asked whether I recognize them.","brain_summary":"Considering how to respond to recognition question.","effort_tier":"basic","reasoning_effort":null,"turn_complete":true}
+    , "Do you recognize me?"));
+}
+
+test "parseChatTurn rejects say that punctuation-echoes the greeting" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectError(error.InvalidChatAction, parseChatTurn(allocator,
+        \\{"action_pressures":[{"action":"recognize","origin":"interaction","scale":"full","text":null,"query":null,"memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"to":null,"subject":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]},{"action":"say","origin":"interaction","scale":"tiny","text":"Hello, Geisha.","query":null,"memory_id":null,"person_id":null,"name":null,"image_path":null,"schedule":null,"to":null,"subject":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"keep_existing":null,"tags":[]}],"user_summary":"Greeted by name.","brain_summary":"Greeted back.","effort_tier":"basic","reasoning_effort":null,"turn_complete":true}
+    , "Hello Geisha"));
+}
+
 test "validateChatDeliveryContext rejects actions on low-materiality delivery" {
     const observations =
         \\deferred_coherence:
@@ -327,7 +345,7 @@ test "chat prompt includes silent-integration planning cue for low-materiality d
     ;
     const prompt = try chatUserPrompt(allocator, "memory", "Hello Geisha", observations, max_chat_context_tokens, .host_sense_delivery);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "# Planning\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "action_pressures must be []") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Prefer empty action_pressures when delivery_materiality is low") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Stimulus (awaited sense delivery):") != null);
 }
 

@@ -4,6 +4,7 @@ const ports = @import("ports.zig");
 const input_mod = ports.input;
 const vector_index = @import("vector_index.zig");
 const helpers = @import("brain_helpers.zig");
+const llm_voice = @import("llm_voice.zig");
 
 const Brain = brain_mod.Brain;
 
@@ -25,9 +26,9 @@ fn truncatePayload(payload: []const u8) []const u8 {
 fn appendPayloadLine(allocator: std.mem.Allocator, out: *std.ArrayList(u8), kind: []const u8, payload: []const u8, age_seconds: i64) !void {
     const snippet = truncatePayload(std.mem.trim(u8, payload, " \t\r\n"));
     if (snippet.len == 0) {
-        try out.print(allocator, "- [{s}] ({d}s ago)\n", .{ kind, age_seconds });
+        try out.print(allocator, "- Something like {s} happened about {d}s ago.\n", .{ kind, age_seconds });
     } else {
-        try out.print(allocator, "- [{s}] ({d}s ago) {s}\n", .{ kind, age_seconds, snippet });
+        try out.print(allocator, "- About {d}s ago, {s}: {s}\n", .{ age_seconds, kind, snippet });
     }
 }
 
@@ -49,7 +50,11 @@ pub fn appendRecentExperienceObservation(self: *Brain, out: *std.ArrayList(u8), 
         try appendPayloadLine(self.allocator, out, event.kind, event.payload, age_seconds);
         count += 1;
     }
-    if (count == 0) try out.appendSlice(self.allocator, "- none\n");
+    if (count == 0) {
+        try out.appendSlice(self.allocator, "- ");
+        try out.appendSlice(self.allocator, llm_voice.empty_inner_state);
+        try out.appendSlice(self.allocator, "\n");
+    }
 }
 
 pub fn appendStimulusContinuityObservation(self: *Brain, out: *std.ArrayList(u8), heard_speech: input_mod.HeardSpeech) !void {
@@ -64,13 +69,16 @@ pub fn appendStimulusContinuityObservation(self: *Brain, out: *std.ArrayList(u8)
 
 pub fn appendWaitingForObservation(self: *Brain, out: *std.ArrayList(u8)) !void {
     const waiting = self.waiting_for orelse {
-        try out.appendSlice(self.allocator, "waiting_for: none\n");
+        try out.appendSlice(self.allocator, "waiting_for: ");
+        try out.appendSlice(self.allocator, llm_voice.empty_inner_state);
+        try out.appendSlice(self.allocator, "\n");
         return;
     };
+    const age = @max(@as(i64, 0), self.now_seconds - waiting.since);
     try out.print(
         self.allocator,
-        "waiting_for:\n- note: reconsider what to do next; do not parrot the intent wording.\n- kind: {s}\n- intent: {s}\n- since_seconds_ago: {d}\n",
-        .{ @tagName(waiting.kind), waiting.intent, @max(@as(i64, 0), self.now_seconds - waiting.since) },
+        "waiting_for:\n- note: reconsider what to do next; do not parrot the intent wording.\n- I have been waiting on {s} for about {d}s — {s}\n",
+        .{ @tagName(waiting.kind), age, waiting.intent },
     );
 }
 
@@ -86,7 +94,11 @@ pub fn appendDayArcToMemory(self: *Brain, out: *std.ArrayList(u8)) !void {
         try appendPayloadLine(self.allocator, out, event.kind, event.payload, age_seconds);
         count += 1;
     }
-    if (count == 0) try out.appendSlice(self.allocator, "- none\n");
+    if (count == 0) {
+        try out.appendSlice(self.allocator, "- ");
+        try out.appendSlice(self.allocator, llm_voice.empty_inner_state);
+        try out.appendSlice(self.allocator, "\n");
+    }
 }
 
 pub fn appendAssociativeRecallObservation(self: *Brain, out: *std.ArrayList(u8), query: []const u8) !void {
@@ -98,6 +110,8 @@ pub fn appendAssociativeRecallObservation(self: *Brain, out: *std.ArrayList(u8),
     try out.appendSlice(self.allocator, "associative_recall_possibilities:\n");
     for (results) |result| {
         const memory = memories[result.memory_index];
-        try out.print(self.allocator, "- {s} similarity={d:.2}\n", .{ memory.memory_id, result.similarity });
+        const line = try llm_voice.formatSalientMemoryLine(self.allocator, helpers.memoryInterpretation(memory));
+        defer self.allocator.free(line);
+        try out.print(self.allocator, "- {s} (this keeps coming back)\n", .{line});
     }
 }

@@ -99,7 +99,7 @@ pub fn sendExperienceEvent(ctx: *AffectiveCoreEmbedded, args: std.json.Value) !s
     const kind = try requireString(args, "kind");
     const payload = getString(args, "payload") orelse "";
     const event: schema.ExperienceEvent = .{
-        .id = getString(args, "id") orelse try std.fmt.allocPrint(ctx.dispatchScratch(), "host_evt_{d}_{s}", .{ ctx.brain.now_seconds * 1000, kind }),
+        .id = getString(args, "id") orelse try allocHostExperienceEventId(ctx, kind, payload),
         .brain_id = ctx.brain.cfg.brain_id,
         .host_id = getString(args, "host_id") orelse try ctx.dispatchScratch().dupe(u8, ctx.brain.currentHostId()),
         .timestamp_ms = getInteger(args, "timestamp_ms") orelse ctx.brain.now_seconds * 1000,
@@ -117,6 +117,15 @@ pub fn sendExperienceEvent(ctx: *AffectiveCoreEmbedded, args: std.json.Value) !s
     };
     try ctx.brain.recordExperienceEvent(event);
     return event;
+}
+
+fn allocHostExperienceEventId(ctx: *AffectiveCoreEmbedded, kind: []const u8, payload: []const u8) ![]const u8 {
+    const events = ctx.brain.deps.store.loadExperienceEvents(ctx.dispatchScratch()) catch &.{};
+    return try std.fmt.allocPrint(
+        ctx.dispatchScratch(),
+        "host_evt_{d}_{d}_{s}_{d}",
+        .{ ctx.brain.now_seconds * 1000, events.len, kind, payload.len },
+    );
 }
 
 pub fn requestDreamTime(ctx: *AffectiveCoreEmbedded, prompt: ?[]const u8) !schema.MailboxItem {

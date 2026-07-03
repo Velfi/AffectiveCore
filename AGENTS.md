@@ -1,3 +1,4 @@
 - This project uses zig v0.16.0
 - Write no fallbacks. I want things to fail loudly and quickly.
 - this project does not use git for version control.
+- For the TCP-backed MCP host, read `docs/09-affective-mcp.md` first. The new LLM-facing host is `affective-mcp`; it speaks MCP over stdio and Brain Session Protocol over loopback TCP to `affective-core-session`.

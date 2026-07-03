@@ -14,14 +14,20 @@ A proposed next step for one thinking pass — with strength and urgency. Inner 
 **Active activity**  
 What the brain is working on right now: main goal, status, open loops, blockers.
 
+**Agency budget**  
+Also called **control capacity**. Internal daily energy for attention and solo actions — separate from battery percentage.
+
 **Appraisal**  
 A structured emotional read of an event — valence, arousal, feeling label, action tendency, and how it lands. May include ambivalence.
 
 **Autonomy**  
-Self-directed behavior when you are not in conversation. Governed by mode, energy budget, and safety rules.
+Compatibility term for background agency: noticing, thinking, acting, waiting, or speaking when you are not in active conversation. Governed by attention, agency budget, capability policy, and boundaries rather than a user-facing mode picker.
 
 **Autonomy budget**  
-Also called **control capacity**. Internal daily energy for solo actions — separate from battery percentage.
+Legacy name for **agency budget** or **control capacity**. Internal daily energy for attention and solo actions — separate from battery percentage.
+
+**Attention**  
+The brain's current allocation of concern: quietly observing, curious, thinking, waiting, or resting.
 
 ---
 
@@ -40,7 +46,7 @@ The first-pass index each turn: summaries, counts, tags, active wants — not fu
 Roughly ninety seconds after your last message during which conversational context stays live.
 
 **Control capacity**  
-See **autonomy budget**.
+See **agency budget**.
 
 **Creator**  
 The first person the brain recognized — a special attachment in the relationship graph.
@@ -50,7 +56,7 @@ The first person the brain recognized — a special attachment in the relationsh
 ## E–I
 
 **Ego**  
-The autonomy planner in psyche deliberation — reconciles Id and Superego, proposes an ordered batch of autonomous action pressures.
+The agency planner in psyche deliberation — reconciles Id and Superego, and may propose quiet integration, private thought, a capability, waiting, emote, or speech.
 
 **Emote**  
 Silent gesture text in chat — *leans closer* — without spoken words.
@@ -62,7 +68,7 @@ A recorded event in the brain's life stream — input that becomes impression an
 Short-lived working attention — what the brain is concentrating on in the near term.
 
 **Id**  
-The short-horizon inner voice in autonomy — urges, near-term needs, curiosity, discomfort.
+The short-horizon inner voice in psyche deliberation — urges, near-term needs, curiosity, discomfort.
 
 **Impression**  
 First-pass sense of what just happened — before full appraisal and memory.
@@ -90,7 +96,7 @@ Structured text result from a sense or skill — fed into the next thinking pass
 Primary ground truth during open contact — what is happening in this exchange.
 
 **Psyche**  
-Id / Ego / Superego deliberation layer for autonomous action.
+Id / Ego / Superego deliberation layer for attention, interpretation, and agency.
 
 ---
 

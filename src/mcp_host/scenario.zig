@@ -11,6 +11,7 @@ pub fn parseMode(name: []const u8) !mock_host.Mode {
     if (std.mem.eql(u8, name, "resume_invalid_llm")) return .resume_invalid_llm;
     if (std.mem.eql(u8, name, "enrollment_without_remember_person")) return .enrollment_without_remember_person;
     if (std.mem.eql(u8, name, "upstream_rejected")) return .upstream_rejected;
+    if (std.mem.eql(u8, name, "touch_speak")) return .touch_speak;
     if (std.mem.eql(u8, name, "scripted_recognize_resume")) return .default;
     if (std.mem.eql(u8, name, "unknown_want_achievement")) return .default;
     return error.UnknownMcpHostScenario;

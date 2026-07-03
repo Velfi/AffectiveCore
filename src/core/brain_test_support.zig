@@ -999,6 +999,11 @@ pub fn writeAndRefreshFacialExpressionCatalog(
     _ = try brain.refreshFacialExpressionCatalog();
 }
 
+pub fn wireTestIo(brain: *Brain) void {
+    brain.deps.io = std.testing.io;
+    brain.syncClock(std.testing.io);
+}
+
 pub fn makeBrain(allocator: std.mem.Allocator, image: []const u8, answers: []const []const u8, store: *TestStore, desc: *openai.TestDescriptionService) Brain {
     var camera = allocator.create(TestCamera) catch unreachable;
     camera.* = .{ .image = image };
@@ -1078,6 +1083,80 @@ pub fn makeBrain(allocator: std.mem.Allocator, image: []const u8, answers: []con
         .speaker = speaker.speaker(),
         .input = input.input(),
         .store = store.store(),
+        .graph = graph_impl.store(),
+        .system_senses = senses.senses(),
+        .clock = clock.clock(),
+        .filesystem = localFileSystem(allocator),
+        .process_runner = process_runner.runner(),
+    });
+}
+
+pub fn makeBrainWithMemoryStore(
+    allocator: std.mem.Allocator,
+    image: []const u8,
+    answers: []const []const u8,
+    memory_store: store_mod.MemoryStore,
+    aux_store: *TestStore,
+    desc: *openai.TestDescriptionService,
+    io: ?std.Io,
+) Brain {
+    var camera = allocator.create(TestCamera) catch unreachable;
+    camera.* = .{ .image = image };
+    var input = allocator.create(TestInput) catch unreachable;
+    input.* = .{ .answers = answers };
+    var recog = allocator.create(TestRecognitionClient) catch unreachable;
+    recog.* = .{};
+    var chat = allocator.create(chat_mod.TestChatService) catch unreachable;
+    chat.* = .{};
+    var image_gen = allocator.create(image_mod.TestImageGenerationService) catch unreachable;
+    image_gen.* = .{};
+    var audio_inspector = allocator.create(audio_mod.TestAudioInspectionService) catch unreachable;
+    audio_inspector.* = .{};
+    var speech = allocator.create(speech_mod.TestSpeechService) catch unreachable;
+    speech.* = .{};
+    var speaker = allocator.create(speaker_mod.TestSpeaker) catch unreachable;
+    speaker.* = .{};
+    var extraction = allocator.create(memory_extraction_mod.ScriptedMemoryExtractionService) catch unreachable;
+    extraction.* = .{ .candidates = &.{} };
+    var process_runner = allocator.create(TestProcessRunner) catch unreachable;
+    process_runner.* = .{};
+    var clock = allocator.create(TestClock) catch unreachable;
+    clock.* = .{};
+    var senses = allocator.create(system_senses_mod.StaticSystemSenses) catch unreachable;
+    senses.* = .{ .snapshot_value = .{
+        .datetime = .{
+            .datetime = "2026-06-23T12:30:00-05:00",
+            .datetime_format = "ISO-8601 local",
+            .friendly_datetime = "June 23, 2026 at 12:30 PM",
+            .friendly_datetime_format = "local long date and time",
+            .unix_seconds = 1_781_222_400,
+        },
+        .power = .{ .supplies = &.{} },
+        .storage = .{ .volumes = &.{} },
+        .database = .{ .databases = &.{} },
+    } };
+    var graph_impl = allocator.create(graph_store.TestGraphStore) catch unreachable;
+    graph_impl.* = .{};
+    var test_embedding = allocator.create(embedding_mod.TestEmbeddingService) catch unreachable;
+    test_embedding.* = .{};
+
+    return Brain.init(allocator, .{ .psyche_mode = "off" }, .{
+        .io = io,
+        .capabilities = chat_mod.CapabilitySet.all(),
+        .camera = camera.camera(),
+        .recognizer = recog.recognizer(),
+        .description_service = desc.service(),
+        .chat_service = chat.service(),
+        .embedding_service = test_embedding.service(),
+        .memory_extraction_service = extraction.service(),
+        .image_generation_service = image_gen.service(),
+        .audio_inspection_service = audio_inspector.service(),
+        .want_achievement_detector = aux_store.want_detector.detector(),
+        .persona_directive_synthesizer = aux_store.persona_synthesizer.synthesizer(),
+        .speech_service = speech.service(),
+        .speaker = speaker.speaker(),
+        .input = input.input(),
+        .store = memory_store,
         .graph = graph_impl.store(),
         .system_senses = senses.senses(),
         .clock = clock.clock(),

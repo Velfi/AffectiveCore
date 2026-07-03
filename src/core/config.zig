@@ -19,6 +19,8 @@ pub const CapacityConfig = struct {
     chat_context_tokens_max: usize = 120_000,
     dispatch_envelope_bytes_max: usize = 16 * 1024,
     dispatch_event_count_max: usize = 12,
+    stimulus_inbox_max: usize = 8,
+    work_registry_max: usize = 3,
 };
 
 pub const CapacityConfigPartial = struct {
@@ -34,6 +36,8 @@ pub const CapacityConfigPartial = struct {
     chat_context_tokens_max: ?usize = null,
     dispatch_envelope_bytes_max: ?usize = null,
     dispatch_event_count_max: ?usize = null,
+    stimulus_inbox_max: ?usize = null,
+    work_registry_max: ?usize = null,
 };
 
 pub const Config = struct {
@@ -54,6 +58,9 @@ pub const Config = struct {
     image_generation_output_dir: []const u8 = "",
     autonomy_mode: []const u8 = "off",
     autonomy_sleep: []const u8 = "off",
+    autonomy_wake_hold_seconds: u64 = 600,
+    stimulus_quiescence_seconds: u64 = 2,
+    stimulus_coalesce_max_wait_seconds: u64 = 7,
     autonomy_quiet_hours: []const u8 = "22:00-08:00",
     autonomy_limited_max_capacity: f32 = 25,
     autonomy_full_max_capacity: f32 = 50,
@@ -155,6 +162,15 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, args[i], "--autonomy-sleep") and i + 1 < args.len) {
                 i += 1;
                 cfg.autonomy_sleep = args[i];
+            } else if (std.mem.eql(u8, args[i], "--autonomy-wake-hold-seconds") and i + 1 < args.len) {
+                i += 1;
+                cfg.autonomy_wake_hold_seconds = try std.fmt.parseInt(u64, args[i], 10);
+            } else if (std.mem.eql(u8, args[i], "--stimulus-quiescence-seconds") and i + 1 < args.len) {
+                i += 1;
+                cfg.stimulus_quiescence_seconds = try std.fmt.parseInt(u64, args[i], 10);
+            } else if (std.mem.eql(u8, args[i], "--stimulus-coalesce-max-wait-seconds") and i + 1 < args.len) {
+                i += 1;
+                cfg.stimulus_coalesce_max_wait_seconds = try std.fmt.parseInt(u64, args[i], 10);
             } else if (std.mem.eql(u8, args[i], "--autonomy-quiet-hours") and i + 1 < args.len) {
                 i += 1;
                 cfg.autonomy_quiet_hours = args[i];
@@ -432,6 +448,9 @@ pub const Config = struct {
             .image_generation_output_dir = self.image_generation_output_dir,
             .autonomy_mode = self.autonomy_mode,
             .autonomy_sleep = self.autonomy_sleep,
+            .autonomy_wake_hold_seconds = self.autonomy_wake_hold_seconds,
+            .stimulus_quiescence_seconds = self.stimulus_quiescence_seconds,
+            .stimulus_coalesce_max_wait_seconds = self.stimulus_coalesce_max_wait_seconds,
             .autonomy_quiet_hours = self.autonomy_quiet_hours,
             .autonomy_limited_max_capacity = self.autonomy_limited_max_capacity,
             .autonomy_full_max_capacity = self.autonomy_full_max_capacity,
@@ -505,6 +524,9 @@ pub const Config = struct {
         if (settings.image_generation_output_dir.len > 0) cfg.image_generation_output_dir = settings.image_generation_output_dir;
         if (settings.autonomy_mode.len > 0) cfg.autonomy_mode = normalizeAutonomyModeCompat(settings.autonomy_mode);
         if (settings.autonomy_sleep.len > 0) cfg.autonomy_sleep = settings.autonomy_sleep;
+        if (settings.autonomy_wake_hold_seconds) |v| cfg.autonomy_wake_hold_seconds = v;
+        if (settings.stimulus_quiescence_seconds) |v| cfg.stimulus_quiescence_seconds = v;
+        if (settings.stimulus_coalesce_max_wait_seconds) |v| cfg.stimulus_coalesce_max_wait_seconds = v;
         if (settings.autonomy_quiet_hours.len > 0) cfg.autonomy_quiet_hours = settings.autonomy_quiet_hours;
         if (settings.autonomy_limited_max_capacity) |v| cfg.autonomy_limited_max_capacity = v;
         if (settings.autonomy_full_max_capacity) |v| cfg.autonomy_full_max_capacity = v;
@@ -579,6 +601,9 @@ pub const BrainSettings = struct {
     image_generation_output_dir: []const u8 = "",
     autonomy_mode: []const u8 = "",
     autonomy_sleep: []const u8 = "",
+    autonomy_wake_hold_seconds: ?u64 = null,
+    stimulus_quiescence_seconds: ?u64 = null,
+    stimulus_coalesce_max_wait_seconds: ?u64 = null,
     autonomy_quiet_hours: []const u8 = "",
     autonomy_limited_max_capacity: ?f32 = null,
     autonomy_full_max_capacity: ?f32 = null,

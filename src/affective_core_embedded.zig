@@ -1,5 +1,8 @@
 const std = @import("std");
 
+const embedded_boundary = @import("affective_core_embedded_boundary.zig");
+pub const panic = embedded_boundary.Panic;
+
 const chat = @import("api/chat_client.zig");
 const brain_container = @import("app/brain_container.zig");
 const host_profiles = @import("app/host_profiles.zig");
@@ -10,11 +13,13 @@ const config_mod = @import("core/config.zig");
 const brain_mod = @import("core/brain.zig");
 const ai_provider = @import("api/random_provider_client.zig");
 const http_transport_mod = @import("api/http_transport.zig");
+const http_log = @import("api/http_log.zig");
 const files = @import("platform/common/files.zig");
 const brain_storage = @import("storage/brain_storage.zig");
 const embedded_config = @import("affective_core_embedded_config.zig");
 const embedded_e2e = @import("affective_core_embedded_e2e.zig");
 const embedded_dispatch = @import("affective_core_embedded_dispatch.zig");
+const stimulus_inbox_mod = @import("core/stimulus_inbox.zig");
 const error_descriptions = @import("core/error_descriptions.zig");
 
 pub const AffectiveCoreEmbeddedString = extern struct {
@@ -37,10 +42,21 @@ pub const AffectiveCoreEmbeddedConfig = extern struct {
     host_manifest_json: AffectiveCoreEmbeddedString = .{},
 };
 
-pub const AffectiveCoreEmbeddedHttpPostJsonFn = *const fn (
+pub const host_http_poll_complete: c_int = 0;
+pub const host_http_poll_failed: c_int = 1;
+pub const host_http_poll_pending: c_int = 2;
+
+pub const AffectiveCoreEmbeddedHttpPostJsonBeginFn = *const fn (
     ?*anyopaque,
     AffectiveCoreEmbeddedString,
     AffectiveCoreEmbeddedString,
+    AffectiveCoreEmbeddedString,
+    ?*AffectiveCoreEmbeddedString,
+    ?*AffectiveCoreEmbeddedString,
+) callconv(.c) c_int;
+
+pub const AffectiveCoreEmbeddedHttpPostJsonPollFn = *const fn (
+    ?*anyopaque,
     AffectiveCoreEmbeddedString,
     ?*AffectiveCoreEmbeddedString,
     ?*AffectiveCoreEmbeddedString,
@@ -51,10 +67,17 @@ pub const AffectiveCoreEmbeddedFreeHostStringFn = *const fn (
     AffectiveCoreEmbeddedString,
 ) callconv(.c) void;
 
+pub const AffectiveCoreEmbeddedOnHostEventsFn = *const fn (
+    ?*anyopaque,
+    AffectiveCoreEmbeddedString,
+) callconv(.c) void;
+
 pub const AffectiveCoreEmbeddedHostServices = extern struct {
     ctx: ?*anyopaque = null,
-    http_post_json: ?AffectiveCoreEmbeddedHttpPostJsonFn = null,
+    http_post_json_begin: ?AffectiveCoreEmbeddedHttpPostJsonBeginFn = null,
+    http_post_json_poll: ?AffectiveCoreEmbeddedHttpPostJsonPollFn = null,
     free_string: ?AffectiveCoreEmbeddedFreeHostStringFn = null,
+    on_host_events: ?AffectiveCoreEmbeddedOnHostEventsFn = null,
 };
 
 pub const AffectiveCoreEmbeddedStatus = enum(c_int) {
@@ -82,6 +105,43 @@ pub const AffectiveCoreEmbedded = struct {
     raw_ref_ttl_seconds: i64 = 24 * 60 * 60,
     pending_camera_permission: ?HostCapabilityPending = null,
     dispatch_mutex: std.atomic.Mutex = .unlocked,
+    stimulus_queue_mutex: std.atomic.Mutex = .unlocked,
+    pending_stimulus_requests: std.ArrayList([]const u8) = .empty,
+
+    pub fn queuePendingStimulusRequest(self: *AffectiveCoreEmbedded, request_json: []const u8) !void {
+        lockStimulusQueue(self);
+        defer unlockStimulusQueue(self);
+        const owned = try std.heap.page_allocator.dupe(u8, request_json);
+        errdefer std.heap.page_allocator.free(owned);
+        // page_allocator: this queue is touched from arbitrary host threads while
+        // the arena allocator is only safe on the dispatching thread.
+        try self.pending_stimulus_requests.append(std.heap.page_allocator, owned);
+    }
+
+    pub fn flushPendingStimulusRequests(self: *AffectiveCoreEmbedded) !void {
+        // Take ownership of the queued requests under the lock, but apply them
+        // after releasing it: applying a message can re-enter this function
+        // (e.g. autonomy_tick -> pollStimulusInbox -> stimulus_poll callback),
+        // which would self-deadlock on the non-reentrant spinlock.
+        const pending = blk: {
+            lockStimulusQueue(self);
+            defer unlockStimulusQueue(self);
+            if (self.pending_stimulus_requests.items.len == 0) return;
+            break :blk try self.pending_stimulus_requests.toOwnedSlice(std.heap.page_allocator);
+        };
+        defer {
+            for (pending) |json| std.heap.page_allocator.free(json);
+            std.heap.page_allocator.free(pending);
+        }
+        for (pending) |json| {
+            embedded_dispatch.applyQueuedMessage(self, json) catch {};
+        }
+    }
+
+    pub fn pollStimulusInboxCallback(ctx: ?*anyopaque) !void {
+        const embedded_ctx: *AffectiveCoreEmbedded = @ptrCast(@alignCast(ctx.?));
+        try embedded_ctx.flushPendingStimulusRequests();
+    }
 
     pub fn allocator(self: *AffectiveCoreEmbedded) std.mem.Allocator {
         return self.arena.allocator();
@@ -149,6 +209,7 @@ const HostHttpTransport = struct {
     failing: FailingHttpTransport = .{},
     error_allocator: std.mem.Allocator = undefined,
     last_error: ?[]const u8 = null,
+    owner: ?*AffectiveCoreEmbedded = null,
 
     fn init(services: ?*const AffectiveCoreEmbeddedHostServices, error_allocator: std.mem.Allocator) HostHttpTransport {
         return .{
@@ -157,8 +218,14 @@ const HostHttpTransport = struct {
         };
     }
 
+    fn hasAsyncHostHttp(self: *const HostHttpTransport) bool {
+        return self.services.http_post_json_begin != null and
+            self.services.http_post_json_poll != null and
+            self.services.free_string != null;
+    }
+
     fn client(self: *HostHttpTransport) http_transport_mod.Client {
-        if (self.services.http_post_json == null or self.services.free_string == null) {
+        if (!self.hasAsyncHostHttp()) {
             return self.failing.client();
         }
         return .{ .ctx = self, .postJsonFn = postJson };
@@ -166,33 +233,73 @@ const HostHttpTransport = struct {
 
     fn postJson(ctx: *anyopaque, allocator: std.mem.Allocator, request: http_transport_mod.JsonPostRequest) ![]u8 {
         const self: *HostHttpTransport = @ptrCast(@alignCast(ctx));
-        const post_json = self.services.http_post_json orelse return error.HostHttpTransportRequired;
+        const begin = self.services.http_post_json_begin orelse return error.HostHttpTransportRequired;
+        const poll = self.services.http_post_json_poll orelse return error.HostHttpTransportRequired;
         const free_string = self.services.free_string orelse return error.HostHttpTransportRequired;
 
         const headers_json = try std.json.Stringify.valueAlloc(allocator, request.headers, .{});
         defer allocator.free(headers_json);
 
-        var out_data = AffectiveCoreEmbeddedString{};
-        var out_error = AffectiveCoreEmbeddedString{};
-        const status = post_json(
+        var out_request_id = AffectiveCoreEmbeddedString{};
+        var begin_error = AffectiveCoreEmbeddedString{};
+        const begin_status = begin(
             self.services.ctx,
             sliceToEmbeddedString(request.url),
             sliceToEmbeddedString(headers_json),
             sliceToEmbeddedString(request.body),
-            &out_data,
-            &out_error,
+            &out_request_id,
+            &begin_error,
         );
-        defer free_string(self.services.ctx, out_data);
-        defer free_string(self.services.ctx, out_error);
-
-        if (status != 0) {
-            self.rememberLastError(out_error);
+        defer free_string(self.services.ctx, out_request_id);
+        defer free_string(self.services.ctx, begin_error);
+        if (begin_status != 0) {
+            self.rememberLastError(begin_error);
+            if (self.owner) |embedded| {
+                if (self.last_error) |detail| embedded.brain.rememberHostHttpErrorDetail(detail) catch {};
+            }
+            http_log.logErrorWithHostDetail(request.url, error.HostHttpPostJsonFailed, self.last_error);
             return error.HostHttpPostJsonFailed;
         }
-        const bytes = try embeddedStringToOwnedSlice(allocator, out_data);
-        errdefer allocator.free(bytes);
-        if (bytes.len > request.max_response_bytes) return error.StreamTooLong;
-        return bytes;
+
+        while (true) {
+            var out_data = AffectiveCoreEmbeddedString{};
+            var poll_error = AffectiveCoreEmbeddedString{};
+            const poll_status = poll(
+                self.services.ctx,
+                out_request_id,
+                &out_data,
+                &poll_error,
+            );
+            defer free_string(self.services.ctx, out_data);
+            defer free_string(self.services.ctx, poll_error);
+
+            switch (poll_status) {
+                host_http_poll_complete => {
+                    if (self.owner) |embedded| embedded.brain.clearHostHttpErrorDetail();
+                    const bytes = try embeddedStringToOwnedSlice(allocator, out_data);
+                    errdefer allocator.free(bytes);
+                    if (bytes.len > request.max_response_bytes) return error.StreamTooLong;
+                    return bytes;
+                },
+                host_http_poll_failed => {
+                    self.rememberLastError(poll_error);
+                    if (self.owner) |embedded| {
+                        if (self.last_error) |detail| embedded.brain.rememberHostHttpErrorDetail(detail) catch {};
+                    }
+                    http_log.logErrorWithHostDetail(request.url, error.HostHttpPostJsonFailed, self.last_error);
+                    return error.HostHttpPostJsonFailed;
+                },
+                host_http_poll_pending => {
+                    std.Thread.yield() catch {};
+                    continue;
+                },
+                else => {
+                    self.rememberLastError(poll_error);
+                    http_log.logErrorWithHostDetail(request.url, error.HostHttpPostJsonFailed, self.last_error);
+                    return error.HostHttpPostJsonFailed;
+                },
+            }
+        }
     }
 
     fn releaseLastError(self: *HostHttpTransport) void {
@@ -214,8 +321,16 @@ const HostHttpTransport = struct {
 };
 
 fn hostSystemSensesHttpClient(http_transport_state: *HostHttpTransport) ?http_transport_mod.Client {
-    if (http_transport_state.services.http_post_json != null and http_transport_state.services.free_string != null) {
+    if (http_transport_state.hasAsyncHostHttp()) {
         return http_transport_state.client();
+    }
+    return null;
+}
+
+fn validateEmbeddedHostServices(host_services: ?*const AffectiveCoreEmbeddedHostServices) ?[]const u8 {
+    const services = host_services orelse return "embedded create requires host services";
+    if (services.http_post_json_begin == null or services.http_post_json_poll == null or services.free_string == null) {
+        return "embedded create requires async host HTTP services (begin, poll, free_string)";
     }
     return null;
 }
@@ -232,12 +347,22 @@ pub export fn affective_core_embedded_create(
     out_handle: ?*?*AffectiveCoreEmbedded,
     out_error: ?*AffectiveCoreEmbeddedString,
 ) c_int {
+    var export_guard = embedded_boundary.ExportGuard.init();
+    if (export_guard.panicked) return embeddedExportPanicFailure(out_error);
+    defer export_guard.deinit();
+
     setHandle(out_handle, null);
     setString(out_error, .{});
 
     const raw_config = config orelse {
         return createFailure(out_error, "missing embedded config");
     };
+    embedded_config.validateEmbeddedConfig(raw_config.*) catch {
+        return invalidArgumentFailure(out_error, "invalid embedded config string field");
+    };
+    if (validateEmbeddedHostServices(host_services)) |message| {
+        return createFailure(out_error, message);
+    }
 
     const handle = std.heap.page_allocator.create(AffectiveCoreEmbedded) catch {
         return createFailure(out_error, "could not allocate embedded AffectiveCore handle");
@@ -260,7 +385,11 @@ pub export fn affective_core_embedded_create(
     handle.raw_ref_ttl_seconds = 24 * 60 * 60;
     handle.pending_camera_permission = null;
     handle.dispatch_mutex = .unlocked;
-    const manifest_json = embedded_config.stringSlice(raw_config.host_manifest_json) orelse "";
+    handle.stimulus_queue_mutex = .unlocked;
+    handle.pending_stimulus_requests = .empty;
+    const manifest_json = embedded_config.validatedStringSlice(raw_config.host_manifest_json) catch {
+        return createFailureWithHandle(handle, out_error, "invalid embedded host_manifest_json", error.InvalidEmbeddedString);
+    };
     if (manifest_json.len == 0) {
         return createFailureWithHandle(handle, out_error, "embedded create requires host_manifest_json from the host app", error.MissingHostManifestCapabilities);
     }
@@ -289,7 +418,7 @@ pub export fn affective_core_embedded_create(
     };
     if (ensureParentDirsOrFailure(handle, out_error, cfg)) |status| return status;
     const host_system_senses_http = hostSystemSensesHttpClient(&handle.http_transport);
-    const host_http_available = host_services != null and host_services.?.http_post_json != null;
+    const host_http_available = host_services != null and host_services.?.http_post_json_begin != null;
     const embedded_brain_host = host_profiles.initEmbeddedMacosBrainHost(
         brain_allocator,
         handle.io(),
@@ -302,6 +431,9 @@ pub export fn affective_core_embedded_create(
         return createFailureWithHandle(handle, out_error, "could not initialize embedded AffectiveCore runtime", err);
     };
     handle.brain = embedded_brain_host.brain;
+    handle.brain.deps.stimulus_poll = AffectiveCoreEmbedded.pollStimulusInboxCallback;
+    handle.brain.deps.stimulus_poll_ctx = handle;
+    handle.http_transport.owner = handle;
     embedded_brain_host.chat_service.parse_failure_brain = &handle.brain;
     embedded_brain_host.autonomy_planner.parse_failure_brain = &handle.brain;
     handle.llm_provider_clients = embedded_brain_host.llm_provider_clients;
@@ -316,7 +448,7 @@ pub export fn affective_core_embedded_create(
         return createFailureWithHandle(handle, out_error, "could not restore persisted activity", err);
     };
     handle.brain_initialized = true;
-    syncContextBudgetFromConfig(handle, cfg, manifest.max_event_text_bytes);
+    syncContextBudgetFromHost(handle, manifest);
     handle.raw_ref_ttl_seconds = manifest.raw_ref_ttl_seconds;
 
     setHandle(out_handle, handle);
@@ -324,7 +456,13 @@ pub export fn affective_core_embedded_create(
 }
 
 pub export fn affective_core_embedded_destroy(handle: ?*AffectiveCoreEmbedded) void {
+    var export_guard = embedded_boundary.ExportGuard.init();
+    if (export_guard.panicked) return;
+    defer export_guard.deinit();
+
     const ctx = handle orelse return;
+    for (ctx.pending_stimulus_requests.items) |json| std.heap.page_allocator.free(json);
+    ctx.pending_stimulus_requests.deinit(std.heap.page_allocator);
     if (ctx.storage_backend) |*storage| {
         storage.deinit(ctx.brainAllocator());
         ctx.storage_backend = null;
@@ -344,6 +482,34 @@ fn tryAcquireDispatch(ctx: *AffectiveCoreEmbedded, out_data: ?*AffectiveCoreEmbe
     return null;
 }
 
+fn tryAcquireDispatchOrQueueMessage(
+    ctx: *AffectiveCoreEmbedded,
+    request_json: []const u8,
+    out_data: ?*AffectiveCoreEmbeddedString,
+    out_error: ?*AffectiveCoreEmbeddedString,
+) ?c_int {
+    if (ctx.dispatch_mutex.tryLock()) return null;
+    const meta = embedded_dispatch.parseDispatchRequestMeta(request_json);
+    if (!embedded_dispatch.isQueueableWhileBusyEventType(meta.eventType())) {
+        return protocolError(ctx, out_data, "", "runtime_error", "embedded dispatch already in progress on this handle");
+    }
+    ctx.queuePendingStimulusRequest(request_json) catch |err| {
+        return runtimeError(ctx, out_error, "could not queue embedded message", err);
+    };
+    const output = embedded_dispatch.encodeQueuedAck(ctx, meta.requestId(), meta.eventType()) catch |err| {
+        return runtimeError(ctx, out_error, "could not encode queued response", err);
+    };
+    return success(ctx, out_data, output);
+}
+
+fn lockStimulusQueue(ctx: *AffectiveCoreEmbedded) void {
+    while (!ctx.stimulus_queue_mutex.tryLock()) {}
+}
+
+fn unlockStimulusQueue(ctx: *AffectiveCoreEmbedded) void {
+    ctx.stimulus_queue_mutex.unlock();
+}
+
 fn releaseDispatch(ctx: *AffectiveCoreEmbedded) void {
     ctx.dispatch_mutex.unlock();
 }
@@ -355,15 +521,19 @@ pub export fn affective_core_embedded_dispatch_json(
     out_data: ?*AffectiveCoreEmbeddedString,
     out_error: ?*AffectiveCoreEmbeddedString,
 ) c_int {
+    var export_guard = embedded_boundary.ExportGuard.init();
+    if (export_guard.panicked) return embeddedExportPanicFailure(out_error);
+    defer export_guard.deinit();
+
     setString(out_data, .{});
     setString(out_error, .{});
 
     const ctx = handle orelse return runtimeFailure(null, out_error, "missing embedded AffectiveCore handle");
-    if (tryAcquireDispatch(ctx, out_data, out_error)) |status| return status;
-    defer releaseDispatch(ctx);
     const request_json = embedded_config.requiredSlice(request_json_ptr, request_json_len) catch {
         return protocolError(ctx, out_data, "", "invalid_request", "missing dispatch request JSON");
     };
+    if (tryAcquireDispatchOrQueueMessage(ctx, request_json, out_data, out_error)) |status| return status;
+    defer releaseDispatch(ctx);
     const output = embedded_dispatch.dispatchJson(ctx, request_json) catch |err| {
         const message = allocDispatchFailureMessage(ctx, err) catch "dispatch failed";
         defer if (!std.mem.eql(u8, message, "dispatch failed")) std.heap.page_allocator.free(message);
@@ -377,6 +547,10 @@ pub export fn affective_core_embedded_drain_events_json(
     out_data: ?*AffectiveCoreEmbeddedString,
     out_error: ?*AffectiveCoreEmbeddedString,
 ) c_int {
+    var export_guard = embedded_boundary.ExportGuard.init();
+    if (export_guard.panicked) return embeddedExportPanicFailure(out_error);
+    defer export_guard.deinit();
+
     setString(out_data, .{});
     setString(out_error, .{});
 
@@ -410,6 +584,58 @@ pub export fn affective_core_embedded_drain_events_json(
     return success(ctx, out_data, output);
 }
 
+pub export fn affective_core_embedded_try_drain_events_json(
+    handle: ?*AffectiveCoreEmbedded,
+    out_data: ?*AffectiveCoreEmbeddedString,
+    out_error: ?*AffectiveCoreEmbeddedString,
+) c_int {
+    var export_guard = embedded_boundary.ExportGuard.init();
+    if (export_guard.panicked) return embeddedExportPanicFailure(out_error);
+    defer export_guard.deinit();
+
+    setString(out_data, .{});
+    setString(out_error, .{});
+
+    const ctx = handle orelse return runtimeFailure(null, out_error, "missing embedded AffectiveCore handle");
+    if (!ctx.dispatch_mutex.tryLock()) {
+        return protocolError(ctx, out_data, "", "runtime_error", "embedded dispatch already in progress on this handle");
+    }
+    defer releaseDispatch(ctx);
+    defer ctx.resetDispatchScratch();
+    const request_id = "";
+    ctx.brain.beginRequestTimings(request_id) catch |err| {
+        return runtimeError(ctx, out_error, "could not begin request timings", err);
+    };
+    defer ctx.brain.resetRequestTimings();
+    const scratch = ctx.dispatchScratch();
+    const compacted = context_gate.compactEvents(scratch, ctx.brain.now_seconds, request_id, ctx.brain.activeActivityId() orelse "", ctx.event_queue.items, ctx.context_budget) catch |err| {
+        return runtimeError(ctx, out_error, "could not compact drained events", err);
+    };
+    embedded_dispatch.persistRawRefs(ctx, compacted.raw_refs) catch |err| {
+        return runtimeError(ctx, out_error, "could not store compacted drained event refs", err);
+    };
+    const budget = context_gate.budgetWithResult(scratch, compacted.budget, 0, &.{}, false) catch |err| {
+        return runtimeError(ctx, out_error, "could not build drain budget", err);
+    };
+    var timings = embedded_dispatch.finishDispatchTimings(ctx) catch |err| {
+        return runtimeError(ctx, out_error, "could not finish drain request timings", err);
+    };
+    defer embedded_dispatch.deinitDispatchTimingsReport(ctx, &timings);
+    const output = embedded_protocol.successEnvelopeAlloc(std.heap.page_allocator, request_id, compacted.events, .{ .kind = "drain" }, budget, timings, null) catch |err| {
+        return runtimeError(ctx, out_error, "could not encode drained events", err);
+    };
+    ctx.event_queue.clearRetainingCapacity();
+    return success(ctx, out_data, output);
+}
+
+pub fn pushHostEventsToHost(ctx: *AffectiveCoreEmbedded, events: []const embedded_protocol.HostEvent) void {
+    const on_host_events = ctx.http_transport.services.on_host_events orelse return;
+    if (events.len == 0) return;
+    const events_json = std.json.Stringify.valueAlloc(std.heap.page_allocator, events, .{}) catch return;
+    defer std.heap.page_allocator.free(events_json);
+    on_host_events(ctx.http_transport.services.ctx, sliceToEmbeddedString(events_json));
+}
+
 pub export fn affective_core_embedded_raw_ref_lookup_json(
     handle: ?*AffectiveCoreEmbedded,
     raw_ref_ptr: ?[*]const u8,
@@ -417,6 +643,10 @@ pub export fn affective_core_embedded_raw_ref_lookup_json(
     out_data: ?*AffectiveCoreEmbeddedString,
     out_error: ?*AffectiveCoreEmbeddedString,
 ) c_int {
+    var export_guard = embedded_boundary.ExportGuard.init();
+    if (export_guard.panicked) return embeddedExportPanicFailure(out_error);
+    defer export_guard.deinit();
+
     setString(out_data, .{});
     setString(out_error, .{});
 
@@ -465,8 +695,13 @@ pub fn hostEvents(ctx: *AffectiveCoreEmbedded) []const embedded_protocol.HostEve
 }
 
 pub export fn affective_core_embedded_free_global_string(string: AffectiveCoreEmbeddedString) void {
-    const bytes = embedded_config.stringSlice(string) orelse return;
-    std.heap.page_allocator.free(bytes);
+    var export_guard = embedded_boundary.ExportGuard.init();
+    if (export_guard.panicked) return;
+    defer export_guard.deinit();
+
+    const bytes = embedded_config.validatedStringSlice(string) catch return;
+    if (bytes.len == 0) return;
+    std.heap.page_allocator.free(@constCast(bytes));
 }
 
 pub export fn affective_core_embedded_export_brain(
@@ -476,6 +711,10 @@ pub export fn affective_core_embedded_export_brain(
     out_data: ?*AffectiveCoreEmbeddedString,
     out_error: ?*AffectiveCoreEmbeddedString,
 ) c_int {
+    var export_guard = embedded_boundary.ExportGuard.init();
+    if (export_guard.panicked) return embeddedExportPanicFailure(out_error);
+    defer export_guard.deinit();
+
     setString(out_data, .{});
     setString(out_error, .{});
 
@@ -509,6 +748,10 @@ pub export fn affective_core_embedded_import_brain(
     out_data: ?*AffectiveCoreEmbeddedString,
     out_error: ?*AffectiveCoreEmbeddedString,
 ) c_int {
+    var export_guard = embedded_boundary.ExportGuard.init();
+    if (export_guard.panicked) return embeddedExportPanicFailure(out_error);
+    defer export_guard.deinit();
+
     setString(out_data, .{});
     setString(out_error, .{});
 
@@ -519,7 +762,9 @@ pub export fn affective_core_embedded_import_brain(
     const brain_file_path = embedded_config.requiredSlice(brain_file_path_ptr, brain_file_path_len) catch {
         return runtimeFailure(ctx, out_error, "missing brain import file path");
     };
-    const maybe_brain_id = optionalNonEmptySlice(brain_id_ptr, brain_id_len);
+    const maybe_brain_id = optionalNonEmptySlice(brain_id_ptr, brain_id_len) catch {
+        return invalidArgumentFailure(out_error, "invalid brain_id slice");
+    };
     const inspected = if (maybe_brain_id == null)
         brain_container.inspectBrainFile(ctx.allocator(), ctx.io(), brain_file_path) catch |err| {
             return runtimeError(ctx, out_error, "embedded brain import inspect failed", err);
@@ -527,7 +772,9 @@ pub export fn affective_core_embedded_import_brain(
     else
         null;
     const brain_id = maybe_brain_id orelse inspected.?.brain_id;
-    const brain_root = optionalNonEmptySlice(brain_root_ptr, brain_root_len) orelse ctx.brain.cfg.brain_root;
+    const brain_root = optionalNonEmptySlice(brain_root_ptr, brain_root_len) catch {
+        return invalidArgumentFailure(out_error, "invalid brain_root slice");
+    } orelse ctx.brain.cfg.brain_root;
     const manifest = brain_container.importBrain(ctx.allocator(), ctx.io(), brain_file_path, .{
         .brain_id = brain_id,
         .brain_root = brain_root,
@@ -537,7 +784,9 @@ pub export fn affective_core_embedded_import_brain(
     reloadEmbeddedBrain(ctx, manifest.brain_id, brain_root) catch |err| {
         return runtimeError(ctx, out_error, "embedded brain import reload failed", err);
     };
-    const host_id = optionalNonEmptySlice(host_id_ptr, host_id_len) orelse ctx.brain.currentHostId();
+    const host_id = optionalNonEmptySlice(host_id_ptr, host_id_len) catch {
+        return invalidArgumentFailure(out_error, "invalid host_id slice");
+    } orelse ctx.brain.currentHostId();
     const payload = if (host_id.len > 0)
         std.fmt.allocPrint(ctx.dispatchScratch(), "brain_id={s}; brain_root={s}; host_id={s}", .{ manifest.brain_id, brain_root, host_id }) catch ""
     else
@@ -556,10 +805,17 @@ pub export fn affective_core_embedded_api_e2e(
     out_data: ?*AffectiveCoreEmbeddedString,
     out_error: ?*AffectiveCoreEmbeddedString,
 ) c_int {
+    var export_guard = embedded_boundary.ExportGuard.init();
+    if (export_guard.panicked) return embeddedExportPanicFailure(out_error);
+    defer export_guard.deinit();
+
     setString(out_data, .{});
     setString(out_error, .{});
 
     const raw_config = config orelse return runtimeFailure(null, out_error, "missing embedded config");
+    embedded_config.validateEmbeddedConfig(raw_config.*) catch {
+        return invalidArgumentFailure(out_error, "invalid embedded config string field");
+    };
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -586,11 +842,11 @@ pub export fn affective_core_embedded_api_e2e(
     return success(null, out_data, copy);
 }
 
-fn syncContextBudgetFromConfig(ctx: *AffectiveCoreEmbedded, cfg: config_mod.Config, max_event_text_bytes: usize) void {
+fn syncContextBudgetFromHost(ctx: *AffectiveCoreEmbedded, manifest: embedded_protocol.HostManifest) void {
     ctx.context_budget = .{
-        .max_envelope_bytes = cfg.capacity.dispatch_envelope_bytes_max,
-        .max_event_count = cfg.capacity.dispatch_event_count_max,
-        .max_event_text_bytes = max_event_text_bytes,
+        .max_envelope_bytes = manifest.max_envelope_bytes,
+        .max_event_count = manifest.max_event_count,
+        .max_event_text_bytes = manifest.max_event_text_bytes,
     };
 }
 
@@ -620,9 +876,12 @@ pub fn reloadEmbeddedBrain(ctx: *AffectiveCoreEmbedded, brain_id: []const u8, br
         cfg,
         ctx.host_capabilities,
         hostSystemSensesHttpClient(&ctx.http_transport),
-        ctx.http_transport.services.http_post_json != null,
+        ctx.http_transport.hasAsyncHostHttp(),
     );
     ctx.brain = embedded_brain_host.brain;
+    ctx.brain.deps.stimulus_poll = AffectiveCoreEmbedded.pollStimulusInboxCallback;
+    ctx.brain.deps.stimulus_poll_ctx = ctx;
+    ctx.http_transport.owner = ctx;
     embedded_brain_host.chat_service.parse_failure_brain = &ctx.brain;
     embedded_brain_host.autonomy_planner.parse_failure_brain = &ctx.brain;
     ctx.llm_provider_clients = embedded_brain_host.llm_provider_clients;
@@ -633,7 +892,6 @@ pub fn reloadEmbeddedBrain(ctx: *AffectiveCoreEmbedded, brain_id: []const u8, br
         _ = try ctx.brain.refreshFacialExpressionCatalog();
     }
     ctx.brain_initialized = true;
-    syncContextBudgetFromConfig(ctx, cfg, ctx.context_budget.max_event_text_bytes);
 
     const payload = try std.fmt.allocPrint(brain_allocator, "brain_id={s}; brain_root={s}", .{ brain_id, brain_root });
     _ = try ctx.brain.recordSimpleExperienceEvent("Brain.RuntimeReloaded", .system, payload);
@@ -698,9 +956,21 @@ fn allocDispatchFailureMessage(ctx: *AffectiveCoreEmbedded, err: anyerror) ![]u8
     });
 }
 
-fn optionalNonEmptySlice(ptr: ?[*]const u8, len: usize) ?[]const u8 {
+fn optionalNonEmptySlice(ptr: ?[*]const u8, len: usize) !?[]const u8 {
     if (len == 0) return null;
-    return embedded_config.optionalSlice(ptr, len);
+    return try embedded_config.requiredSlice(ptr, len);
+}
+
+fn embeddedExportPanicFailure(out_error: ?*AffectiveCoreEmbeddedString) c_int {
+    std.log.err("embedded export panic: {s}", .{embedded_boundary.panicMessage()});
+    return runtimeFailure(null, out_error, embedded_boundary.panicMessage());
+}
+
+fn invalidArgumentFailure(out_error: ?*AffectiveCoreEmbeddedString, message: []const u8) c_int {
+    publishOwnedString(out_error, std.heap.page_allocator.dupe(u8, message) catch {
+        return @intFromEnum(AffectiveCoreEmbeddedStatus.invalid_argument);
+    });
+    return @intFromEnum(AffectiveCoreEmbeddedStatus.invalid_argument);
 }
 
 fn protocolError(
@@ -710,6 +980,7 @@ fn protocolError(
     code: []const u8,
     message: []const u8,
 ) c_int {
+    const timings_allocator = if (ctx.brain.request_timings.active) ctx.brain.allocator else std.heap.page_allocator;
     var timings = if (ctx.brain.request_timings.active)
         embedded_dispatch.finishDispatchTimings(ctx) catch {
             return runtimeFailure(ctx, null, "could not finish request timings for protocol error");
@@ -718,7 +989,7 @@ fn protocolError(
         request_timings.emptyReport(std.heap.page_allocator, request_id) catch {
             return runtimeFailure(ctx, null, "could not encode embedded protocol error");
         };
-    defer request_timings.deinitReport(std.heap.page_allocator, &timings);
+    defer request_timings.deinitReport(timings_allocator, &timings);
     const output = embedded_protocol.errorEnvelopeAlloc(std.heap.page_allocator, request_id, code, message, false, embedded_dispatch.emptyBudget(ctx), timings, ctx.brain.dispatchContextReportView()) catch {
         return runtimeFailure(ctx, null, "could not encode embedded protocol error");
     };

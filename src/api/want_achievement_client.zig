@@ -304,14 +304,7 @@ pub fn sanitizeWantAchievementMatches(
 ) !WantAchievementResult {
     var out = std.ArrayList(WantAchievementMatch).empty;
     for (result.matches) |match| {
-        const want = findWantCandidate(wants, match.memory_id) orelse {
-            try out.append(allocator, .{
-                .memory_id = try allocator.dupe(u8, match.memory_id),
-                .confidence = match.confidence,
-                .evidence = try allocator.dupe(u8, match.evidence),
-            });
-            continue;
-        };
+        const want = findWantCandidate(wants, match.memory_id) orelse continue;
         if (matchConfidenceLooksCopied(match, want, eval_metadata)) continue;
         if (match.confidence < 0.72) continue;
         if (!evidenceGroundedInEvent(event_text, match.evidence)) continue;
@@ -639,6 +632,22 @@ test "sanitize drops firmware deep work from creative want" {
         \\{"matches":[{"memory_id":"want_creative_momentum","confidence":0.84,"evidence":"stayed in flow on the firmware bug I had been avoiding"}]}
     );
     const filtered = try sanitizeWantAchievementMatches(allocator, firmware, firmware_event, wants[0..], null);
+    try std.testing.expectEqual(@as(usize, 0), filtered.matches.len);
+}
+
+test "sanitize drops unknown want ids" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const want = testerConnectionWant();
+    const wants = [_]WantCandidate{want};
+    const event =
+        \\Yesterday's argument hung over breakfast until we finally said what we meant. We talked about feeling like roommates lately and agreed to protect device-free evenings.
+    ;
+    const unknown = try parseWantAchievementResult(allocator,
+        \\{"matches":[{"memory_id":"want_missing","confidence":0.86,"evidence":"talked about feeling like roommates lately"}]}
+    );
+    const filtered = try sanitizeWantAchievementMatches(allocator, unknown, event, wants[0..], null);
     try std.testing.expectEqual(@as(usize, 0), filtered.matches.len);
 }
 

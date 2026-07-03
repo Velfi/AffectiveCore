@@ -39,7 +39,7 @@ pub const RandomProviderIdentityComparisonService = struct {
     fn compare(ctx: *anyopaque, allocator: std.mem.Allocator, current_description: []const u8, stored_description: []const u8) !IdentityComparison {
         const self: *RandomProviderIdentityComparisonService = @ptrCast(@alignCast(ctx));
         const system_prompt =
-            \\Compare two non-sensitive visual descriptions of people for household robot identity recognition.
+            \\Compare two non-sensitive visual descriptions of people for identity recognition.
             \\Use only visible non-sensitive appearance details such as clothing, accessories, carried items, hair/clothing changes, and posture.
             \\Do not infer or use race, ethnicity, gender identity, age, health, disability, attractiveness, emotion, or socioeconomic status.
             \\Return only JSON with keys: same_person, confidence, reason.
@@ -91,7 +91,7 @@ fn validateIdentityComparison(allocator: std.mem.Allocator, content: []const u8)
 
 pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.Scenario {
     const system_prompt =
-        \\Compare two non-sensitive visual descriptions of people for household robot identity recognition.
+        \\Compare two non-sensitive visual descriptions of people for identity recognition.
         \\Use only visible non-sensitive appearance details such as clothing, accessories, carried items, hair/clothing changes, and posture.
         \\Do not infer or use race, ethnicity, gender identity, age, health, disability, attractiveness, emotion, or socioeconomic status.
         \\Return only JSON with keys: same_person, confidence, reason.

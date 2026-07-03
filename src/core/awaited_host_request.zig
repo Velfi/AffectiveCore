@@ -37,6 +37,9 @@ pub fn clear(self: *Brain) void {
 }
 
 pub fn set(self: *Brain, sense: []const u8, purpose: []const u8) !void {
+    if (host_capability_activation.hostSenseReportedUnavailable(self, sense)) {
+        return error.HostSenseUnavailable;
+    }
     const decision = try host_capability_activation.resolvePullTimeoutMs(self, sense, purpose);
     clear(self);
     const request_id = if (self.current_dispatch_request_id) |id|
@@ -121,7 +124,14 @@ pub fn fulfillIfMatches(self: *Brain, sense: []const u8, purpose: []const u8) bo
 
 pub fn pullRequestedObservation(self: *Brain, sense: []const u8, purpose: []const u8) ![]const u8 {
     const decision = try host_capability_activation.resolvePullTimeoutMs(self, sense, purpose);
-    try set(self, sense, purpose);
+    set(self, sense, purpose) catch |err| switch (err) {
+        error.HostSenseUnavailable => return std.fmt.allocPrint(
+            self.allocator,
+            "host_sense_unavailable:\n- sense: {s}\n- purpose: {s}\n- note: the host reports this sense as disabled or unavailable; continue without it and do not wait. It may return when a capability_status marks it available again.\n",
+            .{ sense, purpose },
+        ),
+        else => return err,
+    };
     const request_id = self.awaited_host_request.?.request_id;
     return std.fmt.allocPrint(
         self.allocator,

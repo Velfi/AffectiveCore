@@ -153,7 +153,7 @@ test "trimToTokenBudget drops low rank sections" {
     };
     var observation_blocks = [_]context_composition.ContextBlock{
         .{ .kind = .{ .observation = .present_moment }, .text = "present_moment:\n- now\n", .rank = 100, .protected = true, .order_index = 2 },
-        .{ .kind = .{ .observation = .read_models_snapshot }, .text = "read_models_snapshot:\n- brain_mode: waking\n- salient_belief: none\n- strongest_self_trust: none\n- winning_disposition: none\n- current_focus: none\n- current_stimulus: none\n- host_capabilities: available=0 unavailable=0 degraded=0\n", .rank = 30, .protected = false, .order_index = 3 },
+        .{ .kind = .{ .observation = .read_models_snapshot }, .text = "read_models_snapshot:\n- I feel awake and present.\n- nothing stands out to me right now\n- No faculty feels especially trustworthy to me right now.\n- nothing stands out to me right now\n- Nothing has captured my focus yet.\n- nothing stands out to me right now\n- On this host, 0 senses feel reachable; 0 feel dulled or blocked.\n", .rank = 30, .protected = false, .order_index = 3 },
     };
     const trimmed = try context_composition.trimToTokenBudget(allocator, &memory_blocks, &observation_blocks, "hello", .heard_speech, 40);
     defer trimmed.deinit(allocator);

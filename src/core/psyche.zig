@@ -3,11 +3,13 @@ const ports = @import("ports.zig");
 const schema = ports.schema;
 const needs_mod = @import("needs.zig");
 const psyche_client = ports.psyche;
+const llm_voice = ports.llm_voice;
 
 pub const SharedInputs = struct {
     now: []const u8,
     control_capacity: f32,
     max_capacity: f32,
+    replenish_points_per_minute: f32 = 0,
     social_engagement: f32,
     consecutive_voluntary_speech: u32,
     mode: []const u8,
@@ -26,28 +28,53 @@ pub const SharedInputs = struct {
 
 pub fn formatSharedContext(allocator: std.mem.Allocator, inputs: SharedInputs) ![]const u8 {
     var out = std.ArrayList(u8).empty;
-    try out.print(
-        allocator,
-        "Shared psyche state:\n- time: {s}\n- autonomy_mode: {s}\n- control_capacity: {d:.2}/{d:.2}\n- social_engagement: {d:.2}\n- consecutive_voluntary_speech: {d}\n- sleeping: {any}\n- quiet_hours_active: {any}\n- autonomy_blocked: {s}\n- proactive_camera: forbidden\n- current_stimulus: {s}\n\nNeeds:\n",
-        .{ inputs.now, inputs.mode, inputs.control_capacity, inputs.max_capacity, inputs.social_engagement, inputs.consecutive_voluntary_speech, inputs.sleeping, inputs.quiet_hours_active, inputs.blocked, if (inputs.current_stimulus.len > 0) inputs.current_stimulus else "none" },
-    );
+    try out.appendSlice(allocator, "where_i_am_inside:\n");
+    try out.print(allocator, "- I feel it is {s}.\n", .{inputs.now});
+    const budget_line = try llm_voice.formatActionBudget(allocator, inputs.control_capacity, inputs.max_capacity, inputs.replenish_points_per_minute, inputs.sleeping);
+    defer allocator.free(budget_line);
+    try out.print(allocator, "- {s}\n", .{budget_line});
+    try out.print(allocator, "- My background agency compatibility setting on this host is {s}.\n", .{inputs.mode});
+    if (inputs.sleeping) {
+        try out.appendSlice(allocator, "- I am resting.\n");
+    }
+    if (inputs.quiet_hours_active) {
+        try out.appendSlice(allocator, "- Quiet hours feel active; I should keep outward initiative restrained.\n");
+    }
+    if (inputs.blocked.len > 0 and !std.mem.eql(u8, inputs.blocked, "none")) {
+        try out.print(allocator, "- Something is holding outward agency back: {s}\n", .{inputs.blocked});
+    }
+    if (inputs.current_stimulus.len > 0) {
+        try out.print(allocator, "- What is happening around me: {s}\n", .{inputs.current_stimulus});
+    } else {
+        try out.appendSlice(allocator, "- Nothing particular is pressing on me from outside right now.\n");
+    }
+    try out.print(allocator, "- Social appetite feels at {d:.0}% intensity; I have spoken voluntarily {d} times in a row. Contact is good when it is welcome; solitude is not punishment.\n", .{
+        inputs.social_engagement * 100.0,
+        inputs.consecutive_voluntary_speech,
+    });
+    try out.appendSlice(allocator, "\nwhat_pulls_at_me_now:\n");
     try appendTopNeeds(allocator, &out, inputs.needs, 5);
-    try out.print(allocator, "\nRelationship graph:\n{s}", .{inputs.relationship_graph});
-    try out.appendSlice(allocator, "\nRecent appraisals:\n");
+    try out.print(allocator, "\nwho_and_what_i_am_attached_to:\n{s}", .{inputs.relationship_graph});
+    try out.appendSlice(allocator, "\nrecent_feelings:\n");
     try appendRecentAppraisals(allocator, &out, inputs.appraisals, 4);
-    try out.appendSlice(allocator, "\nRecent impressions:\n");
+    try out.appendSlice(allocator, "\nrecent_impressions:\n");
     try appendRecentImpressions(allocator, &out, inputs.impressions, 4);
-    try out.print(allocator, "\nSuperego self-model:\n{s}", .{if (inputs.superego_self_model.len > 0) inputs.superego_self_model else "- none\n"});
-    try out.appendSlice(allocator, "\nSalient memories:\n");
+    try out.appendSlice(allocator, "\nwhat_i_hold_myself_to:\n");
+    if (inputs.superego_self_model.len > 0) {
+        try out.appendSlice(allocator, inputs.superego_self_model);
+    } else {
+        try out.print(allocator, "- {s}\n", .{llm_voice.empty_inner_state});
+    }
+    try out.appendSlice(allocator, "\nsalient_memories:\n");
     try appendSalientMemories(allocator, &out, inputs.memories, 6);
-    try out.print(allocator, "\nAutonomy skills:\n{s}", .{inputs.affordances});
+    try out.print(allocator, "\nwhat_i_can_do_through_this_host:\n{s}", .{inputs.affordances});
     return out.toOwnedSlice(allocator);
 }
 
 pub fn formatEgoContext(allocator: std.mem.Allocator, shared_context: []const u8, id: psyche_client.IdTurn, superego: psyche_client.SuperegoTurn) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
-        "Ego deliberation context:\n\n{s}\n\n{s}\n{s}\nEgo task:\n- Compare the Id and Superego simulations; note priority conflicts, causal disagreements, and meaning disagreements.\n- Apply system rules for capabilities, autonomy budget, and runtime gates.\n- Return autonomy JSON with an ordered action_pressures array (multi-step when needed).\n",
+        "Ego deliberation context:\n\n{s}\n\n{s}\n{s}\nEgo task:\n- Compare the Id and Superego simulations; note priority conflicts, causal disagreements, and meaning disagreements.\n- Apply system rules for capabilities, agency budget, boundaries, and runtime gates.\n- Return agency JSON with an ordered action_pressures array (multi-step when needed); speech is optional for ambient stimuli, but fresh unanswered speech directed at you deserves a deliberate choice about answering.\n",
         .{ shared_context, try psyche_client.formatIdTurn(allocator, id), try psyche_client.formatSuperegoTurn(allocator, superego) },
     );
 }
@@ -67,22 +94,16 @@ fn appendTopNeeds(allocator: std.mem.Allocator, out: *std.ArrayList(u8), needs: 
         for (needs) |need| {
             if (emitted >= limit) return;
             if (need.urgency != urgency) continue;
-            try out.print(allocator, "- {s}: urgency={s}; text={s}; evidence={s}; desired_action={s}\n", .{
-                need.need_id,
-                @tagName(need.urgency),
-                need.text,
-                need.evidence,
-                need.desired_action,
-            });
+            try llm_voice.formatNeedLine(allocator, out, need.need_id, need.text, @tagName(need.urgency), need.evidence, need.desired_action);
             emitted += 1;
         }
     }
-    if (emitted == 0) try out.appendSlice(allocator, "- none\n");
+    if (emitted == 0) try out.print(allocator, "- {s}\n", .{llm_voice.empty_inner_state});
 }
 
 fn appendRecentAppraisals(allocator: std.mem.Allocator, out: *std.ArrayList(u8), appraisals: []const schema.Appraisal, limit: usize) !void {
     if (appraisals.len == 0) {
-        try out.appendSlice(allocator, "- none\n");
+        try out.print(allocator, "- {s}\n", .{llm_voice.empty_inner_state});
         return;
     }
     const start = if (appraisals.len > limit) appraisals.len - limit else 0;
@@ -90,24 +111,15 @@ fn appendRecentAppraisals(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
     while (i > start) {
         i -= 1;
         const appraisal = appraisals[i];
-        try out.print(allocator, "- query={s}; label={s}; valence={d:.2}; arousal={d:.2}; uncertainty={d:.2}; stress={d:.2}; curiosity={d:.2}; action={s}; dynamics={s}; note={s}\n", .{
-            appraisal.query,
-            appraisal.feeling_label,
-            appraisal.valence,
-            appraisal.arousal,
-            appraisal.uncertainty,
-            appraisal.stress,
-            appraisal.curiosity,
-            appraisal.action_tendency,
-            appraisal.dynamics,
-            appraisal.freeform,
-        });
+        const line = try llm_voice.formatAppraisalLine(allocator, appraisal.query, appraisal.feeling_label, appraisal.freeform, appraisal.valence, appraisal.arousal);
+        defer allocator.free(line);
+        try out.print(allocator, "- {s}\n", .{line});
     }
 }
 
 fn appendRecentImpressions(allocator: std.mem.Allocator, out: *std.ArrayList(u8), impressions: []const schema.Impression, limit: usize) !void {
     if (impressions.len == 0) {
-        try out.appendSlice(allocator, "- none\n");
+        try out.print(allocator, "- {s}\n", .{llm_voice.empty_inner_state});
         return;
     }
     const start = if (impressions.len > limit) impressions.len - limit else 0;
@@ -115,13 +127,15 @@ fn appendRecentImpressions(allocator: std.mem.Allocator, out: *std.ArrayList(u8)
     while (i > start) {
         i -= 1;
         const impression = impressions[i];
-        try out.print(allocator, "- source={s}; salience={d:.2}; text={s}\n", .{ @tagName(impression.source), impression.salience, impression.text });
+        const line = try llm_voice.formatImpressionLine(allocator, @tagName(impression.source), impression.text, impression.salience);
+        defer allocator.free(line);
+        try out.print(allocator, "- {s}\n", .{line});
     }
 }
 
 fn appendSalientMemories(allocator: std.mem.Allocator, out: *std.ArrayList(u8), memories: []const schema.MemoryRecord, limit: usize) !void {
     if (memories.len == 0) {
-        try out.appendSlice(allocator, "- none\n");
+        try out.print(allocator, "- {s}\n", .{llm_voice.empty_inner_state});
         return;
     }
     var emitted: usize = 0;
@@ -133,14 +147,9 @@ fn appendSalientMemories(allocator: std.mem.Allocator, out: *std.ArrayList(u8), 
         }
         const index = best_index orelse break;
         const memory = memories[index];
-        try out.print(allocator, "- {s}: {s}; scope={s}; score={d}; salience={d:.2}; tags={s}\n", .{
-            memory.memory_id,
-            memoryInterpretation(memory),
-            @tagName(memory.scope),
-            memory.score,
-            memory.salience,
-            try joinTags(allocator, memory.tags),
-        });
+        const line = try llm_voice.formatSalientMemoryLine(allocator, memoryInterpretation(memory));
+        defer allocator.free(line);
+        try out.print(allocator, "- {s}\n", .{line});
     }
 }
 
@@ -155,16 +164,6 @@ fn memoryScore(memory: schema.MemoryRecord) f32 {
 fn memoryInterpretation(memory: schema.MemoryRecord) []const u8 {
     if (memory.interpretation.len > 0) return memory.interpretation;
     return memory.text;
-}
-
-fn joinTags(allocator: std.mem.Allocator, tags: []const []const u8) ![]const u8 {
-    if (tags.len == 0) return allocator.dupe(u8, "none");
-    var out = std.ArrayList(u8).empty;
-    for (tags, 0..) |tag, i| {
-        if (i > 0) try out.appendSlice(allocator, ",");
-        try out.appendSlice(allocator, tag);
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "shared context includes pertinent ranked data" {
@@ -188,8 +187,9 @@ test "shared context includes pertinent ranked data" {
     }};
     const text = try formatSharedContext(allocator, .{
         .now = "now",
-        .control_capacity = 0.64,
-        .max_capacity = 0.85,
+        .control_capacity = 5.0,
+        .max_capacity = 8.0,
+        .replenish_points_per_minute = 8.0,
         .social_engagement = 0.2,
         .consecutive_voluntary_speech = 1,
         .mode = "full",
@@ -203,8 +203,9 @@ test "shared context includes pertinent ranked data" {
         .appraisals = &.{},
         .impressions = &.{},
     });
-    try std.testing.expect(std.mem.indexOf(u8, text, "urgent: urgency=urgent") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "memory_self") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "where_i_am_inside:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "this feels urgent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "I remember:") != null);
 }
 
 test "ego context reconciles different salience causes and meanings" {
@@ -227,8 +228,7 @@ test "ego context reconciles different salience causes and meanings" {
         .salience = .high,
         .reason = "long-term trust matters",
     };
-    const text = try formatEgoContext(allocator, "Shared psyche state:\n- current_stimulus: new sound\n", id, superego);
+    const text = try formatEgoContext(allocator, "where_i_am_inside:\n- What is happening around me: new sound\n", id, superego);
     try std.testing.expect(std.mem.indexOf(u8, text, "Compare the Id and Superego simulations") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ordered action_pressures array") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "priority conflicts, causal disagreements, and meaning disagreements") != null);
 }

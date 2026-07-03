@@ -6,9 +6,6 @@ const skills = ports.skills;
 const maintenance = @import("maintenance.zig");
 
 pub const Settings = struct {
-    autonomy_mode: []const u8,
-    limited_threshold_bias: f32,
-    full_threshold_bias: f32,
     social_reserve: f32,
     safety_reserve: f32,
     opportunity_reserve: f32,
@@ -59,6 +56,7 @@ fn evaluateOne(
     state: maintenance.AutonomyState,
     settings: Settings,
 ) !Evaluation {
+    _ = settings;
     if (proposal.origin == .interaction) {
         const effort = skills.actionPointCost(proposal.action) catch 0;
         return .{
@@ -70,16 +68,6 @@ fn evaluateOne(
         };
     }
     const effort = try effortCost(proposal);
-    if (std.mem.eql(u8, settings.autonomy_mode, "off")) {
-        return .{
-            .index = index,
-            .proposal = proposal,
-            .pressure = pressure,
-            .passed = false,
-            .suppressed_reason = "autonomy mode off",
-            .effort_cost = effort,
-        };
-    }
     if (!maintenance.autonomyBudgetAvailable(state)) {
         return .{
             .index = index,
@@ -109,7 +97,7 @@ fn clamp01(value: f32) f32 {
     return value;
 }
 
-test "governor suppresses autonomy when off" {
+test "governor ignores legacy off mode when capacity is available" {
     const allocator = std.testing.allocator;
     const proposals = [_]chat.ActionProposal{.{ .action = .say, .origin = .autonomy, .text = "hello" }};
     const pressures = [_]schema.ActionPressure{.{
@@ -126,15 +114,12 @@ test "governor suppresses autonomy when off" {
         .control_capacity = 40,
         .max_capacity = 50,
     }, .{
-        .autonomy_mode = "off",
-        .limited_threshold_bias = 0.2,
-        .full_threshold_bias = 0.0,
         .social_reserve = 0.1,
         .safety_reserve = 0.2,
         .opportunity_reserve = 0.15,
     });
     defer allocator.free(evaluated);
-    try std.testing.expect(!evaluated[0].passed);
+    try std.testing.expect(evaluated[0].passed);
     try std.testing.expectEqual(@as(f32, 3), evaluated[0].effort_cost);
 }
 
@@ -155,9 +140,6 @@ test "governor suppresses autonomy when overdrawn" {
         .control_capacity = -3,
         .max_capacity = 50,
     }, .{
-        .autonomy_mode = "full",
-        .limited_threshold_bias = 0.0,
-        .full_threshold_bias = 0.0,
         .social_reserve = 0.1,
         .safety_reserve = 0.2,
         .opportunity_reserve = 0.15,
@@ -184,9 +166,6 @@ test "governor suppresses autonomy at zero capacity" {
         .control_capacity = 0,
         .max_capacity = 50,
     }, .{
-        .autonomy_mode = "full",
-        .limited_threshold_bias = 0.0,
-        .full_threshold_bias = 0.0,
         .social_reserve = 0.1,
         .safety_reserve = 0.2,
         .opportunity_reserve = 0.15,

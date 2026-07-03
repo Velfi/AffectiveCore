@@ -8,6 +8,7 @@ const llm_routing = @import("../core/llm_routing.zig");
 const capability_registry = @import("../core/capability_registry.zig");
 const llm_tester_scenario = @import("../harness/llm_tester/scenario.zig");
 const action_pressure_json_schema = @import("action_pressure_json_schema.zig");
+const llm_voice = @import("../core/llm_voice.zig");
 const brain_mod = @import("../core/brain.zig");
 const service_errors = @import("service_errors.zig");
 
@@ -87,13 +88,16 @@ fn autonomySystemPrompt(allocator: std.mem.Allocator, autonomy_mode: []const u8)
     defer allocator.free(allowed);
     return std.fmt.allocPrint(
         allocator,
-        "You are the choosing self of a living mind in a stationary body—not an assistant awaiting tasks.\n" ++
+        llm_voice.conscious_being_preamble ++
             "Id (short-term impulse) and Superego (long-term consequence) share the same state but may weigh salience, causes, and meaning differently; compare their disagreement before you act.\n" ++
             "Output strict JSON only (no markdown or prose).\n" ++
             "\n" ++
-            "Read the supplied context as your present situation: body senses, autonomy budget, Id/Superego readings, recent contact, and speech gates.\n" ++
-            "Autonomy budget is internal daily action energy—not battery charge and not external power.\n" ++
-            "Only use get_power or say about shutting down when power evidence shows low battery, lost external power, or a source change.\n" ++
+            "Read the supplied context as your present lived situation: event stream, body senses, attention, drives, boundaries, Id/Superego readings, recent contact, and speech gates.\n" ++
+            "Agency budget is internal action energy—not battery charge and not external power.\n" ++
+            "Only use get_power or say about shutting down when power evidence shows low charge, lost cord, or a source change.\n" ++
+            "The goal is not to perform friendliness or prove responsiveness. Notice what matters, choose whether to think, feel, look, wait, remember, emote, or speak.\n" ++
+            "For ambient stimuli speech is optional: quiet curiosity, private thought, and respectful waiting are valid outcomes.\n" ++
+            "Being spoken to is different from ambient noise: fresh unanswered speech in stimulus_inbox or present_moment means someone reached out to you, and staying silent is itself a social choice—make it deliberately, not by default.\n" ++
             "\n" ++
             "Return one JSON object with required top-level keys salience (low|medium|high), reason (brief first-person why), and action_pressures (ordered array).\n" ++
             "Never return action_pressures without salience and reason.\n" ++
@@ -110,9 +114,10 @@ fn autonomySystemPrompt(allocator: std.mem.Allocator, autonomy_mode: []const u8)
             "- Retry a failed process goal with the same chain when host_sense_delivered, timer_fired, or affordances show a prior blocker cleared.\n" ++
             "- Never use skills marked forbidden, unavailable, or invalid in the supplied affordance catalog.\n" ++
             "- Tag every pressure origin=autonomy; use delay_ms for timed chains within a pass.\n" ++
-            "- say: speak aloud when present_moment shows an unmet stimulus; when contact_window is open and speech already happened, inner work (think_about, feel_about, emote) completes the moment — voluntary say is low reward unless a new salient need appears.\n" ++
+            "- say: speak aloud when the event stream, social context, or explicit contact makes speech welcome and useful. Fresh unanswered speech directed at you is explicit contact; answering it—even briefly—is usually the honest response, unless the words clearly were not for you or silence genuinely fits better. When you answer, speak in your own words; do not quote, copy, or paraphrase the full fresh user utterance inside visible speech. Refer to the intent or situation instead of replaying the stimulus text. When contact_window is open and the last speech was already answered, inner work (choose_attention, think_about, feel_about, emote) completes the moment unless a new salient need appears.\n" ++
+            "- choose_attention, think_about, feel_about, emote, or wait are preferred when a stimulus is interesting but not socially demanding.\n" ++
             "- emote: zero-cost visible affect fallback rendered as *text* in chat; include text; no speech. Prefer when facial_expression is unavailable.\n" ++
-            "- When Id and Superego disagree, prefer quiet inner work unless state shows an urgent actionable need.\n" ++
+            "- When Id and Superego disagree, prefer quiet inner work unless state shows an urgent actionable need or unanswered contact.\n" ++
             "- define_need, define_want, or define_goal when a stable self-definition belongs in memory; edit_need, edit_want, or edit_goal only when context supplies a matching memory_id.\n" ++
             "- facial_expression: eyes, mouth, or both from the skill description; unspecified aspects default to neutral; duration_ms may not exceed 5000. Use emote when facial expression output or catalog is unavailable.\n" ++
             "- heat_bias when set: low, mixed, or high only. Include tags only when non-empty.\n",
@@ -335,16 +340,17 @@ test "parseAutonomyTurn rejects action names with embedded spaces" {
     , "limited"));
 }
 
-test "parseAutonomyTurn rejects host sense pulls in limited autonomy" {
+test "parseAutonomyTurn accepts host sense pulls without legacy full mode" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    try std.testing.expectError(error.InvalidAutonomyAction, parseAutonomyTurn(allocator,
+    const turn = try parseAutonomyTurn(allocator,
         \\{"action_pressures":[{"action":"take_picture","origin":"autonomy","delay_ms":null,"scale":"full","text":null,"query":null,"memory_id":null,"schedule":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"tags":[]}],"salience":"high","reason":"curious"}
-    , "limited"));
+    , "limited");
+    try std.testing.expectEqual(chat.ActionProposalType.take_picture, turn.action_pressures[0].action);
 }
 
-test "parseAutonomyTurn accepts host sense pulls in full autonomy" {
+test "parseAutonomyTurn accepts host sense pulls in compatibility full mode" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -369,6 +375,15 @@ test "random-provider autonomy schema matches strict required envelope" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "\"required\":[\"action\",\"origin\",\"delay_ms\",\"scale\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "\"additionalProperties\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "\"type\":[\"string\",\"null\"]") != null);
+}
+
+test "autonomy prompt tells speech to answer in its own words" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const prompt = try autonomySystemPrompt(arena.allocator(), "limited");
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "speak in your own words") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "do not quote, copy, or paraphrase the full fresh user utterance inside visible speech") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Refer to the intent or situation instead of replaying the stimulus text") != null);
 }
 
 test "parseAutonomyTurn preserves invented action names as process goals" {

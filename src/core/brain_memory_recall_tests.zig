@@ -256,10 +256,10 @@ test "recall ranks memories with vector similarity" {
     });
 
     const text = try brain.recallMemories("morning plant care", &[_][]const u8{});
-    const plant_index = std.mem.indexOf(u8, text, "memory_plants") orelse return error.MissingPlantMemory;
-    const music_index = std.mem.indexOf(u8, text, "memory_music") orelse text.len;
+    const plant_index = std.mem.indexOf(u8, text, "morning checks") orelse return error.MissingPlantMemory;
+    const music_index = std.mem.indexOf(u8, text, "quiet piano music") orelse text.len;
     try std.testing.expect(plant_index < music_index);
-    try std.testing.expect(std.mem.indexOf(u8, text, "vector_score=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "I remember:") != null);
     try std.testing.expectEqual(@as(u32, 1), store.memories.items[0].access_count);
 }
 
@@ -284,7 +284,7 @@ test "recall lazily indexes old vectorless memories" {
     try std.testing.expectEqual(@as(usize, 0), store.memories.items[0].vector.len);
 
     const text = try brain.recallMemories("concise preference", &[_][]const u8{"preference"});
-    try std.testing.expect(std.mem.indexOf(u8, text, "memory_old") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "I remember: Zelda prefers concise answers") != null);
     try std.testing.expectEqual(brain.deps.embedding_service.dimensions(), store.memories.items[0].vector.len);
     try std.testing.expectEqual(@as(u32, 1), store.memories.items[0].access_count);
     try std.testing.expect(store.memories.items[0].score > 1);
@@ -309,7 +309,7 @@ test "recall with no query or tags does not access every memory" {
     });
 
     const text = try brain.recallMemories("  ", &[_][]const u8{});
-    try std.testing.expect(std.mem.indexOf(u8, text, "- none") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "nothing stands out to me right now") != null);
     try std.testing.expectEqual(@as(u32, 0), store.memories.items[0].access_count);
     try std.testing.expectEqual(@as(usize, 0), store.impressions.items.len);
 }
@@ -343,8 +343,8 @@ test "recall respects explicit tag filters" {
     });
 
     const text = try brain.recallMemories("plants morning", &[_][]const u8{"work"});
-    try std.testing.expect(std.mem.indexOf(u8, text, "memory_work") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "memory_home") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Plants need morning checks at work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Plants need morning checks at home") == null);
     try std.testing.expectEqual(@as(u32, 0), store.memories.items[0].access_count);
     try std.testing.expectEqual(@as(u32, 1), store.memories.items[1].access_count);
 }

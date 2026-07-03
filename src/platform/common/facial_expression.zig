@@ -2,7 +2,6 @@ const facial_expression = @import("../../core/port_facial_expression.zig");
 
 pub const default_duration_ms = facial_expression.default_duration_ms;
 pub const max_duration_ms = facial_expression.max_duration_ms;
-pub const autonomy_cooldown_seconds = facial_expression.autonomy_cooldown_seconds;
 pub const EyeSprite = facial_expression.EyeSprite;
 pub const MouthSprite = facial_expression.MouthSprite;
 pub const eye_sprites = facial_expression.eye_sprites;

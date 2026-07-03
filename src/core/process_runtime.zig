@@ -237,11 +237,16 @@ pub fn abortActiveProcessForInterrupt(self: *Brain, reason: []const u8) !void {
 fn freeProcessStep(allocator: std.mem.Allocator, step: ProcessStep) void {
     if (step.sense) |sense| allocator.free(sense);
     if (step.purpose) |purpose| allocator.free(purpose);
+    if (step.stimulus_signature) |signature| allocator.free(signature);
     if (step.respond_text) |value| allocator.free(value);
     if (step.timer_intent) |intent| allocator.free(intent);
 }
 
-pub fn startProcess(
+pub fn freeProcessStepFields(allocator: std.mem.Allocator, step: ProcessStep) void {
+    freeProcessStep(allocator, step);
+}
+
+pub fn startProcessUnchecked(
     self: *Brain,
     goal: []const u8,
     user_anchor: []const u8,
@@ -249,7 +254,55 @@ pub fn startProcess(
     composition_reason: ?[]const u8,
     steps: []ProcessStep,
 ) !void {
-    if (self.active_process != null) return error.NestedProcessGoal;
+    try startProcessIntoSlot(self, goal, user_anchor, origin, composition_reason, steps, .primary);
+}
+
+pub fn startSecondaryProcess(
+    self: *Brain,
+    goal: []const u8,
+    user_anchor: []const u8,
+    origin: chat_mod.ActionOrigin,
+    composition_reason: ?[]const u8,
+    steps: []ProcessStep,
+) !void {
+    const id = try operation_ids.allocProcessId(self, goal);
+    const owned_steps = try self.allocator.alloc(ProcessStep, steps.len);
+    for (steps, 0..) |step, index| {
+        owned_steps[index] = try cloneProcessStep(self.allocator, step);
+    }
+    const step_ids = try operation_ids.allocStepIds(self.allocator, id, steps.len);
+    errdefer {
+        for (step_ids) |step_id| self.allocator.free(step_id);
+        self.allocator.free(step_ids);
+    }
+    const process: ActiveProcess = .{
+        .id = id,
+        .goal = try self.allocator.dupe(u8, goal),
+        .user_anchor = try self.allocator.dupe(u8, user_anchor),
+        .origin = origin,
+        .steps = owned_steps,
+        .step_ids = step_ids,
+        .step_index = 0,
+        .state = .running,
+        .started_at = self.now_seconds,
+        .timeout_deadline_seconds = null,
+        .composition_reason = if (composition_reason) |reason| try self.allocator.dupe(u8, reason) else null,
+    };
+    try self.work_registry.registerSecondary(self.allocator, process);
+    try logProcessEvent(self, "process.start.side_lane", try formatProcessStartBody(self, goal, steps, composition_reason));
+    self.traceText("process.start.side_lane", goal);
+}
+
+fn startProcessIntoSlot(
+    self: *Brain,
+    goal: []const u8,
+    user_anchor: []const u8,
+    origin: chat_mod.ActionOrigin,
+    composition_reason: ?[]const u8,
+    steps: []ProcessStep,
+    slot: enum { primary, secondary },
+) !void {
+    _ = slot;
     const id = try operation_ids.allocProcessId(self, goal);
     const owned_steps = try self.allocator.alloc(ProcessStep, steps.len);
     for (steps, 0..) |step, index| {
@@ -275,6 +328,22 @@ pub fn startProcess(
     };
     try logProcessEvent(self, "process.start", try formatProcessStartBody(self, goal, steps, composition_reason));
     self.traceText("process.start", goal);
+}
+
+pub fn startProcess(
+    self: *Brain,
+    goal: []const u8,
+    user_anchor: []const u8,
+    origin: chat_mod.ActionOrigin,
+    composition_reason: ?[]const u8,
+    steps: []ProcessStep,
+) !void {
+    if (self.active_process != null) {
+        if (!self.work_registry.slotAvailable()) return error.NestedProcessGoal;
+        try startSecondaryProcess(self, goal, user_anchor, origin, composition_reason, steps);
+        return;
+    }
+    try startProcessUnchecked(self, goal, user_anchor, origin, composition_reason, steps);
 }
 
 fn cloneProcessStep(allocator: std.mem.Allocator, step: ProcessStep) !ProcessStep {

@@ -70,6 +70,8 @@ Each **sighting** is a timestamped visual encounter — sometimes kept as a phot
 | **Typed message** | Same path — text is the stimulus |
 | **Dropped audio file** | Classified first — speech may be transcribed; music stays music |
 
+Every stimulus — speech, typing, touch, senses, reactions — enters through one gate, where the dual-process model (novelty, habituation, sensitization) scores its salience before it joins the attention queue. Speech in several small messages coalesces: while typing activity signals more is coming (bounded by `stimulus_quiescence_seconds` and `stimulus_coalesce_max_wait_seconds`), the brain holds, then answers the whole burst in **one** deliberation. Fragments that arrive while the brain is already mid-thought merge into a single follow-up rather than triggering a reply per message.
+
 Output:
 
 | Skill | Effect |
@@ -120,7 +122,7 @@ The brain can check its own housekeeping:
 | **get database stats** | Memory database health |
 | **request orientation** | Which way the device is tilted (some hosts) |
 
-These matter for autonomy — a brain low on battery may choose differently than one comfortably plugged in.
+These matter for attention and agency — a brain low on battery may choose differently than one comfortably plugged in.
 
 ---
 

@@ -62,7 +62,7 @@ test "conversation memory selection adds relevant_memories and observation" {
     try memory_selection_mod.appendMemorySelectionObservation(allocator, &observations, selection);
 
     try std.testing.expect(std.mem.indexOf(u8, memory, "relevant_memories:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, memory, "vector-ranked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "feel relevant") != null);
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "memory_selection:") != null);
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "want_recognition") != null);
 }

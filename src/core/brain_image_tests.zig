@@ -160,7 +160,7 @@ test "compare image action requires stored visual observation" {
     _ = try brain.executeActionProposals(commands[0..], &observations);
 
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "skill_failed: compare_images: unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "no previous retained visual observation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "I have no previous retained image on this host") != null);
 }
 
 test "imagine_image action calls image generation service" {

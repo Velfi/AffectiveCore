@@ -26,7 +26,7 @@ While dreaming, **conversation and most outward action pause**. You are not igno
 Dream Time starts when:
 
 - A **maintenance schedule** line comes due (*request dream time*)  
-- The brain **requests** it itself during autonomy  
+- The brain **requests** it itself during background attention  
 - An external tool asks for consolidation  
 
 ```mermaid
@@ -142,7 +142,7 @@ Mailbox content might be reflective, practical, or odd — especially after a hi
 
 ## Waking up
 
-**Waking up** is a brief transition mode — not fully alert yet. Then **waking** returns: conversation, senses, and autonomy (if enabled) resume.
+**Waking up** is a brief transition mode — not fully alert yet. Then **waking** returns: conversation, senses, and background attention resume.
 
 ```mermaid
 stateDiagram-v2

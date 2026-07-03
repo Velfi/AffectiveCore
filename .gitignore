@@ -19,11 +19,9 @@ data/events.jsonl
 data/email.json
 data/runtime_options.json
 data/brains/
-data/memory/*.json
-data/memory/*.sqlite*
-data/memory/face_embeddings/
 data/audio/
 data/captures/
+data/affective-mcp/
 
 # Test outputs
 data/test/**
@@ -42,3 +40,4 @@ data/test/**
 .DS_Store
 .idea/
 .vscode/
+

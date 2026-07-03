@@ -375,6 +375,7 @@ fn initMemorySchema(allocator: std.mem.Allocator, db: *sqlite3) !void {
         \\  data_json TEXT NOT NULL
         \\);
     );
+    try execSql(allocator, db, "PRAGMA journal_mode=WAL;");
 }
 
 fn writeCognitiveJsonToDb(allocator: std.mem.Allocator, db: *sqlite3, json: []const u8) !void {

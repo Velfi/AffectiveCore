@@ -8,6 +8,17 @@
 extern "C" {
 #endif
 
+// Ownership and threading contract:
+// - Input slices (config strings, request_json, file paths) are borrowed only for the
+//   duration of each call. Host memory must stay valid until the call returns.
+// - Output strings in out_data/out_error are allocated by the core. The host must call
+//   affective_core_embedded_free_global_string exactly once on each non-empty output.
+// - Host callbacks must allocate out_data/out_error/out_request_id via host memory;
+//   the core frees them through free_string.
+// - Each handle allows one in-flight mutating call at a time, except ingest-eligible and
+//   queueable messages accepted while busy (see embedded dispatch queue policy).
+// - Host HTTP uses async begin/poll only. There is no synchronous http_post_json path.
+
 typedef struct AffectiveCoreEmbedded AffectiveCoreEmbedded;
 
 typedef struct AffectiveCoreEmbeddedString {
@@ -30,11 +41,22 @@ typedef struct AffectiveCoreEmbeddedConfig {
     AffectiveCoreEmbeddedString host_manifest_json;
 } AffectiveCoreEmbeddedConfig;
 
-typedef int (*AffectiveCoreEmbeddedHttpPostJsonFn)(
+#define AFFECTIVE_CORE_HOST_HTTP_POLL_COMPLETE 0
+#define AFFECTIVE_CORE_HOST_HTTP_POLL_FAILED 1
+#define AFFECTIVE_CORE_HOST_HTTP_POLL_PENDING 2
+
+typedef int (*AffectiveCoreEmbeddedHttpPostJsonBeginFn)(
     void *ctx,
     AffectiveCoreEmbeddedString url,
     AffectiveCoreEmbeddedString headers_json,
     AffectiveCoreEmbeddedString body,
+    AffectiveCoreEmbeddedString *out_request_id,
+    AffectiveCoreEmbeddedString *out_error
+);
+
+typedef int (*AffectiveCoreEmbeddedHttpPostJsonPollFn)(
+    void *ctx,
+    AffectiveCoreEmbeddedString request_id,
     AffectiveCoreEmbeddedString *out_data,
     AffectiveCoreEmbeddedString *out_error
 );
@@ -44,10 +66,17 @@ typedef void (*AffectiveCoreEmbeddedFreeHostStringFn)(
     AffectiveCoreEmbeddedString string
 );
 
+typedef void (*AffectiveCoreEmbeddedOnHostEventsFn)(
+    void *ctx,
+    AffectiveCoreEmbeddedString events_json
+);
+
 typedef struct AffectiveCoreEmbeddedHostServices {
     void *ctx;
-    AffectiveCoreEmbeddedHttpPostJsonFn http_post_json;
+    AffectiveCoreEmbeddedHttpPostJsonBeginFn http_post_json_begin;
+    AffectiveCoreEmbeddedHttpPostJsonPollFn http_post_json_poll;
     AffectiveCoreEmbeddedFreeHostStringFn free_string;
+    AffectiveCoreEmbeddedOnHostEventsFn on_host_events;
 } AffectiveCoreEmbeddedHostServices;
 
 typedef enum AffectiveCoreEmbeddedStatus {
@@ -66,8 +95,6 @@ int affective_core_embedded_create(
 
 void affective_core_embedded_destroy(AffectiveCoreEmbedded *handle);
 
-// Each handle allows one in-flight mutating call at a time. Concurrent dispatch,
-// drain, raw_ref_lookup, export, or import on the same handle returns runtime_error.
 void affective_core_embedded_free_global_string(AffectiveCoreEmbeddedString string);
 
 int affective_core_embedded_dispatch_json(
@@ -79,6 +106,12 @@ int affective_core_embedded_dispatch_json(
 );
 
 int affective_core_embedded_drain_events_json(
+    AffectiveCoreEmbedded *handle,
+    AffectiveCoreEmbeddedString *out_data,
+    AffectiveCoreEmbeddedString *out_error
+);
+
+int affective_core_embedded_try_drain_events_json(
     AffectiveCoreEmbedded *handle,
     AffectiveCoreEmbeddedString *out_data,
     AffectiveCoreEmbeddedString *out_error

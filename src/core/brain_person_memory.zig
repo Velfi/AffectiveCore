@@ -58,10 +58,8 @@ const speech_audio_suffix = brain_mod.speech_audio_suffix;
 const speech_transcription_json_suffix = brain_mod.speech_transcription_json_suffix;
 pub fn recognitionAlreadyInObservations(self: *Brain, observations: []const u8) bool {
     if (std.mem.indexOf(u8, observations, "Current speaker recognition:") == null) return false;
-    if (self.last_visual_observation_path) |path| {
-        return std.mem.indexOf(u8, observations, path) != null;
-    }
-    return true;
+    const path = self.last_visual_observation_path orelse return false;
+    return std.mem.indexOf(u8, observations, path) != null;
 }
 
 pub fn recognitionRecentObservationNote(self: *Brain, observations: []const u8) ![]const u8 {

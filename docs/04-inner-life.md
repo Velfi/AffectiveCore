@@ -68,7 +68,6 @@ Your brain can define its own **inner directives**. These are not commands you i
 
 | Type | Character |
 |------|-----------|
-| **System needs** | Built-in drives — interaction, attachment, power continuity |
 | **Self-needs** | Defined needs stored as memory |
 | **Self-wants** | Ongoing desires — may be achievement or maintenance |
 | **Self-goals** | Broader aims with different semantics |

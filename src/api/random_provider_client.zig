@@ -4,6 +4,7 @@ const http_transport = @import("http_transport.zig");
 const http_log = @import("http_log.zig");
 const llm_routing = @import("../core/llm_routing.zig");
 const brain_context_stats = @import("../core/brain_context_stats.zig");
+const json_string = @import("json_string.zig");
 pub const Provider = llm_routing.Provider;
 pub const EffortTier = llm_routing.EffortTier;
 pub const LlmQuality = llm_routing.LlmQuality;
@@ -93,8 +94,8 @@ pub const RandomProviderClient = struct {
     llm_quality: LlmQuality,
     models_spec: []const u8,
     stats_recorder: ?LlmStatsRecorder = null,
-    /// When set, HTTP response bodies from `completeText` / `completeVision` are allocated here.
-    /// Free with `freeHttpResponse`, not the caller's persistent allocator.
+    /// When set, HTTP response bodies from `completeText` / `completeVision` are allocated here
+    /// and reclaimed by the arena reset at the dispatch boundary. Do not call `free` on them.
     http_response_allocator: ?std.mem.Allocator = null,
 
     pub fn init(io: std.Io, http: http_transport.Client, models_spec: []const u8) RandomProviderClient {
@@ -124,7 +125,9 @@ pub const RandomProviderClient = struct {
     }
 
     pub fn freeHttpResponse(self: *RandomProviderClient, allocator: std.mem.Allocator, content: []const u8) void {
-        self.responseAllocator(allocator).free(content);
+        if (self.http_response_allocator == null) {
+            allocator.free(content);
+        }
     }
 
     fn effectiveRoster(self: *RandomProviderClient, allocator: std.mem.Allocator) !llm_routing.LlmRoster {
@@ -258,17 +261,19 @@ pub const RandomProviderClient = struct {
 
 pub fn prepareTextRequest(client: *RandomProviderClient, allocator: std.mem.Allocator, request: TextRequest) !PreparedTextRequest {
     const models_spec = try client.resolvedModelsSpec(allocator, request.subsystem, request.effort_tier);
-    const tier = request.effort_tier orelse llm_routing.defaultEffortTierForSubsystem(request.subsystem);
+    const requested_tier = request.effort_tier orelse llm_routing.defaultEffortTierForSubsystem(request.subsystem);
+    const effective_tier = llm_routing.clampEffortTier(client.llm_quality, requested_tier);
     const primary = try primaryResolvedModel(allocator, models_spec);
     const reasoning_effort = llm_routing.clampReasoningEffort(client.llm_quality, request.reasoning_effort);
     var routed = request;
+    routed.effort_tier = effective_tier;
     routed.reasoning_effort = reasoning_effort;
     return .{
         .routed = routed,
         .models_spec = models_spec,
         .primary_provider = primary.provider,
         .primary_model = primary.model,
-        .tier_name = @tagName(tier),
+        .tier_name = @tagName(effective_tier),
         .reasoning_effort_name = if (reasoning_effort) |effort| @tagName(effort) else null,
         .request_bytes = request.system_prompt.len + request.user_prompt.len,
     };
@@ -297,9 +302,12 @@ pub fn buildHostLLMCompleteBody(allocator: std.mem.Allocator, models_spec: []con
     else
         "null";
     defer if (request.reasoning_effort != null) allocator.free(reasoning_effort_json);
+    const effort_tier = request.effort_tier orelse llm_routing.defaultEffortTierForSubsystem(request.subsystem);
+    const effort_tier_json = try jsonString(allocator, @tagName(effort_tier));
+    defer allocator.free(effort_tier_json);
     return std.fmt.allocPrint(
         allocator,
-        "{{\"subsystem\":{s},\"models\":{s},\"system_prompt\":{s},\"user_prompt\":{s},\"response_format\":{s},\"response_size\":{s},\"reasoning_effort\":{s},\"temperature\":{d:.3},\"max_tokens\":{d},\"json_schema\":{s}}}",
+        "{{\"subsystem\":{s},\"models\":{s},\"system_prompt\":{s},\"user_prompt\":{s},\"response_format\":{s},\"response_size\":{s},\"effort_tier\":{s},\"reasoning_effort\":{s},\"temperature\":{d:.3},\"max_tokens\":{d},\"json_schema\":{s}}}",
         .{
             try jsonString(allocator, request.subsystem),
             models_json,
@@ -307,6 +315,7 @@ pub fn buildHostLLMCompleteBody(allocator: std.mem.Allocator, models_spec: []con
             try jsonString(allocator, request.user_prompt),
             try jsonString(allocator, @tagName(request.response_format)),
             try jsonString(allocator, @tagName(request.response_size)),
+            effort_tier_json,
             reasoning_effort_json,
             request.temperature,
             maxTokens(request.response_size),
@@ -432,7 +441,7 @@ fn maxTokens(size: ResponseSize) u32 {
 }
 
 fn jsonString(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    return std.json.Stringify.valueAlloc(allocator, text, .{});
+    return json_string.jsonString(allocator, text);
 }
 
 test "provider roster accepts all configured providers" {
@@ -495,6 +504,7 @@ test "default random provider construction routes text through host" {
     try std.testing.expect(std.mem.indexOf(u8, transport.body, "\"system_prompt\":\"system rules\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.body, "\"user_prompt\":\"hello\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.body, "\"reasoning_effort\":\"medium\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.body, "\"effort_tier\":\"standard\"") != null);
 }
 
 test "default random provider construction routes vision through host" {

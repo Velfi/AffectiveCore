@@ -196,10 +196,41 @@ pub fn requiredSlice(ptr: ?[*]const u8, len: usize) ![]const u8 {
     return start[0..len];
 }
 
-pub fn optionalSlice(ptr: ?[*]const u8, len: usize) ?[]const u8 {
-    if (len == 0) return "";
-    const start = ptr orelse return null;
-    return start[0..len];
+/// Borrowed slice for host-provided `AffectiveCoreEmbeddedString` values.
+pub fn validatedStringSlice(string: AffectiveCoreEmbeddedString) ![]const u8 {
+    if (string.len == 0) return "";
+    const ptr = string.ptr orelse return error.InvalidEmbeddedString;
+    return ptr[0..string.len];
+}
+
+pub fn validateEmbeddedConfig(raw: AffectiveCoreEmbeddedConfig) !void {
+    _ = try validatedStringSlice(raw.brain_id);
+    _ = try validatedStringSlice(raw.brain_root);
+    _ = try validatedStringSlice(raw.conversation_models);
+    _ = try validatedStringSlice(raw.conversation_reasoning_effort);
+    _ = try validatedStringSlice(raw.image_generation_model);
+    _ = try validatedStringSlice(raw.image_generation_output_dir);
+    _ = try validatedStringSlice(raw.face_embeddings_dir);
+
+    const host_manifest_json = try validatedStringSlice(raw.host_manifest_json);
+    if (host_manifest_json.len == 0) return error.EmptyEmbeddedString;
+
+    const memory_path = try validatedStringSlice(raw.memory_path);
+    if (memory_path.len == 0) return error.EmptyEmbeddedString;
+
+    const graph_path = try validatedStringSlice(raw.graph_path);
+    if (graph_path.len == 0) return error.EmptyEmbeddedString;
+
+    const schedule_path = try validatedStringSlice(raw.schedule_path);
+    if (schedule_path.len == 0) return error.EmptyEmbeddedString;
+
+    const maintenance_state_path = try validatedStringSlice(raw.maintenance_state_path);
+    if (maintenance_state_path.len == 0) return error.EmptyEmbeddedString;
+}
+
+pub fn optionalSlice(ptr: ?[*]const u8, len: usize) !?[]const u8 {
+    if (len == 0) return null;
+    return try requiredSlice(ptr, len);
 }
 
 pub fn stringSlice(string: AffectiveCoreEmbeddedString) ?[]const u8 {

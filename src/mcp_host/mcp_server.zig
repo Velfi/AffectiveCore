@@ -15,39 +15,64 @@ pub fn run(init: std.process.Init, session: *session_mod.Session) !void {
     const stdin_reader = &stdin_file_reader.interface;
 
     while (try readMessage(allocator, stdin_reader)) |request_bytes| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, request_bytes, .{});
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, request_bytes, .{}) catch {
+            const response = try std.json.Stringify.valueAlloc(allocator, ErrorResponse{ .id = .null, .@"error" = .{ .code = -32700, .message = "parse error" } }, .{});
+            try sendMessage(init.io, response);
+            continue;
+        };
         defer parsed.deinit();
-        if (try handleRequest(allocator, init.io, session, parsed.value)) |response| {
+        if (try handleRequest(allocator, session, parsed.value)) |response| {
             try sendMessage(init.io, response);
         }
     }
 }
 
-fn handleRequest(allocator: std.mem.Allocator, io: std.Io, session: *session_mod.Session, request: std.json.Value) !?[]u8 {
+pub const RequestShape = union(enum) {
+    initialize: std.json.Value,
+    tools_list: std.json.Value,
+    tools_call: struct { id: std.json.Value, name: []const u8, arguments: std.json.Value },
+    notification,
+    invalid: struct { id: std.json.Value, code: i32, message: []const u8 },
+};
+
+pub fn classifyRequest(request: std.json.Value) RequestShape {
+    if (request != .object) return .{ .invalid = .{ .id = .null, .code = -32600, .message = "request must be an object" } };
     const object = request.object;
-    const method = object.get("method").?.string;
-    const id = object.get("id") orelse .null;
-    if (std.mem.eql(u8, method, "initialize")) {
-        return try std.json.Stringify.valueAlloc(allocator, InitializeResponse{ .id = id }, .{});
-    }
-    if (std.mem.eql(u8, method, "tools/list")) {
-        return try std.json.Stringify.valueAlloc(allocator, ToolsResponse{ .id = id, .result = .{ .tools = try tools(allocator) } }, .{});
-    }
+    const id = object.get("id") orelse std.json.Value.null;
+    const method_value = object.get("method") orelse return .{ .invalid = .{ .id = id, .code = -32600, .message = "missing method" } };
+    if (method_value != .string) return .{ .invalid = .{ .id = id, .code = -32600, .message = "method must be a string" } };
+    const method = method_value.string;
+    if (std.mem.eql(u8, method, "initialize")) return .{ .initialize = id };
+    if (std.mem.eql(u8, method, "tools/list")) return .{ .tools_list = id };
     if (std.mem.eql(u8, method, "tools/call")) {
-        const params = object.get("params").?.object;
-        const name = params.get("name").?.string;
+        const params_value = object.get("params") orelse return .{ .invalid = .{ .id = id, .code = -32602, .message = "missing params" } };
+        if (params_value != .object) return .{ .invalid = .{ .id = id, .code = -32602, .message = "params must be an object" } };
+        const params = params_value.object;
+        const name_value = params.get("name") orelse return .{ .invalid = .{ .id = id, .code = -32602, .message = "missing tool name" } };
+        if (name_value != .string) return .{ .invalid = .{ .id = id, .code = -32602, .message = "tool name must be a string" } };
         const args = params.get("arguments") orelse std.json.Value.null;
-        const result_json = dispatchTool(allocator, session, name, args) catch |err| {
-            const message = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
-            return try std.json.Stringify.valueAlloc(allocator, ErrorResponse{ .id = id, .@"error" = .{ .code = -32000, .message = message } }, .{});
-        };
-        defer allocator.free(result_json);
-        const content = [_]TextContent{.{ .text = result_json }};
-        return try std.json.Stringify.valueAlloc(allocator, ToolResponse{ .id = id, .result = .{ .content = &content } }, .{});
+        return .{ .tools_call = .{ .id = id, .name = name_value.string, .arguments = args } };
     }
-    if (object.get("id") == null) return null;
-    _ = io;
-    return try std.json.Stringify.valueAlloc(allocator, ErrorResponse{ .id = id, .@"error" = .{ .code = -32601, .message = "unknown method" } }, .{});
+    if (object.get("id") == null) return .notification;
+    return .{ .invalid = .{ .id = id, .code = -32601, .message = "unknown method" } };
+}
+
+fn handleRequest(allocator: std.mem.Allocator, session: *session_mod.Session, request: std.json.Value) !?[]u8 {
+    switch (classifyRequest(request)) {
+        .initialize => |id| return try std.json.Stringify.valueAlloc(allocator, InitializeResponse{ .id = id }, .{}),
+        .tools_list => |id| return try std.json.Stringify.valueAlloc(allocator, ToolsResponse{ .id = id, .result = .{ .tools = try tools(allocator) } }, .{}),
+        .tools_call => |call| {
+            const result_json = dispatchTool(allocator, session, call.name, call.arguments) catch |err| {
+                const message = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
+                return try std.json.Stringify.valueAlloc(allocator, ErrorResponse{ .id = call.id, .@"error" = .{ .code = -32000, .message = message } }, .{});
+            };
+            defer allocator.free(result_json);
+            const content = [_]TextContent{.{ .text = result_json }};
+            return try std.json.Stringify.valueAlloc(allocator, ToolResponse{ .id = call.id, .result = .{ .content = &content } }, .{});
+        },
+        .notification => return null,
+        .invalid => |invalid| return try std.json.Stringify.valueAlloc(allocator, ErrorResponse{ .id = invalid.id, .@"error" = .{ .code = invalid.code, .message = invalid.message } }, .{}),
+    }
 }
 
 fn dispatchTool(allocator: std.mem.Allocator, session: *session_mod.Session, name: []const u8, args: std.json.Value) ![]u8 {

@@ -232,6 +232,24 @@ That is why you sometimes get *"one sec"* — honest waiting, not stalling.
 
 ---
 
+## Stimulus inbox and side-work lanes
+
+While a deliberation pass is blocked on host LLM or camera I/O, the world keeps moving. **Stimulus ingest** accepts concurrent input without starting a full chat pass:
+
+- **heard speech**, **typing**, **interrupts**, **sense deliveries**, and **emoji reactions** land in a bounded **stimulus inbox**
+- Each item carries age, salience, and optional activity binding
+- **Deferred speech** stashes user text received during an awaited host sense so it is processed after the paused turn finishes
+
+During blocking work the runtime **polls the inbox** at interrupt points and before host LLM callbacks. Queued host dispatches that arrive while the embedded mutex is held are accepted with `{ "kind": "stimulus_queued" }` instead of failing.
+
+**Attention scheduling** reads the inbox, open loops, active process, and awaited host request to choose the next slow pass: foreground chat, host follow-up, process advance, lightweight cotext integration, or hold when capacity is exceeded.
+
+**Side-work lanes** allow a bounded **work registry** of concurrent processes (for example recognize while conversation stays open) instead of rejecting nested goals outright.
+
+Observations expose `stimulus_inbox` alongside present moment and open loops so the model decides policy—not hard validators about empty action lists.
+
+---
+
 ## What it is not doing
 
 | Myth | Reality |

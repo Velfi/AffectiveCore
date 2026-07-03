@@ -79,10 +79,10 @@ test "introspection reports autonomy control state" {
     });
 
     const text = try brain.introspect("autonomy");
-    try std.testing.expect(std.mem.indexOf(u8, text, "autonomy: mode=full") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "control_capacity=40.00/50.00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "attention_agency: background_mode=full") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "agency_capacity=40.00/50.00") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "voluntary_speech_streak=2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "autonomy_effort_catalog") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "agency_effort_catalog") != null);
 }
 
 test "autonomy replenish bootstraps timestamp without immediate gain" {
@@ -222,7 +222,29 @@ test "autonomy tick spends control capacity for quiet action" {
     try std.testing.expectEqual(@as(usize, 1), store.memories.items.len);
 }
 
-test "autonomy facial expression respects action cooldown" {
+test "low salience stimulus integrates attention without planner speech pressure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const state_path = "data/test/attention_low_salience_state.json";
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.cfg.autonomy_mode = "off";
+    brain.cfg.psyche_mode = "off";
+    brain.cfg.maintenance_state_path = state_path;
+    brain.deps.io = std.testing.io;
+    var scripted = autonomy_mod.ScriptedAutonomyPlanner{ .turns = &[_]autonomy_mod.AutonomyTurn{} };
+    brain.deps.autonomy_planner = scripted.planner();
+    try brain.stimulus_inbox.enqueue(allocator, .typing, brain.now_seconds, 0.15, null, "draft text");
+
+    try brain.runAutonomyTick(std.testing.io);
+
+    try std.testing.expectEqual(@as(usize, 0), scripted.calls);
+    try std.testing.expectEqual(@as(usize, 0), brain.stimulus_inbox.pendingCount());
+}
+
+test "autonomy facial expression runs on consecutive ticks without cooldown delay" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -244,6 +266,7 @@ test "autonomy facial expression respects action cooldown" {
     var scripted = autonomy_mod.ScriptedAutonomyPlanner{ .turns = &[_]autonomy_mod.AutonomyTurn{
         .{ .action_pressures = &[_]chat_mod.ActionProposal{.{ .action = .facial_expression, .origin = .autonomy, .eyes = "neutral", .mouth = "open", .duration_ms = 3000 }}, .salience = .low, .reason = "visible reaction" },
         .{ .action_pressures = &[_]chat_mod.ActionProposal{.{ .action = .facial_expression, .origin = .autonomy, .eyes = "stern", .mouth = "frown", .duration_ms = 1000 }}, .salience = .low, .reason = "second expression" },
+        .{ .action_pressures = &[_]chat_mod.ActionProposal{}, .salience = .low, .reason = "capacity hold" },
     } };
     brain.deps.autonomy_planner = scripted.planner();
     try seedDueAutonomyState(allocator, &brain, state_path, brain.cfg.autonomy_full_max_capacity);
@@ -256,20 +279,21 @@ test "autonomy facial expression respects action cooldown" {
         .full_max_capacity = brain.cfg.autonomy_full_max_capacity,
     });
     try std.testing.expect(state.control_capacity < state.max_capacity);
-    try std.testing.expect(state.last_autonomy_action_at != null);
+    try std.testing.expect(state.last_autonomy_tick_at != null);
 
     clock.now_seconds += 1;
     try brain.runAutonomyTick(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 1), scripted.calls);
-    try std.testing.expectEqual(@as(usize, 1), expression_output.calls);
+    try std.testing.expectEqual(@as(usize, 2), scripted.calls);
+    try std.testing.expectEqual(@as(usize, 2), expression_output.calls);
 
-    clock.now_seconds += maintenance.autonomy_action_cooldown_seconds;
+    clock.now_seconds += 1;
+    try brain.pollStimulusInbox();
     try brain.runAutonomyTick(std.testing.io);
     state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, "full", .{
         .limited_max_capacity = brain.cfg.autonomy_limited_max_capacity,
         .full_max_capacity = brain.cfg.autonomy_full_max_capacity,
     });
-    try std.testing.expectEqual(@as(usize, 2), scripted.calls);
+    try std.testing.expectEqual(@as(usize, 3), scripted.calls);
     try std.testing.expectEqual(@as(usize, 2), expression_output.calls);
     try std.testing.expect(state.control_capacity < state.max_capacity);
 }
@@ -357,6 +381,64 @@ test "quiet hours resolve from wall clock without process runner" {
     try std.testing.expect(day_key.len == 10);
 }
 
+test "autonomy tick wakes persisted sleep outside quiet hours" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const state_path = "data/test/autonomy_wake_outside_quiet_hours_state.json";
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.cfg.autonomy_mode = "full";
+    brain.cfg.psyche_mode = "off";
+    brain.cfg.maintenance_state_path = state_path;
+    brain.cfg.autonomy_sleep = "off";
+    // Empty window: quiet hours are never active.
+    brain.cfg.autonomy_quiet_hours = "12:00-12:00";
+    brain.deps.io = std.testing.io;
+    var scripted = autonomy_mod.ScriptedAutonomyPlanner{ .turns = &[_]autonomy_mod.AutonomyTurn{.{
+        .action_pressures = &[_]chat_mod.ActionProposal{.{ .action = .say, .origin = .autonomy, .text = "Good morning." }},
+        .salience = .high,
+        .reason = "woke after rest",
+    }} };
+    brain.deps.autonomy_planner = scripted.planner();
+    try seedDueAutonomyState(allocator, &brain, state_path, brain.cfg.autonomy_full_max_capacity);
+    try brain.setAutonomySleeping(true, "test rest");
+
+    try brain.runAutonomyTick(std.testing.io);
+    const state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, "full", .{
+        .limited_max_capacity = brain.cfg.autonomy_limited_max_capacity,
+        .full_max_capacity = brain.cfg.autonomy_full_max_capacity,
+    });
+    try std.testing.expect(!state.sleeping);
+    try std.testing.expect(state.last_woken_at != null);
+}
+
+test "autonomy tick keeps persisted sleep during quiet hours" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const state_path = "data/test/autonomy_sleep_during_quiet_hours_state.json";
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.cfg.autonomy_mode = "full";
+    brain.cfg.psyche_mode = "off";
+    brain.cfg.maintenance_state_path = state_path;
+    brain.cfg.autonomy_sleep = "off";
+    brain.cfg.autonomy_quiet_hours = "00:00-23:59";
+    brain.deps.io = std.testing.io;
+    try seedDueAutonomyState(allocator, &brain, state_path, brain.cfg.autonomy_full_max_capacity);
+    try brain.setAutonomySleeping(true, "test rest");
+
+    try brain.runAutonomyTick(std.testing.io);
+    const state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, "full", .{
+        .limited_max_capacity = brain.cfg.autonomy_limited_max_capacity,
+        .full_max_capacity = brain.cfg.autonomy_full_max_capacity,
+    });
+    try std.testing.expect(state.sleeping);
+}
+
 test "autonomy expands process goals before execution" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -426,7 +508,104 @@ test "autonomy tick skips planner when control capacity is overdrawn" {
     });
     try std.testing.expectEqual(@as(usize, 0), scripted.calls);
     try std.testing.expect(!state.sleeping);
-    try std.testing.expectEqualStrings("autonomy waiting: overdrawn", state.last_reason.?);
+    try std.testing.expectEqualStrings("autonomy_overdrawn", state.last_reason.?);
+}
+
+test "salient pending speech wakes sleeping autonomy" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const state_path = "data/test/autonomy_wake_on_stimulus_state.json";
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = support.makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.cfg.autonomy_mode = "full";
+    brain.cfg.maintenance_state_path = state_path;
+    brain.deps.io = std.testing.io;
+    var scripted = autonomy_mod.ScriptedAutonomyPlanner{ .turns = &[_]autonomy_mod.AutonomyTurn{} };
+    brain.deps.autonomy_planner = scripted.planner();
+    try maintenance.saveAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, .{
+        .sleeping = true,
+        .control_capacity = 10,
+        .max_capacity = brain.cfg.autonomy_full_max_capacity,
+        .last_reason = "user requested sleep",
+    });
+    try brain.stimulus_inbox.enqueue(allocator, .heard_speech, brain.now_seconds, 0.85, null, "Hello?");
+
+    brain.runAutonomyTick(std.testing.io) catch |err| switch (err) {
+        // Waking is persisted before planning; the sparse test harness may
+        // not carry the full planning pipeline.
+        error.MissingPsycheService, error.MissingAutonomyPlanner, error.NoScriptedAutonomyTurn, error.LocalDateUnavailable => {},
+        else => return err,
+    };
+    const state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, "full", .{
+        .limited_max_capacity = brain.cfg.autonomy_limited_max_capacity,
+        .full_max_capacity = brain.cfg.autonomy_full_max_capacity,
+    });
+    try std.testing.expect(!state.sleeping);
+    try std.testing.expect(state.last_woken_at != null);
+    try std.testing.expect(std.mem.startsWith(u8, state.last_reason.?, "woke:"));
+}
+
+test "idle tick leaves sleeping autonomy asleep" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const state_path = "data/test/autonomy_sleep_idle_state.json";
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = support.makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.cfg.autonomy_mode = "full";
+    brain.cfg.maintenance_state_path = state_path;
+    // Sleep only persists inside the quiet-hours window now; pin it open so
+    // this test stays deterministic regardless of wall clock.
+    brain.cfg.autonomy_quiet_hours = "00:00-23:59";
+    brain.deps.io = std.testing.io;
+    var scripted = autonomy_mod.ScriptedAutonomyPlanner{ .turns = &[_]autonomy_mod.AutonomyTurn{} };
+    brain.deps.autonomy_planner = scripted.planner();
+    try maintenance.saveAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, .{
+        .sleeping = true,
+        .control_capacity = 10,
+        .max_capacity = brain.cfg.autonomy_full_max_capacity,
+        .last_reason = "user requested sleep",
+    });
+
+    try brain.runAutonomyTick(std.testing.io);
+    const state = try maintenance.loadAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, false, "full", .{
+        .limited_max_capacity = brain.cfg.autonomy_limited_max_capacity,
+        .full_max_capacity = brain.cfg.autonomy_full_max_capacity,
+    });
+    try std.testing.expectEqual(@as(usize, 0), scripted.calls);
+    try std.testing.expect(state.sleeping);
+}
+
+test "wake hold declines sleep until it expires" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const state_path = "data/test/autonomy_wake_hold_state.json";
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = support.makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.cfg.autonomy_mode = "full";
+    brain.cfg.maintenance_state_path = state_path;
+    brain.deps.io = std.testing.io;
+    try maintenance.saveAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, .{
+        .sleeping = false,
+        .control_capacity = 10,
+        .max_capacity = brain.cfg.autonomy_full_max_capacity,
+        .last_woken_at = brain.now_seconds,
+    });
+    try std.testing.expect((try brain.sleepDeclineRemainingSeconds()) != null);
+
+    const hold: i64 = @intCast(brain.cfg.autonomy_wake_hold_seconds);
+    try maintenance.saveAutonomyState(allocator, brain.deps.filesystem.?, std.testing.io, state_path, .{
+        .sleeping = false,
+        .control_capacity = 10,
+        .max_capacity = brain.cfg.autonomy_full_max_capacity,
+        .last_woken_at = brain.now_seconds - hold - 1,
+    });
+    try std.testing.expectEqual(@as(?i64, null), try brain.sleepDeclineRemainingSeconds());
 }
 
 test "autonomy overdrawn logs blocked status to developer event log" {
@@ -455,7 +634,7 @@ test "autonomy overdrawn logs blocked status to developer event log" {
     try brain.runAutonomyTick(std.testing.io);
     try std.testing.expectEqualStrings("state", log.kind.?);
     try std.testing.expectEqualStrings("autonomy blocked", log.title.?);
-    try std.testing.expectEqualStrings("autonomy waiting: overdrawn", log.body.?);
+    try std.testing.expectEqualStrings("autonomy_overdrawn", log.body.?);
 }
 
 test "dream time request delivers mailbox item" {
@@ -465,6 +644,7 @@ test "dream time request delivers mailbox item" {
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    support.wireTestIo(&brain);
     const item = try brain.requestDreamTime("Connect plant reminders with morning greetings");
     try std.testing.expectEqual(@as(usize, 1), store.dream_time_records.items.len);
     try std.testing.expectEqual(@as(usize, 1), store.mailbox_items.items.len);
@@ -479,6 +659,7 @@ test "dream time persists causal belief self trust disposition and mailbox chain
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    support.wireTestIo(&brain);
     const residue_event = try brain.recordSimpleExperienceEvent("User.TextReceived", .user, "The hallway recognition felt uncertain.");
 
     try brain.deps.store.saveMemoryRecord(.{
@@ -501,9 +682,9 @@ test "dream time persists causal belief self trust disposition and mailbox chain
     try std.testing.expectEqual(@as(usize, 1), store.dream_time_records.items.len);
     try std.testing.expectEqual(@as(usize, 1), store.mailbox_items.items.len);
     try std.testing.expectEqual(@as(usize, 1), store.artifacts.items.len);
-    try std.testing.expectEqual(@as(usize, 1), store.beliefs.items.len);
-    try std.testing.expectEqual(@as(usize, 1), store.self_trust.items.len);
-    try std.testing.expectEqual(@as(usize, 1), store.dispositions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), store.beliefs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), store.self_trust.items.len);
+    try std.testing.expectEqual(@as(usize, 0), store.dispositions.items.len);
     try std.testing.expect(store.experience_events.items.len >= 6);
 
     const dream = store.dream_time_records.items[0];
@@ -526,28 +707,25 @@ test "dream time persists causal belief self trust disposition and mailbox chain
     try std.testing.expect(stringSliceContains(dream.source_event_ids, persona_event_id));
     try std.testing.expectEqual(@as(usize, 1), dream.source_memory_ids.len);
     try std.testing.expectEqualStrings("memory_day_residue", dream.source_memory_ids[0]);
-    try std.testing.expectEqual(@as(usize, 1), dream.updated_belief_ids.len);
-    try std.testing.expectEqual(@as(usize, 1), dream.self_trust_change_ids.len);
-    try std.testing.expectEqual(@as(usize, 1), dream.disposition_change_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), dream.updated_belief_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), dream.self_trust_change_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), dream.disposition_change_ids.len);
 
-    try std.testing.expectEqualStrings(dream.updated_belief_ids[0], store.beliefs.items[0].belief_id);
-    try std.testing.expectEqualStrings(dream.self_trust_change_ids[0], store.self_trust.items[0].self_trust_id);
-    try std.testing.expectEqualStrings(dream.disposition_change_ids[0], store.dispositions.items[0].disposition_id);
-    try std.testing.expectEqualStrings(dream.dream_id, store.dispositions.items[0].source_dream_ids[0]);
     try std.testing.expectEqualStrings(dream.source_event_ids[0], item.source_event_ids[0]);
-    try std.testing.expect(std.mem.indexOf(u8, item.image_spec_json, "day residue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, item.text, "Overnight consolidation:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, item.text, "Focus: dim hallway recognition uncertainty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, item.image_spec_json, "dim hallway recognition uncertainty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, item.image_spec_json, "recognition") != null);
     try std.testing.expect(std.mem.indexOf(u8, dream.maintenance_counts_json, "\"consolidation\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, dream.maintenance_counts_json, "\"selected_memories\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, dream.maintenance_counts_json, "\"pruning_passes\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, item.debug_details, "\"belief_updates\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, item.debug_details, "\"mailbox_deliveries\":1") != null);
 
     const snapshot = try brain.readModelsSnapshot(allocator);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.belief_model.active_count);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.self_trust_model.entry_count);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.disposition_model.disposition_count);
-    try std.testing.expectEqualStrings(store.beliefs.items[0].belief_id, snapshot.belief_model.salient.?.belief_id);
-    try std.testing.expectEqualStrings(store.self_trust.items[0].self_trust_id, snapshot.self_trust_model.strongest.?.self_trust_id);
-    try std.testing.expectEqualStrings(store.dispositions.items[0].disposition_id, snapshot.disposition_model.strongest.?.disposition_id);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.belief_model.active_count);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.self_trust_model.entry_count);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.disposition_model.disposition_count);
     try std.testing.expect(dream.persona.len > 0);
     try std.testing.expect(dream.short_term.len > 0);
     try std.testing.expect(dream.long_term.len > 0);
@@ -655,6 +833,7 @@ test "maintenance request_dream_time delivers mailbox through Dream Time manager
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    support.wireTestIo(&brain);
 
     try brain.runMaintenanceCapability("request_dream_time:plant reminders");
     try std.testing.expectEqual(@as(usize, 1), store.dream_time_records.items.len);
@@ -682,6 +861,7 @@ test "dream time records source ids through canonical dream record" {
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    support.wireTestIo(&brain);
     try brain.deps.store.saveMemoryRecord(.{
         .memory_id = "memory_seed",
         .scope = .long_term,
@@ -792,6 +972,7 @@ test "dream residue ignores capability failures outside waking period" {
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    support.wireTestIo(&brain);
 
     const yesterday_ms = brain.now_seconds * 1000 - 86_400_000;
     try store.store().addCapabilityResult(.{
@@ -810,8 +991,8 @@ test "dream residue ignores capability failures outside waking period" {
     });
 
     const item = try brain.requestDreamTime(null);
-    try std.testing.expect(std.mem.indexOf(u8, item.text, "1 capability failures") != null);
-    try std.testing.expect(std.mem.indexOf(u8, item.text, "2 capability failures") == null);
+    try std.testing.expect(std.mem.indexOf(u8, item.text, "capability failures reviewed: 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, item.text, "capability failures reviewed: 2") == null);
 }
 
 test "conversation expands process goals before executing skills" {
@@ -922,6 +1103,7 @@ test "dream request does not recover active dreaming mode" {
     var store = TestStore.init(allocator);
     var desc = openai.TestDescriptionService{};
     var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    support.wireTestIo(&brain);
 
     try brain.deps.store.setBrainMode(.dreaming);
     try std.testing.expectError(error.BrainUnavailable, brain.requestDreamTime(null));
@@ -948,4 +1130,47 @@ test "dreaming mode blocks action proposal execution" {
     try std.testing.expectEqual(@as(usize, 0), store.capability_results.items.len);
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "action_blocked: brain_mode=dreaming") != null);
     try std.testing.expect(eventKindSeen(store.experience_events.items, experience_kinds.action_selection_blocked));
+}
+
+test "autonomy shared context surfaces pending heard speech" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.deps.io = std.testing.io;
+    brain.syncClock(std.testing.io);
+    try brain.stimulus_inbox.enqueue(allocator, .heard_speech, brain.now_seconds, 0.85, null, "I heard Other say \"are you there?\"");
+    brain.last_conversation_turn_seconds = brain.now_seconds;
+
+    const text = try brain_autonomy.buildPsycheSharedContext(&brain, std.testing.io, .{
+        .sleeping = false,
+        .control_capacity = 5.0,
+        .max_capacity = 8.0,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, text, "stimulus_inbox:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "are you there?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fresh speech is pending in stimulus_inbox") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Nothing particular is pressing on me from outside") == null);
+}
+
+test "autonomy shared context keeps answered-contact line without pending speech" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.deps.io = std.testing.io;
+    brain.syncClock(std.testing.io);
+    brain.last_conversation_turn_seconds = brain.now_seconds;
+
+    const text = try brain_autonomy.buildPsycheSharedContext(&brain, std.testing.io, .{
+        .sleeping = false,
+        .control_capacity = 5.0,
+        .max_capacity = 8.0,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, text, "contact already answered") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "stimulus_inbox:") == null);
 }

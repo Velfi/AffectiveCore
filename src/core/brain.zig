@@ -55,6 +55,7 @@ pub const speech_audio_suffix = brain_types.speech_audio_suffix;
 pub const speech_transcription_json_suffix = brain_types.speech_transcription_json_suffix;
 pub const SpeechArtifactSweepResult = brain_types.SpeechArtifactSweepResult;
 pub const HostVisualObservationResult = brain_lifecycle.HostVisualObservationResult;
+pub const StimulusDispatch = brain_process.StimulusDispatch;
 
 const brain_action_execution = @import("brain_action_execution.zig");
 const brain_autonomy = @import("brain_autonomy.zig");
@@ -136,6 +137,10 @@ pub const Brain = struct {
     active_activity: ?activity_mod.Active = null,
     /// Explicit multi-step process currently driving conversation execution.
     active_process: ?@import("process_runtime.zig").ActiveProcess = null,
+    /// Concurrent stimulus intake queue for attention scheduling.
+    stimulus_inbox: @import("stimulus_inbox.zig").Inbox,
+    /// Side-work process lanes when the foreground process slot is occupied.
+    work_registry: @import("work_registry.zig").Registry,
     /// Paused parent activities waiting for the current subtask to finish (root-first).
     activity_stack: std.ArrayList(activity_mod.Active) = .empty,
     /// Dispatch request id for the current host turn; used when the brain opens a process.
@@ -153,6 +158,11 @@ pub const Brain = struct {
     current_stimulus_context: ?[]const u8 = null,
     /// When set, equals current_stimulus_context and must be freed on replace/clear.
     owned_current_stimulus_context: ?[]const u8 = null,
+    host_stimulus_kind: ?[]const u8 = null,
+    host_received_during: ?[]const u8 = null,
+    host_idle_seconds: ?i64 = null,
+    owned_host_stimulus_kind: ?[]const u8 = null,
+    owned_host_received_during: ?[]const u8 = null,
     current_stimulus_seconds: ?i64 = null,
     current_focus: ?Focus = null,
     display_budget: display_budget_mod.State = .{},
@@ -175,6 +185,8 @@ pub const Brain = struct {
     dispatch_context_report: ?context_dispatch_report.OwnedReport = null,
     /// Last invalid conversation LLM payload, kept for hard-error detail on this brain only.
     chat_parse_failure_body: ?[]const u8 = null,
+    /// Last host HTTP callback error detail from the embedded transport, if any.
+    last_host_http_error_detail: ?[]const u8 = null,
     /// Voice section bullets from the seed document, loaded at connect or seed time.
     persona_voice_lines: []const []const u8 = &.{},
     /// Waking-period persona directive; defaults until first dream synthesis.
@@ -218,6 +230,9 @@ pub const Brain = struct {
     pub const clearChatParseFailure = brain_lifecycle.clearChatParseFailure;
     pub const rememberChatParseFailure = brain_lifecycle.rememberChatParseFailure;
     pub const chatParseFailureBody = brain_lifecycle.chatParseFailureBody;
+    pub const rememberHostHttpErrorDetail = brain_lifecycle.rememberHostHttpErrorDetail;
+    pub const hostHttpErrorDetail = brain_lifecycle.hostHttpErrorDetail;
+    pub const clearHostHttpErrorDetail = brain_lifecycle.clearHostHttpErrorDetail;
 
     pub const seedFromFile = brain_lifecycle.seedFromFile;
     pub const refreshPersonaVoiceFromSeed = brain_lifecycle.refreshPersonaVoiceFromSeed;
@@ -261,6 +276,7 @@ pub const Brain = struct {
     pub const clearPendingConversationPause = brain_process.clearActiveActivity;
 
     pub const drainPendingDeferredConversation = brain_lifecycle.drainPendingDeferredConversation;
+    pub const pollStimulusInbox = brain_lifecycle.pollStimulusInbox;
 
     pub const reconsiderFromReminder = brain_lifecycle.reconsiderFromReminder;
 
@@ -312,6 +328,23 @@ pub const Brain = struct {
         self.current_stimulus_seconds = self.now_seconds;
     }
 
+    pub fn setHostStimulusMetadata(
+        self: *Brain,
+        kind: ?[]const u8,
+        received_during: ?[]const u8,
+        idle_seconds: ?i64,
+    ) !void {
+        if (self.owned_host_stimulus_kind) |owned| self.allocator.free(owned);
+        if (self.owned_host_received_during) |owned| self.allocator.free(owned);
+        self.owned_host_stimulus_kind = null;
+        self.owned_host_received_during = null;
+        self.host_stimulus_kind = if (kind) |value| try self.allocator.dupe(u8, value) else null;
+        self.host_received_during = if (received_during) |value| try self.allocator.dupe(u8, value) else null;
+        self.host_idle_seconds = idle_seconds;
+        self.owned_host_stimulus_kind = self.host_stimulus_kind;
+        self.owned_host_received_during = self.host_received_during;
+    }
+
     pub const SenseStimulusRecord = struct {
         packet: SenseStimulusPacket,
         log_text: []const u8,
@@ -339,8 +372,11 @@ pub const Brain = struct {
 
     pub fn recordSenseStimulusPacket(self: *Brain, packet: SenseStimulusPacket, suffix: []const u8) !SenseStimulusLogRecord {
         const text = try stimulus_mod.formatPacket(self.allocator, packet);
-        const final_text = if (suffix.len == 0) text else try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ text, suffix });
-        self.setCurrentStimulusContext(final_text);
+        defer self.allocator.free(text);
+        const staged = if (suffix.len == 0) text else try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ text, suffix });
+        errdefer if (suffix.len > 0) self.allocator.free(staged);
+        try self.setOwnedCurrentStimulusContext(staged);
+        const final_text = self.current_stimulus_context.?;
         const event_id = try self.recordExperienceLogEvent(.{
             .kind = .observation,
             .source = "sense",
@@ -394,6 +430,8 @@ pub const Brain = struct {
     pub const runAutonomyReplenishFromPush = brain_lifecycle.runAutonomyReplenishFromPush;
 
     pub const runStimulusAutonomy = brain_lifecycle.runStimulusAutonomy;
+
+    pub const attentionLoopEnabled = brain_autonomy.attentionLoopEnabled;
 
     pub const assignSpeechStimulus = brain_recognition.assignSpeechStimulus;
 
@@ -651,6 +689,8 @@ pub const Brain = struct {
     pub const executeAutonomyTurn = brain_autonomy.executeAutonomyTurn;
 
     pub const setAutonomySleeping = brain_autonomy.setAutonomySleeping;
+
+    pub const sleepDeclineRemainingSeconds = brain_autonomy.sleepDeclineRemainingSeconds;
 
     pub const parseQuietHours = brain_autonomy.parseQuietHours;
 

@@ -42,12 +42,21 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, arg, "--models")) {
                 idx += 1;
                 options.conversation_models = forwarded.items[idx];
+            } else if (std.mem.eql(u8, arg, "--host")) {
+                idx += 1;
+                if (std.mem.eql(u8, forwarded.items[idx], "mock")) {
+                    options.host_mode = .mock;
+                } else if (std.mem.eql(u8, forwarded.items[idx], "live")) {
+                    options.host_mode = .live;
+                } else {
+                    return error.InvalidHostMode;
+                }
             } else {
                 std.debug.print("Unknown MCP flag: {s}\n", .{arg});
                 return error.UnknownArgument;
             }
         }
-        var session = try mcp_host.session.Session.open(init.io, options);
+        var session = try mcp_host.session.Session.openWithEnv(init.io, init.environ_map, options);
         defer session.deinit();
         try session.setupHost();
         try mcp_host.mcp_server.run(init, &session);

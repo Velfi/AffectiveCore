@@ -2,6 +2,8 @@ const std = @import("std");
 const brain_mod = @import("brain.zig");
 const read_models = @import("read_models.zig");
 const cognitive_capacity = @import("cognitive_capacity.zig");
+const json_store_cognitive = @import("../storage/json_store_cognitive.zig");
+const llm_voice = @import("llm_voice.zig");
 
 const Brain = brain_mod.Brain;
 
@@ -41,47 +43,58 @@ pub fn appendSocialContextObservation(self: *Brain, out: *std.ArrayList(u8)) !vo
 
 pub fn appendReadModelsObservation(self: *Brain, out: *std.ArrayList(u8)) !void {
     const snapshot = try read_models.readModelsSnapshot(self, self.allocator);
-    const salient_belief = if (snapshot.belief_model.salient) |belief| belief.proposition else "none";
+    const brain_mode_line = try llm_voice.formatBrainMode(self.allocator, @tagName(snapshot.brain_mode));
+    defer self.allocator.free(brain_mode_line);
+    const salient_belief = if (snapshot.belief_model.salient) |belief|
+        try std.fmt.allocPrint(self.allocator, "What looms largest: {s}.", .{belief.proposition})
+    else
+        try self.allocator.dupe(u8, llm_voice.empty_inner_state);
+    defer self.allocator.free(salient_belief);
     const self_trust_text = if (snapshot.self_trust_model.strongest) |entry|
-        try std.fmt.allocPrint(self.allocator, "{s}={d:.2}", .{ entry.faculty, entry.confidence })
+        try std.fmt.allocPrint(self.allocator, "I trust my {s} faculty at about {d:.0}% right now.", .{ entry.faculty, entry.confidence * 100.0 })
     else
-        try self.allocator.dupe(u8, "none");
+        try self.allocator.dupe(u8, "No faculty feels especially trustworthy to me right now.");
     defer self.allocator.free(self_trust_text);
-    const disposition = if (snapshot.disposition_model.strongest) |entry| entry.action_tendency else "none";
-    const focus_text = if (self.current_focus) |focus|
-        try std.fmt.allocPrint(self.allocator, "{s} ({s})", .{ focus.text, @tagName(focus.source) })
+    const disposition = if (snapshot.disposition_model.strongest) |entry|
+        try std.fmt.allocPrint(self.allocator, "My strongest pull is to {s}.", .{entry.action_tendency})
     else
-        try self.allocator.dupe(u8, "none");
+        try self.allocator.dupe(u8, llm_voice.empty_inner_state);
+    defer self.allocator.free(disposition);
+    const focus_text = if (self.current_focus) |focus|
+        try std.fmt.allocPrint(self.allocator, "My attention keeps returning to {s}.", .{focus.text})
+    else
+        try self.allocator.dupe(u8, "Nothing has captured my focus yet.");
     defer self.allocator.free(focus_text);
-    const stimulus_text = self.current_stimulus_context orelse "none";
-    try out.print(
+    const stimulus_text = if (self.current_stimulus_context) |stimulus|
+        try std.fmt.allocPrint(self.allocator, "Something in the air: {s}.", .{stimulus})
+    else
+        try self.allocator.dupe(u8, llm_voice.empty_inner_state);
+    defer self.allocator.free(stimulus_text);
+    const host_caps = try llm_voice.formatHostCapabilities(
         self.allocator,
-        "read_models_snapshot:\n- brain_mode: {s}\n- salient_belief: {s}\n- strongest_self_trust: {s}\n- winning_disposition: {s}\n- current_focus: {s}\n- current_stimulus: {s}\n- host_capabilities: available={d} unavailable={d} degraded={d}\n",
-        .{
-            @tagName(snapshot.brain_mode),
-            salient_belief,
-            self_trust_text,
-            disposition,
-            focus_text,
-            stimulus_text,
-            snapshot.host_capability_model.available_count,
-            snapshot.host_capability_model.unavailable_count,
-            snapshot.host_capability_model.degraded_count,
-        },
+        snapshot.host_capability_model.available_count,
+        snapshot.host_capability_model.unavailable_count,
+        snapshot.host_capability_model.degraded_count,
     );
+    defer self.allocator.free(host_caps);
+    try out.appendSlice(self.allocator, "read_models_snapshot:\n");
+    try out.print(self.allocator, "- {s}\n", .{brain_mode_line});
+    try out.print(self.allocator, "- {s}\n", .{salient_belief});
+    try out.print(self.allocator, "- {s}\n", .{self_trust_text});
+    try out.print(self.allocator, "- {s}\n", .{disposition});
+    try out.print(self.allocator, "- {s}\n", .{focus_text});
+    try out.print(self.allocator, "- {s}\n", .{stimulus_text});
+    try out.print(self.allocator, "- {s}\n", .{host_caps});
     const active_process = snapshot.active_process_model;
     if (active_process.process_id != null) {
         try out.print(
             self.allocator,
-            "- active_process: goal={s} origin={s} state={s} step={d}/{d} kind={s} waiting={s}\n",
+            "- I am still working through {s} (step {d} of {d}, waiting on {s}).\n",
             .{
-                active_process.goal orelse "unknown",
-                active_process.origin orelse "unknown",
-                active_process.state orelse "unknown",
+                active_process.goal orelse "something unfinished",
                 active_process.step_index + 1,
                 active_process.step_count,
-                active_process.current_step_kind orelse "none",
-                active_process.waiting_for orelse "none",
+                active_process.waiting_for orelse "the next moment",
             },
         );
     }
@@ -89,11 +102,18 @@ pub fn appendReadModelsObservation(self: *Brain, out: *std.ArrayList(u8)) !void 
 }
 
 pub fn appendHostCapabilityObservationIfChanged(self: *Brain, out: *std.ArrayList(u8)) !void {
+    self.trace("conversation.compose_observations.host_capability.start");
     const statuses = try self.deps.store.loadCapabilityStatuses(self.allocator);
     var digest = std.ArrayList(u8).empty;
     defer digest.deinit(self.allocator);
     for (statuses) |status| {
-        const part = try std.fmt.allocPrint(self.allocator, "{s}:{s};", .{ status.capability_id, @tagName(status.availability) });
+        json_store_cognitive.validateCapabilityStatusBorrow(status) catch |err| {
+            self.traceError("conversation.compose_observations.host_capability.invalid_status_borrow", err);
+            return err;
+        };
+        const owned = try json_store_cognitive.cloneCapabilityStatusValidated(self.allocator, status);
+        defer json_store_cognitive.freeCapabilityStatus(self.allocator, owned);
+        const part = try std.fmt.allocPrint(self.allocator, "{s}:{s};", .{ owned.capability_id, @tagName(owned.availability) });
         defer self.allocator.free(part);
         try digest.appendSlice(self.allocator, part);
     }

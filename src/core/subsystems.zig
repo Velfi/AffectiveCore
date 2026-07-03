@@ -4,6 +4,7 @@ const action_selection = @import("action_selection.zig");
 const learning = @import("learning.zig");
 const capability_registry = @import("capability_registry.zig");
 const needs_mod = @import("needs.zig");
+const dream_time_mod = @import("dream_time.zig");
 const ports = @import("ports.zig");
 const schema = ports.schema;
 
@@ -23,6 +24,7 @@ pub const registered_subsystems = [_]Subsystem{
     .{ .name = "ActionSelection", .proposeFn = proposePolicyPressure },
     .{ .name = "OutcomeLearning", .proposeFn = observeOutcomeLearning },
     .{ .name = "DreamTime", .proposeFn = observeDreamTime },
+    .{ .name = "IdleConsolidation", .proposeFn = observeIdleConsolidation },
     .{ .name = "HostBinding", .proposeFn = observeHostBinding },
     .{ .name = "SelfTrust", .proposeFn = proposeSelfTrustPressure },
     .{ .name = "Disposition", .proposeFn = proposeDispositionPressure },
@@ -110,7 +112,17 @@ pub fn appendSubsystemObservations(
     observations: *std.ArrayList(u8),
     context: SubsystemContext,
 ) !void {
-    const outcomes = try arbitrateSubsystemPressures(self, allocator, context);
+    var owned_source_event_ids = std.ArrayList([]const u8).empty;
+    defer {
+        for (owned_source_event_ids.items) |id| allocator.free(id);
+        owned_source_event_ids.deinit(allocator);
+    }
+    for (context.source_event_ids) |id| {
+        try owned_source_event_ids.append(allocator, try allocator.dupe(u8, id));
+    }
+    var local_context = context;
+    local_context.source_event_ids = owned_source_event_ids.items;
+    const outcomes = try arbitrateSubsystemPressures(self, allocator, local_context);
     defer allocator.free(outcomes);
     for (outcomes) |outcome| {
         if (outcome.suppressed) {
@@ -235,6 +247,8 @@ fn observeOutcomeLearning(brain: *Brain, context: SubsystemContext) !?schema.Act
 fn observeDreamTime(brain: *Brain, context: SubsystemContext) !?schema.ActionPressure {
     const mode = brain.deps.store.loadBrainMode() catch .waking;
     if (mode != .waking) return null;
+    const io = brain.deps.io orelse return null;
+    if (try dream_time_mod.dreamedToday(brain, io)) return null;
     const events = try brain.deps.store.loadExperienceEvents(brain.allocator);
     if (events.len < 6) return null;
     return try brain.proposeActionPressure(
@@ -245,6 +259,29 @@ fn observeDreamTime(brain: *Brain, context: SubsystemContext) !?schema.ActionPre
         0.36,
         0.20,
         0.03,
+        context.source_event_ids,
+    );
+}
+
+fn observeIdleConsolidation(brain: *Brain, context: SubsystemContext) !?schema.ActionPressure {
+    const mode = brain.deps.store.loadBrainMode() catch .waking;
+    if (mode != .waking) return null;
+    const memories = try brain.deps.store.loadMemoryRecords(brain.allocator);
+    var short_term: usize = 0;
+    for (memories) |memory| {
+        if (memory.scope == .short_term) short_term += 1;
+    }
+    if (short_term < 3 and brain.host_received_during == null) return null;
+    const idle = brain.host_idle_seconds orelse 0;
+    if (idle < 120 and short_term < 5) return null;
+    return try brain.proposeActionPressure(
+        "IdleConsolidation",
+        "consolidate_idle_memory",
+        "consolidate_memory",
+        "idle memory backlog",
+        0.34,
+        0.18,
+        0.02,
         context.source_event_ids,
     );
 }
@@ -303,19 +340,9 @@ fn isVisualOrIdentityEvent(event: schema.ExperienceEvent) bool {
 
 fn proposeNeedsPressure(brain: *Brain, context: SubsystemContext) !?schema.ActionPressure {
     const allocator = brain.allocator;
-    const summaries = try brain.deps.store.loadConversationSummaries(allocator);
     const memories = try brain.deps.store.loadMemoryRecords(allocator);
-    const stimulus_event = try sourceOrLatestEvent(brain, context);
-    const user_stimulus_payload = if (stimulus_event) |event| (if (event.source == .user) event.payload else null) else null;
     const needs = try needs_mod.evaluate(allocator, .{
-        .now_seconds = brain.now_seconds,
-        .conversation_summaries = summaries,
         .memory_records = memories,
-        .power = .{ .supplies = &.{} },
-        .autonomy_control_capacity = null,
-        .autonomy_max_capacity = brain.cfg.autonomy_full_max_capacity,
-        .autonomy_sleeping = null,
-        .user_stimulus_payload = user_stimulus_payload,
     });
     defer needs_mod.freeNeeds(allocator, needs);
 
@@ -488,7 +515,6 @@ fn needMapsToSay(need: needs_mod.Need) bool {
 }
 
 fn needExpressiveSharing(need: needs_mod.Need) bool {
-    if (std.mem.eql(u8, need.need_id, "conversation_reply")) return true;
     if (std.mem.startsWith(u8, need.need_id, "self_defined_want:") or std.mem.startsWith(u8, need.need_id, "self_defined_goal:")) {
         return textImpliesExpressiveSharing(need.text);
     }
@@ -526,6 +552,7 @@ test "registered subsystems include complete initial brain architecture" {
         "ActionSelection",
         "OutcomeLearning",
         "DreamTime",
+        "IdleConsolidation",
         "HostBinding",
         "SelfTrust",
         "Disposition",

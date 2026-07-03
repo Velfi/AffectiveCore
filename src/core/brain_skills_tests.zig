@@ -86,7 +86,8 @@ test "introspection separates available and unavailable skills" {
 
     const text = try brain.introspect("capabilities");
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "- live_camera: unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "live_camera:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "camera sense is dulled") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "- unknown:") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "- describe_image:") == null);
 }
@@ -103,7 +104,7 @@ test "affordance observation uses grouped skill library summary" {
     try brain.appendAffordanceObservation(&observations);
 
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "skill_library:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "speech (") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "- speech:") != null);
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "query=skill/") != null);
     try std.testing.expect(observations.items.len < 4096);
 }
@@ -122,7 +123,7 @@ test "introspect drills into skill groups and individual skills" {
 
     const group = try brain.introspect("skills/speech");
     try std.testing.expect(std.mem.indexOf(u8, group, "skill_group: speech") != null);
-    try std.testing.expect(std.mem.indexOf(u8, group, "- say:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, group, "I can say:") != null);
 
     const skill = try brain.introspect("skill/say");
     try std.testing.expect(std.mem.indexOf(u8, skill, "skill_detail: say") != null);
@@ -192,7 +193,7 @@ test "unavailable action records reason without executing sense" {
     _ = try brain.executeActionProposals(commands[0..], &observations);
 
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "skill_failed: describe_image: unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "no live camera or uploaded image is available for this body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "cannot reach a live camera or stored image on this host") != null);
     try std.testing.expect(brain.last_visual_observation_path == null);
 }
 

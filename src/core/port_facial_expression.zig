@@ -2,7 +2,6 @@ const std = @import("std");
 
 pub const default_duration_ms: u32 = 3000;
 pub const max_duration_ms: u32 = 5000;
-pub const autonomy_cooldown_seconds: i64 = 5;
 
 pub const EyeSprite = struct {
     name: []const u8,

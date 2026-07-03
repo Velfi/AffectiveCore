@@ -13,6 +13,9 @@ pub const Kind = enum {
     interrupt,
     reminder,
     reaction,
+    typing,
+    timer,
+    sense_delivery,
 };
 
 pub const Input = struct {

@@ -99,6 +99,18 @@ pub const HostEvent = struct {
         } else if (std.mem.eql(u8, self.type, "developer_log")) {
             try jw.objectField("developer_log");
             try self.writeDeveloperLogPayload(jw);
+        } else if (std.mem.eql(u8, self.type, "need_state")) {
+            try jw.objectField("need_state");
+            try self.writeNeedStatePayload(jw);
+        } else if (std.mem.eql(u8, self.type, "attention_state")) {
+            try jw.objectField("attention_state");
+            try self.writeAttentionStatePayload(jw);
+        } else if (std.mem.eql(u8, self.type, "intention")) {
+            try jw.objectField("intention");
+            try self.writeIntentionPayload(jw);
+        } else if (std.mem.eql(u8, self.type, "appraisal")) {
+            try jw.objectField("appraisal");
+            try self.writeAppraisalPayload(jw);
         } else {
             try jw.objectField("control");
             try self.writeControlPayload(jw);
@@ -195,6 +207,41 @@ pub const HostEvent = struct {
         try jw.endObject();
     }
 
+    fn writeNeedStatePayload(self: HostEvent, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("needs");
+        try jw.beginObject();
+        try jw.endObject();
+        try writeOptionalString(jw, "summary", self.body orelse self.text);
+        try jw.endObject();
+    }
+
+    fn writeAttentionStatePayload(self: HostEvent, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("competing_event_ids");
+        try jw.beginArray();
+        try jw.endArray();
+        try writeOptionalString(jw, "summary", self.body orelse self.text orelse "");
+        try writeOptionalString(jw, "suppression_reason", self.title);
+        try jw.endObject();
+    }
+
+    fn writeIntentionPayload(self: HostEvent, jw: anytype) !void {
+        try jw.beginObject();
+        try writeOptionalString(jw, "goal", self.body orelse self.text orelse "");
+        try writeOptionalString(jw, "expected_action", self.title);
+        try jw.endObject();
+    }
+
+    fn writeAppraisalPayload(self: HostEvent, jw: anytype) !void {
+        try jw.beginObject();
+        try writeOptionalString(jw, "summary", self.body orelse self.text);
+        try jw.objectField("tags");
+        try jw.beginArray();
+        try jw.endArray();
+        try jw.endObject();
+    }
+
     fn writeMiseEnScenePayload(self: HostEvent, jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("name");
@@ -247,9 +294,9 @@ pub fn parseHostManifest(allocator: std.mem.Allocator, json: []const u8) !HostMa
         .platform = try allocator.dupe(u8, platform),
         .capabilities = capabilities,
         .feature_flags = try cloneObjectMap(allocator, flags_value.object),
-        .max_envelope_bytes = @intCast(getInteger(object, "max_envelope_bytes") orelse 16 * 1024),
-        .max_event_count = @intCast(getInteger(object, "max_event_count") orelse 12),
-        .max_event_text_bytes = @intCast(getInteger(object, "max_event_text_bytes") orelse 768),
+        .max_envelope_bytes = try getBudget(object, "max_envelope_bytes", 16 * 1024),
+        .max_event_count = try getBudget(object, "max_event_count", 12),
+        .max_event_text_bytes = try getBudget(object, "max_event_text_bytes", 768),
         .raw_ref_ttl_seconds = getInteger(object, "raw_ref_ttl_seconds") orelse 24 * 60 * 60,
     };
 }
@@ -294,6 +341,12 @@ fn getString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = object.get(key) orelse return null;
     if (value != .string) return null;
     return value.string;
+}
+
+fn getBudget(object: std.json.ObjectMap, key: []const u8, default: usize) !usize {
+    const value = getInteger(object, key) orelse return default;
+    if (value < 0) return error.InvalidHostManifestBudget;
+    return @intCast(value);
 }
 
 fn getInteger(object: std.json.ObjectMap, key: []const u8) ?i64 {
@@ -478,6 +531,40 @@ pub const HostEffectCollector = struct {
             .visibility = try self.allocator.dupe(u8, "public"),
             .role = try self.allocator.dupe(u8, "brain"),
             .text = try self.allocator.dupe(u8, text),
+        });
+    }
+
+    pub fn appendNeedState(self: *HostEffectCollector, summary: []const u8) !void {
+        try self.events.append(self.allocator, .{
+            .type = "need_state",
+            .visibility = try self.allocator.dupe(u8, "internal"),
+            .body = try self.allocator.dupe(u8, summary),
+        });
+    }
+
+    pub fn appendAttentionState(self: *HostEffectCollector, summary: []const u8, suppression_reason: ?[]const u8) !void {
+        try self.events.append(self.allocator, .{
+            .type = "attention_state",
+            .visibility = try self.allocator.dupe(u8, "internal"),
+            .title = if (suppression_reason) |reason| try self.allocator.dupe(u8, reason) else null,
+            .body = try self.allocator.dupe(u8, summary),
+        });
+    }
+
+    pub fn appendIntention(self: *HostEffectCollector, goal: []const u8, expected_action: ?[]const u8) !void {
+        try self.events.append(self.allocator, .{
+            .type = "intention",
+            .visibility = try self.allocator.dupe(u8, "internal"),
+            .title = if (expected_action) |action| try self.allocator.dupe(u8, action) else null,
+            .body = try self.allocator.dupe(u8, goal),
+        });
+    }
+
+    pub fn appendAppraisal(self: *HostEffectCollector, summary: []const u8) !void {
+        try self.events.append(self.allocator, .{
+            .type = "appraisal",
+            .visibility = try self.allocator.dupe(u8, "internal"),
+            .body = try self.allocator.dupe(u8, summary),
         });
     }
 
@@ -678,6 +765,31 @@ pub fn successEnvelopeAlloc(
     timings: request_timings.Report,
     context: ?context_dispatch_report.Report,
 ) ![]u8 {
+    return successEnvelopeWithOptions(allocator, request_id, events, result, budget, timings, context, .{ .whitespace = .indent_2 });
+}
+
+pub fn successEnvelopeCompactAlloc(
+    allocator: std.mem.Allocator,
+    request_id: []const u8,
+    events: []const HostEvent,
+    result: anytype,
+    budget: anytype,
+    timings: request_timings.Report,
+    context: ?context_dispatch_report.Report,
+) ![]u8 {
+    return successEnvelopeWithOptions(allocator, request_id, events, result, budget, timings, context, .{});
+}
+
+fn successEnvelopeWithOptions(
+    allocator: std.mem.Allocator,
+    request_id: []const u8,
+    events: []const HostEvent,
+    result: anytype,
+    budget: anytype,
+    timings: request_timings.Report,
+    context: ?context_dispatch_report.Report,
+    options: std.json.Stringify.Options,
+) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, .{
         .request_id = request_id,
         .ok = true,
@@ -686,7 +798,7 @@ pub fn successEnvelopeAlloc(
         .budget = budget,
         .timings = timings,
         .context = context,
-    }, .{ .whitespace = .indent_2 });
+    }, options);
 }
 
 pub fn errorEnvelopeAlloc(

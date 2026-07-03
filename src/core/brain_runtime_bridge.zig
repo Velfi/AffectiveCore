@@ -451,8 +451,8 @@ fn runtimeNowMs(self: *Brain) i64 {
 fn runtimeAutonomyState(self: *Brain) !maintenance.AutonomyState {
     var state = maintenance.AutonomyState{
         .sleeping = false,
-        .control_capacity = if (std.mem.eql(u8, self.cfg.autonomy_mode, "limited")) self.cfg.autonomy_limited_max_capacity else self.cfg.autonomy_full_max_capacity,
-        .max_capacity = if (std.mem.eql(u8, self.cfg.autonomy_mode, "limited")) self.cfg.autonomy_limited_max_capacity else self.cfg.autonomy_full_max_capacity,
+        .control_capacity = self.cfg.autonomy_full_max_capacity,
+        .max_capacity = self.cfg.autonomy_full_max_capacity,
     };
     if (self.deps.io != null and self.deps.filesystem != null) {
         state = try maintenance.loadAutonomyState(
@@ -603,13 +603,10 @@ fn proposalFromPayload(payload: ProposalEventPayload) !chat_mod.ActionProposal {
 
 fn governorSettings(self: *Brain) autonomy_governor.Settings {
     return .{
-        .autonomy_mode = self.cfg.autonomy_mode,
-        .limited_threshold_bias = self.cfg.autonomy_limited_threshold_bias,
-        .full_threshold_bias = self.cfg.autonomy_full_threshold_bias,
         .social_reserve = self.cfg.autonomy_social_reserve,
         .safety_reserve = self.cfg.autonomy_safety_reserve,
         .opportunity_reserve = self.cfg.autonomy_opportunity_reserve,
-        .quiet_hours_active = if (std.mem.eql(u8, self.cfg.autonomy_mode, "limited") and self.deps.io != null)
+        .quiet_hours_active = if (self.deps.io != null)
             brain_autonomy.inQuietHours(self, self.deps.io.?) catch false
         else
             false,
@@ -850,7 +847,6 @@ fn runtimeAutonomyActorHandle(ctx: *anyopaque, event: brain_event.BrainEvent, ha
     const actor = actors.autonomy_actor.AutonomyActor.init(handle_ctx.allocator, collector.sink());
     const decision = try actor.decide(.{
         .proposal = parsed.value,
-        .autonomy_mode = self.cfg.autonomy_mode,
         .control_capacity = turn_ctx.autonomy_state.control_capacity,
         .autonomy_sleeping = turn_ctx.autonomy_state.sleeping,
     });

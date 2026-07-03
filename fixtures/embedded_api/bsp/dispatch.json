@@ -1,0 +1,5 @@
+{
+  "type": "dispatch",
+  "request_id": "dispatch-1",
+  "request_json": "{\"request_id\":\"dispatch-1\",\"event\":{\"type\":\"user_text\",\"text\":\"hello\"}}"
+}

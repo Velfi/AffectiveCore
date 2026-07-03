@@ -165,6 +165,9 @@ pub fn applyRecordContext(self: *Brain, record: schema.ActivityRecord) !void {
         const sense = record.awaited_host_sense orelse return error.MissingAwaitedHostSense;
         const purpose = record.awaited_host_purpose orelse return error.MissingAwaitedHostPurpose;
         self.clearAwaitedHostRequest();
+        if (host_capability_activation.hostSenseReportedUnavailable(self, sense)) {
+            return restoreDeferredSpeech(self, record);
+        }
         var bound_activity_id: ?[]const u8 = null;
         var bound_user_text: ?[]const u8 = null;
         var bound_goal: ?[]const u8 = null;
@@ -187,9 +190,16 @@ pub fn applyRecordContext(self: *Brain, record: schema.ActivityRecord) !void {
         };
     } else if (record.awaiting) |awaiting| {
         if (std.mem.indexOf(u8, awaiting, "recognize") != null and std.mem.indexOf(u8, awaiting, "camera") != null) {
-            try self.setAwaitedHostRequest("camera", "recognize");
+            self.setAwaitedHostRequest("camera", "recognize") catch |err| switch (err) {
+                error.HostSenseUnavailable => {},
+                else => return err,
+            };
         }
     }
+    return restoreDeferredSpeech(self, record);
+}
+
+fn restoreDeferredSpeech(self: *Brain, record: schema.ActivityRecord) !void {
     if (record.deferred_heard_speech_text) |text| {
         if (text.len > 0) {
             self.pending_deferred_heard_speech = try input_mod.HeardSpeech.typed(self.allocator, text);

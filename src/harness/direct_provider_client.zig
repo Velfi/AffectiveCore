@@ -133,10 +133,12 @@ pub const DirectRandomProviderClient = struct {
         // Each route attempt and validation failure records separately (see brain_context_stats).
         const models_spec = try self.resolvedModelsSpec(allocator, request.subsystem, request.effort_tier);
         defer allocator.free(models_spec);
-        const tier = request.effort_tier orelse llm_routing.defaultEffortTierForSubsystem(request.subsystem);
+        const requested_tier = request.effort_tier orelse llm_routing.defaultEffortTierForSubsystem(request.subsystem);
+        const tier = llm_routing.clampEffortTier(self.llm_quality, requested_tier);
         const primary = try primaryResolvedModel(allocator, models_spec);
         defer allocator.free(primary.model);
         var routed = request;
+        routed.effort_tier = tier;
         routed.reasoning_effort = llm_routing.clampReasoningEffort(self.llm_quality, request.reasoning_effort);
         const request_bytes = request.system_prompt.len + request.user_prompt.len;
         const reasoning_effort = routed.reasoning_effort;
@@ -512,9 +514,11 @@ fn callHostLLMComplete(allocator: std.mem.Allocator, http: http_transport.Client
         try jsonString(allocator, @tagName(effort))
     else
         "null";
+    const effort_tier = request.effort_tier orelse llm_routing.defaultEffortTierForSubsystem(request.subsystem);
+    const effort_tier_json = try jsonString(allocator, @tagName(effort_tier));
     const body = try std.fmt.allocPrint(
         allocator,
-        "{{\"subsystem\":{s},\"models\":{s},\"system_prompt\":{s},\"user_prompt\":{s},\"response_format\":{s},\"response_size\":{s},\"reasoning_effort\":{s},\"temperature\":{d:.3},\"max_tokens\":{d},\"json_schema\":{s}}}",
+        "{{\"subsystem\":{s},\"models\":{s},\"system_prompt\":{s},\"user_prompt\":{s},\"response_format\":{s},\"response_size\":{s},\"effort_tier\":{s},\"reasoning_effort\":{s},\"temperature\":{d:.3},\"max_tokens\":{d},\"json_schema\":{s}}}",
         .{
             try jsonString(allocator, request.subsystem),
             models_json,
@@ -522,6 +526,7 @@ fn callHostLLMComplete(allocator: std.mem.Allocator, http: http_transport.Client
             try jsonString(allocator, request.user_prompt),
             try jsonString(allocator, @tagName(request.response_format)),
             try jsonString(allocator, @tagName(request.response_size)),
+            effort_tier_json,
             reasoning_effort_json,
             request.temperature,
             maxTokens(request.response_size),
@@ -859,5 +864,5 @@ fn randomSeed(io: std.Io) u64 {
 }
 
 pub fn jsonString(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    return std.json.Stringify.valueAlloc(allocator, text, .{});
+    return @import("../api/json_string.zig").jsonString(allocator, text);
 }

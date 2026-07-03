@@ -290,22 +290,23 @@ pub fn executeCapabilityAction(
             try self.logCapabilityResult(proposal, line);
         },
         .consolidate_memory => {
-            const item = try self.requestDreamTime(proposal.text);
-            const line = try std.fmt.allocPrint(
-                self.allocator,
-                "dream_time_entered: mailbox_id={s} title={s}\n",
-                .{ item.mailbox_id, item.title },
-            );
-            try observations.appendSlice(self.allocator, line);
-            try self.logCapabilityResult(proposal, line);
-            spoken_text.* = if (item.waking_thought.len > 0) item.waking_thought else item.text;
+            const text = try self.consolidateMemory();
+            defer self.allocator.free(text);
+            try observations.appendSlice(self.allocator, text);
+            try self.logCapabilityResult(proposal, text);
         },
         .sleep_autonomy => {
             const reason = proposal.text orelse "user requested sleep";
-            try self.setAutonomySleeping(true, reason);
-            const line = try std.fmt.allocPrint(self.allocator, "autonomy_sleeping: true reason={s}\n", .{reason});
-            try observations.appendSlice(self.allocator, line);
-            try self.logCapabilityResult(proposal, line);
+            if (try self.sleepDeclineRemainingSeconds()) |remaining| {
+                const line = try std.fmt.allocPrint(self.allocator, "autonomy_sleep_declined: a salient stimulus woke me recently; sleep available again in {d}s\n", .{remaining});
+                try observations.appendSlice(self.allocator, line);
+                try self.logCapabilityResult(proposal, line);
+            } else {
+                try self.setAutonomySleeping(true, reason);
+                const line = try std.fmt.allocPrint(self.allocator, "autonomy_sleeping: true reason={s}\n", .{reason});
+                try observations.appendSlice(self.allocator, line);
+                try self.logCapabilityResult(proposal, line);
+            }
         },
         .wake_autonomy => {
             const reason = proposal.text orelse "user requested wake";

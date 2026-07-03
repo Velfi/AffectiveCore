@@ -31,4 +31,5 @@ pub const store = @import("port_store.zig");
 pub const system_senses = @import("port_system_senses.zig");
 pub const want_achievement = @import("port_want_achievement.zig");
 pub const persona_directive = @import("port_persona_directive.zig");
+pub const llm_voice = @import("llm_voice.zig");
 pub const process_goal = @import("port_process_goal.zig");

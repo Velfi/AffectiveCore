@@ -139,9 +139,6 @@ test "thrift actor emits ranked proposal events" {
         .max_capacity = 0.85,
     };
     const settings = autonomy_governor.Settings{
-        .autonomy_mode = "limited",
-        .limited_threshold_bias = 0.2,
-        .full_threshold_bias = 0.0,
         .social_reserve = 0.1,
         .safety_reserve = 0.2,
         .opportunity_reserve = 0.15,
@@ -171,7 +168,6 @@ test "autonomy actor emits governance decision" {
                 .noop = "noop",
             },
         },
-        .autonomy_mode = "full",
         .control_capacity = 0.8,
     });
     try std.testing.expectEqual(payloads.GovernanceDecision.allow, decision.decision);
@@ -249,4 +245,3 @@ fn freeChatTurn(allocator: std.mem.Allocator, turn: chat.ChatTurn) void {
     allocator.free(turn.user_summary);
     allocator.free(turn.brain_summary);
 }
-

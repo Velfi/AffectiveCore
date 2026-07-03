@@ -157,7 +157,7 @@ pub fn parseIntrospectQuery(query: ?[]const u8) IntrospectTarget {
 }
 
 pub fn appendConversationSummary(allocator: std.mem.Allocator, out: *std.ArrayList(u8), availability: Availability) !void {
-    try out.appendSlice(allocator, "Current skill availability:\n");
+    try out.appendSlice(allocator, "What I can do through this host right now:\n");
     try out.appendSlice(allocator, "skill_library:\n");
     var callable_total: usize = 0;
     for (group_specs) |group| {
@@ -175,14 +175,19 @@ pub fn appendConversationSummary(allocator: std.mem.Allocator, out: *std.ArrayLi
         }
         if (total == 0) continue;
         callable_total += available;
-        try out.print(allocator, "- {s} ({d}/{d}): ", .{ group.name, available, total });
-        for (names.items, 0..) |name, index| {
-            if (index > 0) try out.appendSlice(allocator, ", ");
-            try out.appendSlice(allocator, name);
+        try out.print(allocator, "- {s}: ", .{group.name});
+        if (available == 0) {
+            try out.appendSlice(allocator, "nothing reachable here right now");
+        } else {
+            for (names.items, 0..) |name, index| {
+                if (index > 0) try out.appendSlice(allocator, ", ");
+                try out.appendSlice(allocator, name);
+            }
+            try out.print(allocator, " ({d} of {d} available)", .{ available, total });
         }
         try out.print(allocator, " — {s}\n", .{group.summary});
     }
-    try out.print(allocator, "callable_now: {d}\n", .{callable_total});
+    try out.print(allocator, "Right now I can reach about {d} skills on this host.\n", .{callable_total});
     try out.appendSlice(allocator, "Use introspect with query=skills, query=skills/<group>, or query=skill/<name> for full descriptions.\n");
 }
 
@@ -198,7 +203,7 @@ pub fn appendSkillsTree(allocator: std.mem.Allocator, out: *std.ArrayList(u8), a
             if (availability.isAvailable(availability.ctx, entry.id)) available += 1;
         }
         if (total == 0) continue;
-        try out.print(allocator, "- {s} ({d}/{d}): {s}\n", .{ group.name, available, total, group.summary });
+        try out.print(allocator, "- {s}: {d} of {d} reachable — {s}\n", .{ group.name, available, total, group.summary });
     }
     try out.appendSlice(allocator, "Use query=skills/<group> or query=skill/<name> to drill down.\n");
 }
@@ -216,9 +221,9 @@ pub fn appendGroupCatalog(
         if (groupFor(entry.id) != group) continue;
         const available = availability.isAvailable(availability.ctx, entry.id);
         if (available) {
-            try out.print(allocator, "- {s}: {s}\n", .{ entry.name, entry.description });
+            try out.print(allocator, "- I can {s}: {s}\n", .{ entry.name, entry.description });
         } else {
-            try out.print(allocator, "- {s}: unavailable\n", .{entry.name});
+            try out.print(allocator, "- I cannot reach {s} on this host right now\n", .{entry.name});
         }
     }
 }
@@ -235,12 +240,13 @@ pub fn appendSkillDetail(
     };
     const group = groupSpec(groupFor(id));
     const available = availability.isAvailable(availability.ctx, id);
-    try out.print(allocator, "skill_detail: {s}\ngroup: {s}\navailable: {any}\n{s}\n", .{
-        entry.name,
-        group.name,
-        available,
-        entry.description,
-    });
+    try out.print(allocator, "skill_detail: {s}\ngroup: {s}\n", .{ entry.name, group.name });
+    if (available) {
+        try out.appendSlice(allocator, "I can reach this on the host right now.\n");
+    } else {
+        try out.appendSlice(allocator, "I cannot reach this on the host right now.\n");
+    }
+    try out.print(allocator, "{s}\n", .{entry.description});
     if (entry.failure_hint.len > 0) {
         try out.print(allocator, "failure_hint: {s}\n", .{entry.failure_hint});
     }
@@ -303,7 +309,7 @@ test "conversation summary lists grouped callable skills" {
         .isAvailable = TestCtx.available,
     });
     try std.testing.expect(std.mem.indexOf(u8, out.items, "skill_library:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "speech (") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "- speech:") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "say") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "query=skill/") != null);
 }

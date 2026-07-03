@@ -39,6 +39,7 @@ const vector_index = @import("vector_index.zig");
 const emotion = @import("emotion.zig");
 const process = ports.process;
 const helpers = @import("brain_helpers.zig");
+const llm_voice = @import("llm_voice.zig");
 const experience_pipeline = @import("experience_pipeline.zig");
 const experience_kinds = @import("experience_kinds.zig");
 const experiential_observations = @import("experiential_observations.zig");
@@ -68,13 +69,13 @@ pub fn dreamImagePrompt(allocator: std.mem.Allocator, style: []const u8, connect
     if (seed.len > 0) {
         return std.fmt.allocPrint(
             allocator,
-            "Create a {s} dream image for a small household robot. Visualize this dream seed: {s}. Blend these associated memories: {s}. No text, captions, UI, or labels in the image.",
+            "Create a {s} dream image for a being. Visualize this dream seed: {s}. Blend these associated memories: {s}. No text, captions, UI, or labels in the image.",
             .{ style, seed, connection },
         );
     }
     return std.fmt.allocPrint(
         allocator,
-        "Create a {s} dream image for a small household robot. Blend these associated memories: {s}. No text, captions, UI, or labels in the image.",
+        "Create a {s} dream image for a being. Blend these associated memories: {s}. No text, captions, UI, or labels in the image.",
         .{ style, connection },
     );
 }
@@ -520,12 +521,13 @@ pub fn recallFacts(self: *Brain, query_text: []const u8, tags: []const []const u
             .{ record.fact_id, query, record.active, record.confidence },
         );
         _ = try self.recordSimpleExperienceEvent(experience_kinds.memory_recalled, .memory, recall_payload);
-        try out.print(self.allocator, "- {s}: {s} key={s} active={any} confidence={d:.3} updated_at={s}", .{ record.fact_id, record.value, record.key, record.active, record.confidence, record.updated_at });
-        try out.appendSlice(self.allocator, " tags=");
-        try out.appendSlice(self.allocator, try helpers.joinTags(self.allocator, record.tags));
-        try out.append(self.allocator, '\n');
+        try out.print(self.allocator, "- I recall: {s} ({s})\n", .{ record.value, record.key });
     }
-    if (matched == 0) try out.appendSlice(self.allocator, "- none\n");
+    if (matched == 0) {
+        try out.appendSlice(self.allocator, "- ");
+        try out.appendSlice(self.allocator, llm_voice.empty_inner_state);
+        try out.appendSlice(self.allocator, "\n");
+    }
     return out.toOwnedSlice(self.allocator);
 }
 
@@ -672,8 +674,6 @@ fn appendTaggedSeedMemories(
 
 pub fn buildDreamPersonaSynthesisContext(
     self: *Brain,
-    belief_proposition: []const u8,
-    disposition_tendency: []const u8,
     reconciliation_count: usize,
     residue: DreamPersonaResidue,
 ) ![]const u8 {
@@ -727,9 +727,9 @@ pub fn buildDreamPersonaSynthesisContext(
     try out.appendSlice(self.allocator, "\n");
     try out.appendSlice(self.allocator, needs);
 
-    try out.appendSlice(self.allocator, "\ndream_outputs:\n");
-    try out.print(self.allocator, "- belief: {s}\n", .{belief_proposition});
-    try out.print(self.allocator, "- disposition: {s}\n", .{disposition_tendency});
+    try out.appendSlice(self.allocator, "\ndream_maintenance:\n");
+    try out.print(self.allocator, "- capability_failures_reviewed: {d}\n", .{residue.failure_capability_ids.len});
+    try out.print(self.allocator, "- contradiction_reconciliations: {d}\n", .{reconciliation_count});
     return out.toOwnedSlice(self.allocator);
 }
 
@@ -753,12 +753,10 @@ fn wakingPeriodStartMsForPersona(self: *Brain) !i64 {
 
 pub fn synthesizeDreamPersonaDirective(
     self: *Brain,
-    belief_proposition: []const u8,
-    disposition_tendency: []const u8,
     reconciliation_count: usize,
     residue: DreamPersonaResidue,
 ) !persona_directive_mod.PersonaDirective {
-    const base_context = try buildDreamPersonaSynthesisContext(self, belief_proposition, disposition_tendency, reconciliation_count, residue);
+    const base_context = try buildDreamPersonaSynthesisContext(self, reconciliation_count, residue);
     defer self.allocator.free(base_context);
     const context = try appendDreamPersonaPsycheConsult(self, base_context);
     defer self.allocator.free(context);

@@ -162,7 +162,7 @@ fn compositionSystemPrompt(allocator: std.mem.Allocator, mode: ComposeMode, auto
         \\Example (investigate_unusual_touch, no camera, interaction mode): {"action_pressures":[{"action":"feel_about","origin":"interaction","step_kind":"sync_capability","query":"short tap on head","scale":null,"text":null,"tags":[]},{"action":"emote","origin":"interaction","text":"*startles slightly*","tags":[]},{"action":"say","origin":"interaction","step_kind":"respond","scale":"tiny","text":"That surprised me.","tags":[]}],"reason":"Non-visual touch investigation with user-visible acknowledgment."}
     ;
     const touch_autonomy_example =
-        \\Example (investigate_unusual_touch, no camera, autonomy mode): {"action_pressures":[{"action":"feel_about","origin":"autonomy","step_kind":"sync_capability","query":"short tap on head","tags":[]},{"action":"think_about","origin":"autonomy","step_kind":"sync_capability","query":"touch source without camera","tags":[]}],"reason":"Inner investigation without speech."}
+        \\Example (investigate_unusual_touch, no camera, attention loop): {"action_pressures":[{"action":"feel_about","origin":"autonomy","step_kind":"sync_capability","query":"short tap on head","tags":[]},{"action":"think_about","origin":"autonomy","step_kind":"sync_capability","query":"touch source without camera","tags":[]}],"reason":"Inner investigation without speech."}
     ;
     const touch_example = switch (mode) {
         .interaction => touch_interaction_example,
@@ -260,7 +260,7 @@ pub fn llmTesterScenarios(allocator: std.mem.Allocator) ![]llm_tester_scenario.S
             .interaction => "Expand process goal into interaction action chain",
         };
         const description = switch (mode) {
-            .autonomy => "Expands a touch-investigation goal into an ordered autonomy action chain the robot can execute without user interaction.",
+            .autonomy => "Expands a touch-investigation goal into an ordered autonomy action chain the being can execute without user interaction.",
             .interaction => "Expands the same goal into an interaction action chain that may involve speech or other user-visible steps.",
         };
         out[i] = try llm_tester_scenario.Scenario.init(
@@ -550,16 +550,17 @@ test "parseProcessComposition requires non-empty action pressures" {
     try std.testing.expectEqual(chat.ActionProposalType.think_about, result.action_pressures[0].action);
 }
 
-test "parseProcessComposition rejects host sense pulls in limited autonomy" {
+test "parseProcessComposition accepts host sense pulls without legacy full mode" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    try std.testing.expectError(error.InvalidProcessCompositionAction, parseProcessComposition(allocator,
+    const result = try parseProcessComposition(allocator,
         \\{"action_pressures":[{"action":"take_picture","origin":"autonomy","delay_ms":null,"scale":"full","text":null,"query":null,"memory_id":null,"schedule":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"tags":[]}],"reason":"look"}
-    , .autonomy, "limited"));
+    , .autonomy, "limited");
+    try std.testing.expectEqual(chat.ActionProposalType.take_picture, result.action_pressures[0].action);
 }
 
-test "parseProcessComposition accepts host sense pulls in full autonomy" {
+test "parseProcessComposition accepts host sense pulls in compatibility full mode" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();

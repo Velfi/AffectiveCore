@@ -6,7 +6,7 @@
 
 ## Introspection is a skill
 
-Your brain can examine itself the same way it looks at a room — by **choosing** the introspect skill. This is not a hidden debug panel. It is part of normal capability, available in conversation and (when allowed) during autonomy.
+Your brain can examine itself the same way it looks at a room — by **choosing** the introspect skill. This is not a hidden debug panel. It is part of normal capability, available in conversation and during background attention when budget and boundaries allow.
 
 ```mermaid
 flowchart TB
@@ -34,7 +34,7 @@ flowchart TB
     OV --> DR[Dreams on record]
     OV --> FN[Focus & needs]
     OV --> CC[Callable capabilities]
-    OV --> AS[Autonomy status]
+    OV --> AS[Attention & agency status]
     OV --> SL[Skill library]
 ```
 
@@ -53,7 +53,7 @@ Pass an optional **query** to zoom in:
 | **facts** | Durable self-facts |
 | **needs** | Active needs, wants, goals |
 | **capabilities** or **senses** | What the body can do right now |
-| **autonomy** | Mode, budget, blockers |
+| **autonomy** | Compatibility view of agency budget, attention status, blockers |
 | **focus** or **identity** | Attention and self-model |
 | **skills** | Entire skill library |
 | **skill/** *name* | One skill in detail |
@@ -61,6 +61,7 @@ Pass an optional **query** to zoom in:
 
 Examples you can say naturally:
 
+- *"Introspect attention."*  
 - *"Introspect autonomy."*  
 - *"What skills do you have for seeing?"*  
 - *"What are your active wants?"*
@@ -78,7 +79,7 @@ flowchart LR
     SNAP --> N[Needs · beliefs]
     SNAP --> T[Self-trust · disposition]
     SNAP --> V[Visual state]
-    SNAP --> A[Autonomy budget]
+    SNAP --> A[Agency budget]
     SNAP --> H[Host capability status]
 ```
 
@@ -107,7 +108,7 @@ The brain may **think_about** before **say** — you see only the final speech.
 flowchart TB
     subgraph Good["✓ Good questions"]
         G1[What do you want right now?]
-        G2[Are you low on autonomy energy?]
+        G2[Are you low on agency energy?]
         G3[What can you see and do on this device?]
         G4[What's your focus?]
     end
@@ -123,9 +124,9 @@ Introspection reports **derived state**, not raw database dumps. For memory deta
 
 ---
 
-## During autonomy
+## During background attention
 
-When alone, the brain may introspect for housekeeping — checking budget, skills, or focus before choosing an action. You might never notice unless it chooses to **say** something afterward.
+When alone, the brain may introspect for housekeeping — checking budget, skills, or focus before choosing attention or action. You might never notice unless it chooses to **say** something afterward.
 
 ---
 

@@ -39,6 +39,7 @@ const vector_index = @import("vector_index.zig");
 const emotion = @import("emotion.zig");
 const process = ports.process;
 const helpers = @import("brain_helpers.zig");
+const llm_voice = @import("llm_voice.zig");
 const context_composition = @import("context_composition.zig");
 const experience_kinds = @import("experience_kinds.zig");
 
@@ -169,7 +170,7 @@ pub fn detectWantAchievements(self: *Brain, event_text: []const u8) !usize {
     var reinforced: usize = 0;
     for (result.matches) |match| {
         if (match.confidence < 0.72) continue;
-        const want = helpers.findSelfWantById(memories, match.memory_id) orelse return error.UnknownWantAchievementMemoryId;
+        const want = helpers.findSelfWantById(memories, match.memory_id) orelse continue;
         try reinforceAchievedWant(self, want, match, trimmed);
         reinforced += 1;
     }
@@ -470,23 +471,12 @@ fn deriveTopPriority(self: *Brain) !DerivedFocus {
             };
         }
     }
-    const summaries = try self.deps.store.loadConversationSummaries(self.allocator);
     const memories = try self.deps.store.loadMemoryRecords(self.allocator);
-    const power = try self.deps.system_senses.power(self.allocator);
-    const autonomy_state = try self.autonomyStateForNeeds();
     const active_needs = try needs_mod.evaluate(self.allocator, .{
-        .now_seconds = self.now_seconds,
-        .conversation_summaries = summaries,
         .memory_records = memories,
-        .relationship_graph = try self.deps.graph.summary(self.allocator, 8),
-        .power = power,
-        .autonomy_control_capacity = if (autonomy_state) |state| state.control_capacity else null,
-        .autonomy_max_capacity = if (autonomy_state) |state| state.max_capacity else self.cfg.autonomy_full_max_capacity,
-        .autonomy_sleeping = if (autonomy_state) |state| state.sleeping else null,
     });
     defer needs_mod.freeNeeds(self.allocator, active_needs);
     for (active_needs) |need| {
-        if (std.mem.eql(u8, need.need_id, "conversation_reply")) continue;
         if (need.urgency == .urgent or need.urgency == .need) {
             return .{
                 .priority = "self_need",
@@ -688,21 +678,15 @@ pub fn recallMemories(self: *Brain, query: []const u8, tags: []const []const u8)
         );
         _ = try self.recordSimpleExperienceEvent(experience_kinds.memory_recalled, .memory, recall_payload);
 
-        const line = try std.fmt.allocPrint(self.allocator, "- {s}: {s} [{s}] scope={s} accessed={d} score={d} confidence={d:.3} salience={d:.3} vector_score={d:.3} similarity={d:.3}\n", .{
-            updated.memory_id,
-            helpers.memoryInterpretation(updated),
-            try helpers.joinTags(self.allocator, updated.tags),
-            @tagName(updated.scope),
-            updated.access_count,
-            updated.score,
-            updated.confidence,
-            updated.salience,
-            result.score,
-            result.similarity,
-        });
-        try out.appendSlice(self.allocator, line);
+        const line = try llm_voice.formatSalientMemoryLine(self.allocator, helpers.memoryInterpretation(updated));
+        defer self.allocator.free(line);
+        try out.print(self.allocator, "- {s}\n", .{line});
     }
-    if (results.len == 0) try out.appendSlice(self.allocator, "- none\n");
+    if (results.len == 0) {
+        try out.appendSlice(self.allocator, "- ");
+        try out.appendSlice(self.allocator, llm_voice.empty_inner_state);
+        try out.appendSlice(self.allocator, "\n");
+    }
     return out.toOwnedSlice(self.allocator);
 }
 
@@ -724,8 +708,7 @@ pub fn sweepShortTermMemories(self: *Brain) ![]const u8 {
             try self.deps.store.saveMemoryRecord(updated);
         }
     }
-    const line = try std.fmt.allocPrint(self.allocator, "- decayed={d} removed={d}\n", .{ decayed, removed });
-    try out.appendSlice(self.allocator, line);
+    try out.print(self.allocator, "- I let {d} short-term memories fade; {d} slipped away entirely.\n", .{ decayed, removed });
     return out.toOwnedSlice(self.allocator);
 }
 

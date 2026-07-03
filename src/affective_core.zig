@@ -8,6 +8,7 @@ pub const api = struct {
     pub const openai_client = @import("api/openai_client.zig");
     pub const psyche_client = @import("api/psyche_client.zig");
     pub const persona_directive_client = @import("api/persona_directive_client.zig");
+    pub const dream_image_client = @import("api/dream_image_client.zig");
     pub const random_provider_client = @import("api/random_provider_client.zig");
     pub const recognition_client = @import("api/recognition_client.zig");
     pub const speech_client = @import("api/speech_client.zig");

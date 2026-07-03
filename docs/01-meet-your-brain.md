@@ -119,7 +119,7 @@ stateDiagram-v2
     Unavailable --> Waking
 ```
 
-While **waking**, the brain may be in conversation with you, running autonomy ticks, or simply idle — all normal waking behavior.
+While **waking**, the brain may be in conversation with you, noticing events, thinking privately, acting quietly, speaking, or simply resting — all normal waking behavior.
 
 > **While dreaming**  
 > Conversation and most outward actions pause. Inside, the brain sweeps memory, reconciles contradictions, may revise its wants, and writes a dream record. When it wakes, you may find a **mailbox** message waiting.

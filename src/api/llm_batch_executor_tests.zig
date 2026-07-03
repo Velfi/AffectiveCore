@@ -171,6 +171,36 @@ test "completeTextBatch runs sequentially when dispatch scratch allocator is act
     try std.testing.expectEqual(@as(usize, 2), transport.calls.load(.monotonic));
 }
 
+test "freeHttpResponse skips scratch frees so arena reset stays safe" {
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+
+    const Transport = struct {
+        fn client(_: *@This()) http_transport.Client {
+            return .{ .ctx = @as(*anyopaque, @ptrFromInt(1)), .postJsonFn = postJson };
+        }
+
+        fn postJson(_: *anyopaque, alloc: std.mem.Allocator, _: http_transport.JsonPostRequest) ![]u8 {
+            return try alloc.dupe(u8, "llm-body");
+        }
+    };
+
+    var io_threaded: std.Io.Threaded = .init_single_threaded;
+    defer io_threaded.deinit();
+    const roster = try llm_routing.parseRosterFromModelsSpec(std.testing.allocator, "openai:gpt-4.1-nano");
+    var client = random_provider.RandomProviderClient.initWithRoster(io_threaded.io(), Transport.client(), roster, .auto);
+    client.http_response_allocator = scratch.allocator();
+
+    const content = try client.completeTextOnce(std.testing.allocator, .{
+        .subsystem = "chat",
+        .system_prompt = "s",
+        .user_prompt = "u",
+        .response_format = .text,
+    });
+    client.freeHttpResponse(std.testing.allocator, content);
+    _ = scratch.reset(.free_all);
+}
+
 test "completeTextBatch records stats for each successful item" {
     if (comptime @import("builtin").single_threaded) return;
 

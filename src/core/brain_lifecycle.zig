@@ -43,6 +43,10 @@ const learning = @import("learning.zig");
 const memory_selection_mod = @import("memory_selection.zig");
 const context_tier = @import("context_tier.zig");
 const read_models = @import("read_models.zig");
+const stimulus_inbox_mod = @import("stimulus_inbox.zig");
+const work_registry_mod = @import("work_registry.zig");
+const stimulus_ingest_mod = @import("stimulus_ingest.zig");
+const attention_scheduler_mod = @import("attention_scheduler.zig");
 const experience_kinds = @import("experience_kinds.zig");
 const recognition_composite = @import("recognition_composite.zig");
 const belief_updates = @import("belief_updates.zig");
@@ -249,8 +253,17 @@ pub fn init(allocator: std.mem.Allocator, cfg: config_mod.Config, deps: BrainDep
         .runtime = brain_mod.BrainRuntime.init(allocator, .{}),
         .now_seconds = initial_now,
         .context_stats = brain_context_stats.State.init(allocator),
+        .stimulus_inbox = stimulus_inbox_mod.Inbox.init(allocator, cfg.capacity.stimulus_inbox_max),
+        .work_registry = work_registry_mod.Registry.init(cfg.capacity.work_registry_max),
     };
     return brain;
+}
+
+pub fn pollStimulusInbox(self: *Brain) !void {
+    if (self.deps.stimulus_poll) |poll| {
+        if (self.deps.stimulus_poll_ctx) |ctx| try poll(ctx);
+    }
+    try stimulus_ingest_mod.pollInbox(self);
 }
 
 pub fn clearChatParseFailure(self: *Brain) void {
@@ -267,6 +280,24 @@ pub fn rememberChatParseFailure(self: *Brain, body: []const u8) !void {
 
 pub fn chatParseFailureBody(self: *Brain) ?[]const u8 {
     return self.chat_parse_failure_body;
+}
+
+pub fn rememberHostHttpErrorDetail(self: *Brain, detail: []const u8) error{OutOfMemory}!void {
+    const trimmed = std.mem.trim(u8, detail, &std.ascii.whitespace);
+    if (trimmed.len == 0) return;
+    if (self.last_host_http_error_detail) |prev| self.allocator.free(prev);
+    self.last_host_http_error_detail = try self.allocator.dupe(u8, trimmed);
+}
+
+pub fn hostHttpErrorDetail(self: *Brain) ?[]const u8 {
+    return self.last_host_http_error_detail;
+}
+
+pub fn clearHostHttpErrorDetail(self: *Brain) void {
+    if (self.last_host_http_error_detail) |prev| {
+        self.allocator.free(prev);
+        self.last_host_http_error_detail = null;
+    }
 }
 
 pub fn executeRuntimeProposalBatch(self: *Brain, proposals: []chat_mod.ActionProposal, observations: *std.ArrayList(u8)) !ActionPressureBatchResult {
@@ -640,6 +671,11 @@ pub fn runHostSenseFollowUpChat(
 ) !?ConversationTurnResult {
     if (!shouldFollowUpAfterHostSenseDelivery(self, delivery_was_awaited)) return null;
 
+    if (!delivery_was_awaited and !attention_scheduler_mod.shouldRunFullChatPass(self, .host_sense_delivery)) {
+        try integrateHostSenseDeliverySilently(self, delivered_line);
+        return null;
+    }
+
     const assessment = present_moment.assessHostDelivery(self, delivered_line, bind);
     if (!present_moment.shouldDeliberateAfterHostDelivery(self, assessment)) {
         try integrateHostSenseDeliverySilently(self, delivered_line);
@@ -744,8 +780,25 @@ pub fn clearPendingDeferredSpeech(self: *Brain) void {
     freeHeardSpeechFields(self, deferred);
 }
 
-fn stashDeferredSpeech(self: *Brain, heard_speech: input_mod.HeardSpeech) !void {
-    clearPendingDeferredSpeech(self);
+pub fn stashDeferredSpeech(self: *Brain, heard_speech: input_mod.HeardSpeech) !void {
+    // Fragments arriving while a turn is in flight coalesce into one deferred
+    // utterance, so the follow-up is a single deliberation over the burst.
+    if (self.pending_deferred_heard_speech) |existing| {
+        const joined = try std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ existing.text, heard_speech.text });
+        defer self.allocator.free(joined);
+        const merged = try cloneHeardSpeech(self, .{
+            .text = joined,
+            .source = heard_speech.source,
+            .provider = heard_speech.provider,
+            .model_path = heard_speech.model_path,
+            .audio_path = heard_speech.audio_path,
+            .raw_provider_json_path = heard_speech.raw_provider_json_path,
+            .summary_json = heard_speech.summary_json,
+        });
+        clearPendingDeferredSpeech(self);
+        self.pending_deferred_heard_speech = merged;
+        return;
+    }
     self.pending_deferred_heard_speech = try cloneHeardSpeech(self, heard_speech);
 }
 
@@ -857,6 +910,15 @@ pub fn handleHostVisualObservation(
         }
         if (try runHostSenseFollowUpChat(self, observation_line, true, bind)) |conversation| {
             return .{ .conversation_resume = conversation };
+        }
+        if (shouldFollowUpAfterHostSenseDelivery(self, true)) {
+            if (std.mem.indexOf(u8, observation_line, "Current speaker recognition:") != null or
+                std.mem.indexOf(u8, observation_line, "picture:") != null)
+            {
+                return .{ .recognition_only = observation_line };
+            }
+            const detail = try std.fmt.allocPrint(self.allocator, "camera: observed image at {s}", .{owned_path});
+            return .{ .detail_only = detail };
         }
     }
 
@@ -1234,7 +1296,6 @@ fn runConversationTurnBody(self: *Brain, heard_speech: input_mod.HeardSpeech) !C
         heard_speech,
         if (speaker_context) |context| context.memory_line else null,
         memory_selection_result,
-        turn_event.id,
         overlap_nudge,
         had_pending_hard_error,
     ));
@@ -1422,6 +1483,8 @@ pub fn reactToSalientSense(self: *Brain, packet: stimulus_mod.Packet) !?Conversa
     const brain_mode = self.deps.store.loadBrainMode() catch .waking;
     if (brain_mode == .dreaming or brain_mode == .waking_up or brain_mode == .unavailable or brain_mode == .drowsy) return null;
 
+    try brain_autonomy.maybeWakeFromSalientSense(self, @tagName(packet.kind), packet.attention_intensity);
+
     if (brain_process.activeConversationPresent(self)) {
         const observation_line = try std.fmt.allocPrint(
             self.allocator,
@@ -1440,11 +1503,21 @@ pub fn reactToSalientSense(self: *Brain, packet: stimulus_mod.Packet) !?Conversa
     defer self.allocator.free(orchestration_text);
 
     try self.refreshFocus();
-    const orchestration_preamble = try std.fmt.allocPrint(
-        self.allocator,
-        "salient_sense:\n- kind: {s}\n- attention_intensity: {d:.3}\n- note: this sense is strong enough to warrant reconsideration; choose whether to speak, look, remember, or wait.\n",
-        .{ @tagName(packet.kind), packet.attention_intensity },
-    );
+    const pending_speech = try stimulus_ingest_mod.pendingHeardSpeechCoalesced(self);
+    defer if (pending_speech) |text| self.allocator.free(text);
+    if (pending_speech != null) stimulus_ingest_mod.markPendingHeardSpeechHandled(self);
+    const orchestration_preamble = if (pending_speech) |speech_text|
+        try std.fmt.allocPrint(
+            self.allocator,
+            "salient_sense:\n- kind: {s}\n- attention_intensity: {d:.3}\n- note: this sense is strong enough to warrant reconsideration; choose whether to speak, look, remember, or wait.\npending_user_speech (unanswered, arrived before this sense — address it, do not ignore it):\n{s}\n",
+            .{ @tagName(packet.kind), packet.attention_intensity, speech_text },
+        )
+    else
+        try std.fmt.allocPrint(
+            self.allocator,
+            "salient_sense:\n- kind: {s}\n- attention_intensity: {d:.3}\n- note: this sense is strong enough to warrant reconsideration; choose whether to speak, look, remember, or wait.\n",
+            .{ @tagName(packet.kind), packet.attention_intensity },
+        );
     defer self.allocator.free(orchestration_preamble);
 
     const prepared = composeAndPrepareConversationContext(
@@ -1880,8 +1953,12 @@ pub fn runAutonomyReplenishFromPush(self: *Brain, io: std.Io, points: u32) !f32 
 }
 
 pub fn runAutonomyTick(self: *Brain, io: std.Io) !void {
-    if (!self.autonomyEnabled()) return;
+    if (!self.attentionLoopEnabled()) return;
     self.syncClock(io);
+    if (self.stimulus_inbox.pendingCount() > 0) {
+        try self.runStimulusAutonomy(io);
+        return;
+    }
     const fs = self.deps.filesystem orelse return error.MissingFileSystem;
     var state = try maintenance.loadAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, self.defaultAutonomySleeping(), self.cfg.autonomy_mode, .{
         .limited_max_capacity = self.cfg.autonomy_limited_max_capacity,
@@ -1905,8 +1982,8 @@ pub fn runAutonomyTick(self: *Brain, io: std.Io) !void {
         },
         .idle => {},
     }
-    if (!maintenance.autonomyPlannerReady(state)) {
-        const reason = "autonomy waiting: overdrawn";
+    if (!maintenance.autonomyActionsAvailable(state)) {
+        const reason = try brain_autonomy.autonomyBlockedReason(self, io, state);
         state.last_reason = try self.allocator.dupe(u8, reason);
         try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state);
         try self.logAutonomyStatus("autonomy blocked", reason);
@@ -1916,19 +1993,39 @@ pub fn runAutonomyTick(self: *Brain, io: std.Io) !void {
 }
 
 pub fn runStimulusAutonomy(self: *Brain, io: std.Io) !void {
-    if (!self.autonomyEnabled()) return;
+    if (!self.attentionLoopEnabled()) return;
     self.syncClock(io);
+    switch (attention_scheduler_mod.chooseNextWork(self)) {
+        .hold => {
+            try self.logAutonomyStatus("attention hold", "pending stimulus did not need deliberation");
+            try self.pollStimulusInbox();
+            return;
+        },
+        .coalesce_hold => {
+            // Leave the inbox pending: the user is still composing, and the
+            // fragments will be answered together once typing goes quiet.
+            try self.logAutonomyStatus("attention coalescing", "stimulus burst in progress; holding for one deliberation");
+            return;
+        },
+        .cotext_integrate => {
+            try self.logAutonomyStatus("attention integrated", "stimulus updated attention without choosing speech");
+            try self.pollStimulusInbox();
+            return;
+        },
+        .foreground_chat, .host_follow_up, .process_advance => {},
+    }
     const fs = self.deps.filesystem orelse return error.MissingFileSystem;
     var state = try maintenance.loadAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, self.defaultAutonomySleeping(), self.cfg.autonomy_mode, .{
         .limited_max_capacity = self.cfg.autonomy_limited_max_capacity,
         .full_max_capacity = self.cfg.autonomy_full_max_capacity,
     });
+    if (state.sleeping) try brain_autonomy.wakeFromForegroundStimulus(self, io, &state);
     if (!try prepareAutonomyPlanning(self, io, &state)) return;
     switch (try brain_autonomy.tickActiveAutonomyProcess(self)) {
         .waiting, .advanced => return,
         .idle => {},
     }
-    if (!maintenance.autonomyPlannerReady(state)) return;
+    if (!maintenance.autonomyActionsAvailable(state)) return;
     try runAutonomyPlannerWithState(self, io, &state);
 }
 
@@ -1942,18 +2039,18 @@ fn prepareAutonomyPlanning(self: *Brain, io: std.Io, state: *maintenance.Autonom
     }
     const fs = self.deps.filesystem orelse return error.MissingFileSystem;
     if (state.sleeping) {
-        try self.logAutonomyStatus("autonomy blocked", "autonomy sleeping");
-        return false;
+        // Persisted sleep only holds while the owner keeps rest on or quiet
+        // hours are active; otherwise the schedule ends the sleep.
+        const in_quiet_hours = brain_autonomy.inQuietHours(self, io) catch true;
+        if (!self.defaultAutonomySleeping() and !in_quiet_hours) {
+            try brain_autonomy.wakeAutonomyFromStimulus(self, io, state, "woke: outside quiet hours");
+        } else {
+            try self.logAutonomyStatus("autonomy blocked", "autonomy sleeping");
+            return false;
+        }
     }
     if (try self.deps.input.isActive(self.allocator)) {
         const reason = "autonomy paused: human input active";
-        state.last_reason = try self.allocator.dupe(u8, reason);
-        try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state.*);
-        try self.logAutonomyStatus("autonomy blocked", reason);
-        return false;
-    }
-    if (maintenance.autonomyActionCooldownActive(state.*, self.now_seconds)) {
-        const reason = "autonomy paused: action cooldown";
         state.last_reason = try self.allocator.dupe(u8, reason);
         try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state.*);
         try self.logAutonomyStatus("autonomy blocked", reason);
@@ -1964,6 +2061,13 @@ fn prepareAutonomyPlanning(self: *Brain, io: std.Io, state: *maintenance.Autonom
 
 fn runAutonomyPlannerWithState(self: *Brain, io: std.Io, state: *maintenance.AutonomyState) !void {
     const fs = self.deps.filesystem orelse return error.MissingFileSystem;
+    if (!maintenance.autonomyActionsAvailable(state.*)) {
+        const reason = try brain_autonomy.autonomyBlockedReason(self, io, state.*);
+        state.last_reason = try self.allocator.dupe(u8, reason);
+        try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state.*);
+        try self.logAutonomyStatus("autonomy blocked", reason);
+        return;
+    }
     const planner = self.deps.autonomy_planner orelse return error.MissingAutonomyPlanner;
     state.last_autonomy_tick_at = self.now_seconds;
     try maintenance.saveAutonomyState(self.allocator, fs, io, self.cfg.maintenance_state_path, state.*);
@@ -1977,6 +2081,9 @@ fn runAutonomyPlannerWithState(self: *Brain, io: std.Io, state: *maintenance.Aut
         return err;
     };
     defer autonomy_mod.freeAutonomyTurn(self.allocator, turn);
+    // The plan deliberated over the coalesced pending speech in its context;
+    // consume those fragments so mid-turn polls do not re-stash them.
+    stimulus_ingest_mod.markPendingHeardSpeechHandled(self);
     const composition_context = try process_goal_resolver.buildAutonomyCompositionContext(self.allocator, context, turn.reason);
     defer self.allocator.free(composition_context);
     const expanded_turn = try process_goal_resolver.expandAutonomyTurn(self, turn, composition_context);

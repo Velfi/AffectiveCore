@@ -117,8 +117,8 @@ test "conversation memory includes seeded self goals" {
 
     const memory = try brain.buildConversationMemory();
     try std.testing.expect(std.mem.indexOf(u8, memory, "inner_directives:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, memory, "self_wants:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, memory, "self_goals:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "what_i_want:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "what_i_am_working_toward:") != null);
     try std.testing.expect(std.mem.indexOf(u8, memory, "self-defined goal: Figure out who I am") != null);
     try std.testing.expect(std.mem.indexOf(u8, memory, "self-defined want: Continue existing.") != null);
 }

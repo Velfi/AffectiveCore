@@ -4,6 +4,7 @@ const belief_updates = @import("belief_updates.zig");
 const capabilities = @import("capabilities.zig");
 const capability_registry = @import("capability_registry.zig");
 const experience_kinds = @import("experience_kinds.zig");
+const json_store_cognitive = @import("../storage/json_store_cognitive.zig");
 const ports = @import("ports.zig");
 const schema = ports.schema;
 
@@ -11,6 +12,10 @@ const Brain = brain_mod.Brain;
 
 pub const HostSensePullError = error{
     UnknownHostSensePull,
+};
+
+pub const HostSenseUnavailableError = error{
+    HostSenseUnavailable,
 };
 
 /// Brain cold-start wait when this host has no latency sample and no activation history yet.
@@ -96,6 +101,26 @@ fn requestDurationMs(requests: []const schema.CapabilityRequest, request_id: []c
         return @intCast(@min(delta, @as(i64, max_pull_timeout_ms)));
     }
     return 0;
+}
+
+/// Hosts report sense-level availability under the sense name ("camera" from
+/// permission flows) or "<sense>_read" (pull-sense status acks). The most recent
+/// report wins; an empty store means no host has spoken, so the pull stays allowed.
+pub fn hostSenseReportedUnavailable(self: *Brain, sense: []const u8) bool {
+    const statuses = self.deps.store.loadCapabilityStatuses(self.allocator) catch return false;
+    const host_id = self.currentHostId();
+    var read_id_buf: [64]u8 = undefined;
+    const read_id = std.fmt.bufPrint(&read_id_buf, "{s}_read", .{sense}) catch return false;
+    var latest_ms: i64 = 0;
+    var blocked = false;
+    for (statuses) |status| {
+        if (!std.mem.eql(u8, status.host_id, host_id)) continue;
+        if (!std.mem.eql(u8, status.capability_id, sense) and !std.mem.eql(u8, status.capability_id, read_id)) continue;
+        if (status.updated_at_ms == 0 or status.updated_at_ms < latest_ms) continue;
+        latest_ms = status.updated_at_ms;
+        blocked = status.availability == .unavailable or status.availability == .refused;
+    }
+    return blocked;
 }
 
 pub fn resolvePullTimeoutMs(self: *Brain, sense: []const u8, purpose: []const u8) !PullTimeoutDecision {
@@ -237,7 +262,8 @@ fn recordActivationOutcome(
     source_event_id: []const u8,
 ) !void {
     const stats = try activationStats(self, host_id, capability_id);
-    const source_event_ids = if (source_event_id.len > 0) &[_][]const u8{source_event_id} else &.{};
+    var source_event_ids_buf: [1][]const u8 = .{source_event_id};
+    const source_event_ids = if (source_event_id.len > 0) source_event_ids_buf[0..] else &.{};
     try belief_updates.onHostCapabilityActivation(
         self,
         host_id,
@@ -251,7 +277,9 @@ fn recordActivationOutcome(
 }
 
 fn maybeRefreshObservedLatency(self: *Brain, host_id: []const u8, capability_id: []const u8, duration_ms: u32) !void {
-    const status = findCapabilityStatus(self, host_id, capability_id);
+    const borrowed = findCapabilityStatus(self, host_id, capability_id);
+    const status = try json_store_cognitive.cloneCapabilityStatusValidated(self.allocator, borrowed);
+    defer json_store_cognitive.freeCapabilityStatus(self.allocator, status);
     const updated_latency = if (status.latency_ms > 0)
         @divTrunc(status.latency_ms + duration_ms, 2)
     else

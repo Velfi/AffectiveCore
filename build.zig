@@ -77,6 +77,67 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(api_e2e);
 
+    const brain_quality_e2e = b.addExecutable(.{
+        .name = "brain-quality-e2e",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main_brain_quality_e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    brain_quality_e2e.root_module.linkSystemLibrary("sqlite3", .{});
+    b.installArtifact(brain_quality_e2e);
+
+    const session = b.addExecutable(.{
+        .name = "affective-core-session",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main_session.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    session.root_module.linkSystemLibrary("sqlite3", .{});
+    b.installArtifact(session);
+
+    const affective_mcp = b.addExecutable(.{
+        .name = "affective-mcp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main_affective_mcp.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    affective_mcp.root_module.linkSystemLibrary("sqlite3", .{});
+    b.installArtifact(affective_mcp);
+
+    const affective_mcp_stdio = b.addExecutable(.{
+        .name = "affective-mcp-stdio",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main_affective_mcp_stdio.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    affective_mcp_stdio.root_module.addIncludePath(b.path("include"));
+    affective_mcp_stdio.root_module.linkSystemLibrary("sqlite3", .{});
+    b.installArtifact(affective_mcp_stdio);
+
+    const session_lib = b.addLibrary(.{
+        .name = "affective-core-session",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main_session.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    session_lib.bundle_compiler_rt = true;
+    if (target.result.os.tag != .ios) {
+        session_lib.root_module.linkSystemLibrary("sqlite3", .{});
+    } else {
+        session_lib.root_module.link_libc = true;
+    }
+
     const llm_tester_manifest = b.addExecutable(.{
         .name = "affective-core-llm-tester-manifest",
         .root_module = b.createModule(.{
@@ -115,11 +176,27 @@ pub fn build(b: *std.Build) void {
     const mcp_step = b.step("mcp", "Build and install the stdio MCP server");
     mcp_step.dependOn(&install_mcp.step);
 
+    const install_affective_mcp = b.addInstallArtifact(affective_mcp, .{});
+    const affective_mcp_step = b.step("affective-mcp", "Build and install the TCP-backed Affective MCP host");
+    affective_mcp_step.dependOn(&install_affective_mcp.step);
+
+    const install_affective_mcp_stdio = b.addInstallArtifact(affective_mcp_stdio, .{});
+    const affective_mcp_stdio_step = b.step("affective-mcp-stdio", "Build and install the embedded stdio-only Affective MCP host");
+    affective_mcp_stdio_step.dependOn(&install_affective_mcp_stdio.step);
+
     const install_embedded = b.addInstallArtifact(embedded, .{});
     const install_embedded_header = b.addInstallHeaderFile(b.path("include/affective_core_embedded.h"), "affective_core_embedded.h");
     const embedded_step = b.step("embedded", "Build and install the Affective embeddable static library");
     embedded_step.dependOn(&install_embedded.step);
     embedded_step.dependOn(&install_embedded_header.step);
+
+    const install_session = b.addInstallArtifact(session, .{});
+    const install_session_lib = b.addInstallArtifact(session_lib, .{});
+    const install_session_header = b.addInstallHeaderFile(b.path("include/affective_core_session.h"), "affective_core_session.h");
+    const session_step = b.step("session", "Build and install the Brain Session Protocol runtime");
+    session_step.dependOn(&install_session.step);
+    session_step.dependOn(&install_session_lib.step);
+    session_step.dependOn(&install_session_header.step);
 
     const run_api_health_cmd = b.addRunArtifact(api_health);
     run_api_health_cmd.step.dependOn(b.getInstallStep());
@@ -134,6 +211,14 @@ pub fn build(b: *std.Build) void {
 
     const api_e2e_step = b.step("api-e2e", "Run live LLM and image API contract checks");
     api_e2e_step.dependOn(&run_api_e2e_cmd.step);
+
+    const install_brain_quality_e2e = b.addInstallArtifact(brain_quality_e2e, .{});
+    const run_brain_quality_e2e_cmd = b.addRunArtifact(brain_quality_e2e);
+    run_brain_quality_e2e_cmd.step.dependOn(&install_brain_quality_e2e.step);
+    if (b.args) |args| run_brain_quality_e2e_cmd.addArgs(args);
+
+    const brain_quality_e2e_step = b.step("brain-quality-e2e", "Run live brain quality E2E scenarios and emit snapshot JSON");
+    brain_quality_e2e_step.dependOn(&run_brain_quality_e2e_cmd.step);
 
     const lint_module_size = b.addExecutable(.{
         .name = "lint-module-size",
@@ -162,6 +247,62 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    const embedded_ffi_fuzz = b.addExecutable(.{
+        .name = "embedded-ffi-fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main_embedded_ffi_fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    embedded_ffi_fuzz.root_module.addIncludePath(b.path("include"));
+    embedded_ffi_fuzz.root_module.linkSystemLibrary("sqlite3", .{});
+    const install_embedded_ffi_fuzz = b.addInstallArtifact(embedded_ffi_fuzz, .{});
+    const embedded_ffi_fuzz_build_step = b.step("embedded-ffi-fuzz-build", "Build embedded JSON dispatch fuzz harness");
+    embedded_ffi_fuzz_build_step.dependOn(&install_embedded_ffi_fuzz.step);
+
+    const run_embedded_ffi_fuzz = b.addRunArtifact(embedded_ffi_fuzz);
+    run_embedded_ffi_fuzz.step.dependOn(&install_embedded_ffi_fuzz.step);
+    if (b.args) |args| run_embedded_ffi_fuzz.addArgs(args);
+
+    const embedded_ffi_fuzz_step = b.step("embedded-ffi-fuzz", "Run embedded JSON dispatch fuzz harness (pass --iterations N --seed S)");
+    embedded_ffi_fuzz_step.dependOn(&run_embedded_ffi_fuzz.step);
+
+    const dispatch_deadlock_stress = b.addExecutable(.{
+        .name = "dispatch-deadlock-stress",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main_dispatch_deadlock_stress.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    dispatch_deadlock_stress.root_module.addIncludePath(b.path("include"));
+    dispatch_deadlock_stress.root_module.linkSystemLibrary("sqlite3", .{});
+    const install_dispatch_deadlock_stress = b.addInstallArtifact(dispatch_deadlock_stress, .{});
+    const dispatch_deadlock_stress_build_step = b.step("dispatch-deadlock-stress-build", "Build dispatch deadlock stress harness");
+    dispatch_deadlock_stress_build_step.dependOn(&install_dispatch_deadlock_stress.step);
+
+    const run_dispatch_deadlock_stress = b.addRunArtifact(dispatch_deadlock_stress);
+    run_dispatch_deadlock_stress.step.dependOn(&install_dispatch_deadlock_stress.step);
+    if (b.args) |args| run_dispatch_deadlock_stress.addArgs(args);
+
+    const dispatch_deadlock_stress_step = b.step("dispatch-deadlock-stress", "Run dispatch deadlock stress harness (pass --cycles N --pressure N --seed S)");
+    dispatch_deadlock_stress_step.dependOn(&run_dispatch_deadlock_stress.step);
+
+    const dispatch_deadlock_model = b.addExecutable(.{
+        .name = "dispatch-deadlock-model",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main_dispatch_deadlock_model.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_dispatch_deadlock_model = b.addRunArtifact(dispatch_deadlock_model);
+    if (b.args) |args| run_dispatch_deadlock_model.addArgs(args);
+
+    const dispatch_deadlock_model_step = b.step("dispatch-deadlock-model", "Exhaustively model-check dispatch routing for internal deadlocks");
+    dispatch_deadlock_model_step.dependOn(&run_dispatch_deadlock_model.step);
 
     const reinit_brain_cmd = b.addSystemCommand(&.{ "sh", "scripts/reinit_brain_data.sh" });
     if (b.args) |args| reinit_brain_cmd.addArgs(args);

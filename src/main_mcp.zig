@@ -234,7 +234,7 @@ const Server = struct {
             touched_runtime = true;
         }
         if (!touched_runtime and !touched_llm) return error.MissingRuntimeOptionField;
-        const local_fs = files_mod.LocalFileSystem{};
+        var local_fs = files_mod.LocalFileSystem{};
         if (touched_runtime) try config_mod.saveRuntimeOptions(self.allocator, local_fs.filesystem(), self.io, self.brain.cfg);
         if (touched_llm) try config_mod.saveLlmProviders(self.allocator, local_fs.filesystem(), self.io, self.brain.cfg);
         return std.json.Stringify.valueAlloc(self.allocator, struct {
@@ -283,9 +283,17 @@ const Server = struct {
     fn capabilityStatusBatch(self: *Server, args: std.json.Value) ![]const u8 {
         const statuses_value = if (args == .object) args.object.get("statuses") orelse return error.MissingCapabilityStatuses else return error.MissingCapabilityStatuses;
         if (statuses_value != .array) return error.ExpectedCapabilityStatusArray;
-        try self.brain.deps.store.beginDeferredPersist();
-        errdefer self.brain.deps.store.endDeferredPersist() catch @panic("capability status batch deferred persist end failed");
-        for (statuses_value.array.items) |item| {
+        var persist = try self.brain.deps.store.deferredPersistGuard();
+        const capability_count = capabilityStatusBatchInner(self, statuses_value.array.items) catch |err| {
+            persist.cancel() catch return error.DeferredPersistEndFailed;
+            return err;
+        };
+        try persist.commit();
+        return std.json.Stringify.valueAlloc(self.allocator, struct { capability_count: usize }{ .capability_count = capability_count }, .{ .whitespace = .indent_2 });
+    }
+
+    fn capabilityStatusBatchInner(self: *Server, statuses: []std.json.Value) !usize {
+        for (statuses) |item| {
             if (item != .object) return error.ExpectedCapabilityStatusObject;
             const object = item.object;
             const capability_id = object.get("capability_id") orelse return error.MissingRequiredString;
@@ -309,8 +317,7 @@ const Server = struct {
             };
             try self.brain.recordCapabilityStatus(status);
         }
-        try self.brain.deps.store.endDeferredPersist();
-        return std.json.Stringify.valueAlloc(self.allocator, struct { capability_count: usize }{ .capability_count = statuses_value.array.items.len }, .{ .whitespace = .indent_2 });
+        return statuses.len;
     }
 
     fn exportBrain(self: *Server, path: []const u8) ![]const u8 {

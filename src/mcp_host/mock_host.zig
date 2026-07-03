@@ -18,6 +18,25 @@ pub const Mode = enum {
     touch_speak,
 };
 
+const PendingRequest = struct {
+    request_id: []const u8,
+    url: []const u8,
+    headers_json: []const u8,
+    body: []const u8,
+    completed: bool = false,
+    response: []const u8 = "",
+    error_msg: []const u8 = "",
+
+    fn deinit(self: *PendingRequest) void {
+        std.heap.page_allocator.free(self.request_id);
+        std.heap.page_allocator.free(self.url);
+        std.heap.page_allocator.free(self.headers_json);
+        std.heap.page_allocator.free(self.body);
+        if (self.response.len > 0) std.heap.page_allocator.free(self.response);
+        if (self.error_msg.len > 0) std.heap.page_allocator.free(self.error_msg);
+    }
+};
+
 pub const MockHost = struct {
     mode: Mode,
     llm_calls: usize = 0,
@@ -26,58 +45,175 @@ pub const MockHost = struct {
     vision_calls: usize = 0,
     identify_calls: usize = 0,
     enroll_calls: usize = 0,
+    next_request_id: u64 = 1,
+    pending_request: ?PendingRequest = null,
 
     pub fn hostServices(self: *MockHost) embedded.AffectiveCoreEmbeddedHostServices {
         return .{
             .ctx = self,
-            .http_post_json = httpPostJson,
+            .http_post_json_begin = httpPostJsonBegin,
+            .http_post_json_poll = httpPostJsonPoll,
             .free_string = freeHostString,
+            .on_host_events = null,
         };
     }
 
-    fn httpPostJson(
+    pub fn deinit(self: *MockHost) void {
+        if (self.pending_request) |*pending| {
+            pending.deinit();
+            self.pending_request = null;
+        }
+    }
+
+    fn httpPostJsonBegin(
         ctx: ?*anyopaque,
         url: AffectiveCoreEmbeddedString,
-        _: AffectiveCoreEmbeddedString,
+        headers_json: AffectiveCoreEmbeddedString,
         body: AffectiveCoreEmbeddedString,
+        out_request_id: ?*AffectiveCoreEmbeddedString,
+        out_error: ?*AffectiveCoreEmbeddedString,
+    ) callconv(.c) c_int {
+        const self: *MockHost = @ptrCast(@alignCast(ctx orelse {
+            return hostFailure(out_error, out_request_id, "missing mock host context");
+        }));
+        const url_slice = embedded_config.stringSlice(url) orelse "";
+        const headers_slice = embedded_config.stringSlice(headers_json) orelse "";
+        const body_slice = embedded_config.stringSlice(body) orelse "";
+
+        const request_id_num = self.next_request_id;
+        self.next_request_id += 1;
+        const request_id = std.fmt.allocPrint(std.heap.page_allocator, "mock-req-{d}", .{request_id_num}) catch {
+            return hostFailure(out_error, out_request_id, "could not allocate mock request id");
+        };
+
+        const owned_url = std.heap.page_allocator.dupe(u8, url_slice) catch {
+            std.heap.page_allocator.free(request_id);
+            return hostFailure(out_error, out_request_id, "could not store mock request url");
+        };
+        const owned_headers = std.heap.page_allocator.dupe(u8, headers_slice) catch {
+            std.heap.page_allocator.free(request_id);
+            std.heap.page_allocator.free(owned_url);
+            return hostFailure(out_error, out_request_id, "could not store mock request headers");
+        };
+        const owned_body = std.heap.page_allocator.dupe(u8, body_slice) catch {
+            std.heap.page_allocator.free(request_id);
+            std.heap.page_allocator.free(owned_url);
+            std.heap.page_allocator.free(owned_headers);
+            return hostFailure(out_error, out_request_id, "could not store mock request body");
+        };
+
+        if (self.pending_request != null) {
+            std.heap.page_allocator.free(request_id);
+            std.heap.page_allocator.free(owned_url);
+            std.heap.page_allocator.free(owned_headers);
+            std.heap.page_allocator.free(owned_body);
+            return hostFailure(out_error, out_request_id, "mock host already has a pending HTTP request");
+        }
+        self.pending_request = .{
+            .request_id = request_id,
+            .url = owned_url,
+            .headers_json = owned_headers,
+            .body = owned_body,
+        };
+
+        if (out_error) |err_out| err_out.* = .{};
+        if (out_request_id) |id_out| {
+            const core_request_id = std.heap.page_allocator.dupe(u8, request_id) catch {
+                std.heap.page_allocator.free(request_id);
+                std.heap.page_allocator.free(owned_url);
+                std.heap.page_allocator.free(owned_headers);
+                std.heap.page_allocator.free(owned_body);
+                id_out.* = .{};
+                return 1;
+            };
+            id_out.* = .{ .ptr = core_request_id.ptr, .len = core_request_id.len };
+        }
+        return 0;
+    }
+
+    fn httpPostJsonPoll(
+        ctx: ?*anyopaque,
+        request_id: AffectiveCoreEmbeddedString,
         out_data: ?*AffectiveCoreEmbeddedString,
         out_error: ?*AffectiveCoreEmbeddedString,
     ) callconv(.c) c_int {
         const self: *MockHost = @ptrCast(@alignCast(ctx orelse {
-            return hostFailure(out_data, out_error, "missing mock host context");
+            return hostFailure(out_error, null, "missing mock host context");
         }));
-        const url_slice = embedded_config.stringSlice(url) orelse "";
-        const body_slice = embedded_config.stringSlice(body) orelse "";
+        const request_id_slice = embedded_config.stringSlice(request_id) orelse {
+            return hostFailure(out_error, out_data, "missing mock request id");
+        };
+
+        const pending = self.pending_request orelse {
+            return hostFailure(out_error, out_data, "unknown mock request id");
+        };
+        if (!std.mem.eql(u8, pending.request_id, request_id_slice)) {
+            return hostFailure(out_error, out_data, "unknown mock request id");
+        }
+        var entry = self.pending_request.?;
+        if (!entry.completed) {
+            const result = self.completePendingRequest(&entry);
+            entry.completed = true;
+            entry.response = std.heap.page_allocator.dupe(u8, result.response) catch "";
+            if (result.error_msg.len > 0) {
+                entry.error_msg = std.heap.page_allocator.dupe(u8, result.error_msg) catch "";
+            }
+            self.pending_request = entry;
+        }
+        const active = self.pending_request.?;
+        defer {
+            var finished = self.pending_request.?;
+            finished.deinit();
+            self.pending_request = null;
+        }
+        if (active.error_msg.len > 0) {
+            return hostFailure(out_error, out_data, active.error_msg);
+        }
+        return hostSuccess(out_data, out_error, active.response);
+    }
+
+    fn completePendingRequest(self: *MockHost, pending: *PendingRequest) struct {
+        response: []const u8,
+        error_msg: []const u8,
+    } {
+        const url_slice = pending.url;
+        const body_slice = pending.body;
 
         if (std.mem.endsWith(u8, url_slice, "/llm/complete")) {
             self.llm_calls += 1;
             if (self.mode == .upstream_rejected) {
-                return hostFailure(out_data, out_error, "upstream provider rejected request");
+                return .{
+                    .response = "",
+                    .error_msg = std.heap.page_allocator.dupe(u8, "upstream provider rejected request") catch "",
+                };
             }
-            return hostSuccess(out_data, out_error, self.llmResponse(body_slice));
+            return .{ .response = self.llmResponse(body_slice), .error_msg = "" };
         }
         if (std.mem.endsWith(u8, url_slice, "/vision/complete")) {
             self.vision_calls += 1;
-            return hostSuccess(out_data, out_error, visionDescriptionResponse());
+            return .{ .response = visionDescriptionResponse(), .error_msg = "" };
         }
         if (std.mem.endsWith(u8, url_slice, "/recognize/identify")) {
             self.identify_calls += 1;
-            return hostSuccess(out_data, out_error, identifyResponse(body_slice));
+            return .{ .response = identifyResponse(body_slice), .error_msg = "" };
         }
         if (std.mem.endsWith(u8, url_slice, "/recognize/enroll")) {
             self.enroll_calls += 1;
-            return hostSuccess(out_data, out_error, enrollResponse());
+            return .{ .response = enrollResponse(), .error_msg = "" };
         }
         if (std.mem.endsWith(u8, url_slice, "/embed/compute")) {
-            return hostSuccess(out_data, out_error, embedResponse(body_slice));
+            return .{ .response = embedResponse(body_slice), .error_msg = "" };
         }
         if (std.mem.eql(u8, url_slice, "affective-host://system/power")) {
-            return hostSuccess(out_data, out_error, "{\"supplies\":[]}");
+            return .{ .response = "{\"supplies\":[]}", .error_msg = "" };
         }
         if (std.mem.eql(u8, url_slice, "affective-host://system/storage")) {
-            return hostSuccess(out_data, out_error, "{\"volumes\":[]}");
+            return .{ .response = "{\"volumes\":[]}", .error_msg = "" };
         }
-        return hostFailure(out_data, out_error, "unsupported mock host route");
+        return .{
+            .response = "",
+            .error_msg = std.heap.page_allocator.dupe(u8, "unsupported mock host route") catch "",
+        };
     }
 
     fn llmResponse(self: *MockHost, request_body: []const u8) []const u8 {
@@ -227,23 +363,27 @@ fn hostSuccess(out_data: ?*AffectiveCoreEmbeddedString, out_error: ?*AffectiveCo
     if (out_data) |data| {
         const owned = std.heap.page_allocator.dupe(u8, body) catch {
             data.* = .{};
-            return 1;
+            return embedded.host_http_poll_failed;
         };
         data.* = .{ .ptr = owned.ptr, .len = owned.len };
     }
-    return 0;
+    return embedded.host_http_poll_complete;
 }
 
-fn hostFailure(out_data: ?*AffectiveCoreEmbeddedString, out_error: ?*AffectiveCoreEmbeddedString, message: []const u8) c_int {
+fn hostFailure(
+    out_error: ?*AffectiveCoreEmbeddedString,
+    out_data: ?*AffectiveCoreEmbeddedString,
+    message: []const u8,
+) c_int {
     if (out_data) |data| data.* = .{};
     if (out_error) |err_out| {
         const owned = std.heap.page_allocator.dupe(u8, message) catch {
             err_out.* = .{};
-            return 1;
+            return embedded.host_http_poll_failed;
         };
         err_out.* = .{ .ptr = owned.ptr, .len = owned.len };
     }
-    return 1;
+    return embedded.host_http_poll_failed;
 }
 
 fn freeHostString(_: ?*anyopaque, string: AffectiveCoreEmbeddedString) callconv(.c) void {

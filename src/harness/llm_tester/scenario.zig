@@ -3,11 +3,13 @@ const std = @import("std");
 pub const ResponseFormat = enum {
     text,
     json_object,
+    image_generation,
 
     pub fn wireName(self: ResponseFormat) []const u8 {
         return switch (self) {
             .text => "text",
             .json_object => "json_object",
+            .image_generation => "image_generation",
         };
     }
 };

@@ -6,6 +6,7 @@ const helpers = @import("brain_helpers.zig");
 const vector_index = @import("vector_index.zig");
 const context_composition = @import("context_composition.zig");
 const context_tier = @import("context_tier.zig");
+const llm_voice = @import("llm_voice.zig");
 const selection_port = ports.memory_selection;
 
 const Brain = brain_mod.Brain;
@@ -98,24 +99,30 @@ pub fn selectConversationMemories(self: *Brain, user_utterance: []const u8) !Res
 
     for (mmr_selected) |result| {
         const memory = memories[result.memory_index];
+        // Copy borrowed store fields before saveMemoryRecord; mutating the store can
+        // invalidate loadMemoryRecords slices and the MemoryRecord string pointers.
+        const memory_id = try self.allocator.dupe(u8, memory.memory_id);
+        errdefer self.allocator.free(memory_id);
+        const interpretation = try memorySnippet(
+            self.allocator,
+            memory,
+            self.cfg.capacity.memory_snippet_max_bytes,
+        );
+        errdefer self.allocator.free(interpretation);
         try touchSelectedMemory(self, memory);
         try entries.append(self.allocator, .{
-            .memory_id = try self.allocator.dupe(u8, memory.memory_id),
+            .memory_id = memory_id,
             .relevance = relevanceFromScore(result.score),
             .reason = try self.allocator.dupe(u8, result.reason),
-            .interpretation = try memorySnippet(
-                self.allocator,
-                memory,
-                self.cfg.capacity.memory_snippet_max_bytes,
-            ),
+            .interpretation = interpretation,
         });
     }
     try appendFactAndBeliefEntries(self, trimmed, &entries, max_selected_limit);
 
     const summary = if (entries.items.len == 0)
-        try self.allocator.dupe(u8, "No vector-ranked memories matched this utterance.")
+        try self.allocator.dupe(u8, "Nothing in memory strongly matches what was just said.")
     else
-        try std.fmt.allocPrint(self.allocator, "Top {d} vector-ranked memories for this utterance.", .{entries.items.len});
+        try std.fmt.allocPrint(self.allocator, "{d} memories feel relevant to what was just said.", .{entries.items.len});
 
     return .{
         .summary = summary,
@@ -143,12 +150,7 @@ pub fn appendMemorySelectionToMemory(
     }
     for (selection.entries) |entry| {
         if (out.items.len - section_start >= context_bytes_max) break;
-        try out.print(allocator, "- {s} relevance={d:.2} reason={s}\n  {s}\n", .{
-            entry.memory_id,
-            entry.relevance,
-            entry.reason,
-            entry.interpretation,
-        });
+        try out.print(allocator, "- I remember: {s}\n", .{entry.interpretation});
     }
 }
 
@@ -206,6 +208,13 @@ fn mmrSelect(
     lambda: f32,
 ) ![]MmrResult {
     if (prefiltered.len == 0 or limit == 0) return &[_]MmrResult{};
+    var vector_cache = vector_index.EphemeralVectorCache.init(allocator);
+    defer vector_cache.deinit();
+    var mmr_indices = std.ArrayList(usize).empty;
+    defer mmr_indices.deinit(allocator);
+    for (prefiltered) |candidate| try mmr_indices.append(allocator, candidate.memory_index);
+    try vector_cache.fillMissing(service, memories, mmr_indices.items);
+
     var selected = std.ArrayList(MmrResult).empty;
     errdefer {
         for (selected.items) |item| allocator.free(item.reason);
@@ -222,10 +231,8 @@ fn mmrSelect(
             if (picked.contains(candidate.memory_index)) continue;
             var diversity_penalty: f32 = 0.0;
             for (selected.items) |chosen| {
-                const a = try memoryVector(allocator, service, memories[candidate.memory_index]);
-                defer if (memories[candidate.memory_index].vector.len != service.dimensions()) allocator.free(a);
-                const b = try memoryVector(allocator, service, memories[chosen.memory_index]);
-                defer if (memories[chosen.memory_index].vector.len != service.dimensions()) allocator.free(b);
+                const a = try vector_cache.vector(service, memories, candidate.memory_index);
+                const b = try vector_cache.vector(service, memories, chosen.memory_index);
                 diversity_penalty = @max(diversity_penalty, vector_index.cosine(a, b));
             }
             const mmr_score = lambda * candidate.score - (1.0 - lambda) * diversity_penalty;
@@ -244,11 +251,6 @@ fn mmrSelect(
         });
     }
     return selected.toOwnedSlice(allocator);
-}
-
-fn memoryVector(allocator: std.mem.Allocator, service: ports.embedding.EmbeddingService, memory: schema.MemoryRecord) ![]f32 {
-    if (memory.vector.len == service.dimensions()) return memory.vector;
-    return vector_index.embedMemory(allocator, service, memory);
 }
 
 fn appendFactAndBeliefEntries(self: *Brain, query: []const u8, entries: *std.ArrayList(ResolvedEntry), max_total: usize) !void {
@@ -292,6 +294,65 @@ fn touchSelectedMemory(self: *Brain, memory: schema.MemoryRecord) !void {
     updated.score += 1;
     updated.last_accessed_at = try self.timestampNow();
     try self.deps.store.saveMemoryRecord(updated);
+}
+
+test "selectConversationMemories copies snippets before touching store borrow" {
+    const support = @import("brain_test_support.zig");
+    const store_support = @import("brain_test_store.zig");
+    const json_store = @import("../storage/json_store.zig");
+    const openai = @import("ports.zig").openai;
+
+    const io = std.testing.io;
+    const root = "data/test/memory_selection_touch_order";
+    const memory_path = root ++ "/memory/people.sqlite";
+    _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var json_impl = json_store.JsonMemoryStore.init(allocator, io, memory_path);
+    const store = json_impl.store();
+
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        const memory_id = try std.fmt.allocPrint(allocator, "mem_touch_{d}", .{i});
+        const text = try std.fmt.allocPrint(allocator, "Geisha greeting memory {d} with recognition context", .{i});
+        try store.saveMemoryRecord(.{
+            .memory_id = memory_id,
+            .scope = .long_term,
+            .text = text,
+            .interpretation = text,
+            .tags = &.{},
+            .created_at = "1000",
+            .last_accessed_at = null,
+            .access_count = 0,
+            .score = @intCast(i % 8 + 1),
+        });
+    }
+
+    var aux = store_support.TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = support.makeBrainWithMemoryStore(allocator, "fixtures/visitors/known_01.jpg", &.{}, store, &aux, &desc, null);
+
+    const selection = try brain.selectConversationMemories("Hello Geisha");
+    defer {
+        brain.allocator.free(selection.summary);
+        for (selection.entries) |entry| {
+            brain.allocator.free(entry.memory_id);
+            brain.allocator.free(entry.reason);
+            brain.allocator.free(entry.interpretation);
+        }
+        brain.allocator.free(selection.entries);
+    }
+    try std.testing.expect(selection.entries.len > 1);
+    for (selection.entries) |entry| {
+        try std.testing.expect(entry.interpretation.len > 0);
+        try std.testing.expect(std.mem.indexOf(u8, entry.interpretation, "Geisha") != null or
+            std.mem.indexOf(u8, entry.interpretation, "greeting") != null);
+    }
 }
 
 test "appendMemorySelectionObservation formats ids only" {

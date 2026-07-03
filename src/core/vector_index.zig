@@ -25,6 +25,71 @@ pub fn embedQuery(allocator: std.mem.Allocator, service: embedding_mod.Embedding
     return service.embedQuery(allocator, query, tags);
 }
 
+pub const EphemeralVectorCache = struct {
+    vectors: std.AutoHashMap(usize, []f32),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) EphemeralVectorCache {
+        return .{
+            .vectors = std.AutoHashMap(usize, []f32).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *EphemeralVectorCache) void {
+        var it = self.vectors.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.value_ptr.*);
+        self.vectors.deinit();
+    }
+
+    pub fn fillMissing(
+        self: *EphemeralVectorCache,
+        service: embedding_mod.EmbeddingService,
+        memories: []const schema.MemoryRecord,
+        indices: []const usize,
+    ) !void {
+        const expected_dimensions = service.dimensions();
+        var missing_indices = std.ArrayList(usize).empty;
+        defer missing_indices.deinit(self.allocator);
+        var missing_texts = std.ArrayList([]const u8).empty;
+        defer {
+            for (missing_texts.items) |text| self.allocator.free(text);
+            missing_texts.deinit(self.allocator);
+        }
+
+        for (indices) |index| {
+            const memory = memories[index];
+            if (memory.vector.len == expected_dimensions) continue;
+            if (self.vectors.contains(index)) continue;
+            try missing_indices.append(self.allocator, index);
+            try missing_texts.append(self.allocator, try memoryEmbeddingText(self.allocator, memory));
+        }
+        if (missing_texts.items.len == 0) return;
+
+        const batch = try service.embedBatch(self.allocator, missing_texts.items);
+        defer {
+            for (batch) |values| self.allocator.free(values);
+            self.allocator.free(batch);
+        }
+        if (batch.len != missing_indices.items.len) return error.EmptyEmbeddingBatch;
+
+        for (missing_indices.items, batch) |index, values| {
+            try self.vectors.put(index, try self.allocator.dupe(f32, values));
+        }
+    }
+
+    pub fn vector(
+        self: *const EphemeralVectorCache,
+        service: embedding_mod.EmbeddingService,
+        memories: []const schema.MemoryRecord,
+        index: usize,
+    ) ![]const f32 {
+        const memory = memories[index];
+        if (memory.vector.len == service.dimensions()) return memory.vector;
+        return self.vectors.get(index) orelse error.MissingEphemeralVector;
+    }
+};
+
 pub fn search(
     allocator: std.mem.Allocator,
     service: embedding_mod.EmbeddingService,
@@ -33,7 +98,6 @@ pub fn search(
     tags: []const []const u8,
     limit: usize,
 ) ![]SearchResult {
-    const expected_dimensions = service.dimensions();
     const floor = similarityFloor(service);
     var results = std.ArrayList(SearchResult).empty;
     defer results.deinit(allocator);
@@ -41,10 +105,20 @@ pub fn search(
     defer allocator.free(query_vector);
     const has_query = std.mem.trim(u8, query, " \r\n\t").len > 0;
 
+    var candidate_indices = std.ArrayList(usize).empty;
+    defer candidate_indices.deinit(allocator);
     for (memories, 0..) |memory, i| {
         if (!hasRequiredTags(memory, tags)) continue;
-        const vector = if (memory.vector.len == expected_dimensions) memory.vector else try embedMemory(allocator, service, memory);
-        defer if (memory.vector.len != expected_dimensions) allocator.free(vector);
+        try candidate_indices.append(allocator, i);
+    }
+
+    var vector_cache = EphemeralVectorCache.init(allocator);
+    defer vector_cache.deinit();
+    try vector_cache.fillMissing(service, memories, candidate_indices.items);
+
+    for (candidate_indices.items) |i| {
+        const memory = memories[i];
+        const vector = try vector_cache.vector(service, memories, i);
         const similarity = if (has_query) cosine(query_vector, vector) else @as(f32, 0.0);
         const lexical = if (has_query and lexicalMatch(memory, query)) @as(f32, 0.28) else @as(f32, 0.0);
         const tag_boost = tagOverlapBoost(memory, tags);
@@ -109,6 +183,19 @@ fn lexicalMatch(memory: schema.MemoryRecord, query: []const u8) bool {
 fn memoryInterpretation(memory: schema.MemoryRecord) []const u8 {
     if (memory.interpretation.len > 0) return memory.interpretation;
     return memory.text;
+}
+
+fn memoryEmbeddingText(allocator: std.mem.Allocator, memory: schema.MemoryRecord) ![]const u8 {
+    const interpretation = memoryInterpretation(memory);
+    if (memory.tags.len == 0) return allocator.dupe(u8, interpretation);
+    var tagged = std.ArrayList(u8).empty;
+    defer tagged.deinit(allocator);
+    try tagged.appendSlice(allocator, interpretation);
+    for (memory.tags) |tag| {
+        try tagged.append(allocator, ' ');
+        try tagged.appendSlice(allocator, tag);
+    }
+    return tagged.toOwnedSlice(allocator);
 }
 
 test "vector search ranks semantically adjacent words above unrelated memories" {

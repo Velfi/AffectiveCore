@@ -134,6 +134,8 @@ pub const MemoryStore = struct {
     }
 
     pub fn loadMemoryRecords(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.MemoryRecord {
+        // Borrow contract: returned slice and nested string pointers are invalidated
+        // by any subsequent mutating store operation on this store.
         return self.loadMemoryRecordsFn(self.ctx, allocator);
     }
 
@@ -226,4 +228,32 @@ pub const MemoryStore = struct {
     pub fn loadActivityHistory(self: MemoryStore, allocator: std.mem.Allocator) ![]schema.ActivityRecord { return self.loadActivityHistoryFn(self.ctx, allocator); }
     pub fn beginDeferredPersist(self: MemoryStore) !void { return self.beginDeferredPersistFn(self.ctx); }
     pub fn endDeferredPersist(self: MemoryStore) !void { return self.endDeferredPersistFn(self.ctx); }
+
+    pub fn deferredPersistGuard(self: MemoryStore) !DeferredPersistGuard {
+        return DeferredPersistGuard.init(self);
+    }
+};
+
+/// Pairs `beginDeferredPersist` / `endDeferredPersist`. Call `commit` on success;
+/// `errdefer guard.cancel()` on failure paths so unwind errors propagate instead of panicking.
+pub const DeferredPersistGuard = struct {
+    store: MemoryStore,
+    finished: bool = false,
+
+    pub fn init(store: MemoryStore) !DeferredPersistGuard {
+        try store.beginDeferredPersist();
+        return .{ .store = store };
+    }
+
+    pub fn commit(self: *DeferredPersistGuard) !void {
+        if (self.finished) return error.DeferredPersistGuardUsed;
+        self.finished = true;
+        try self.store.endDeferredPersist();
+    }
+
+    pub fn cancel(self: *DeferredPersistGuard) !void {
+        if (self.finished) return;
+        self.finished = true;
+        try self.store.endDeferredPersist();
+    }
 };

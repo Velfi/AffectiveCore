@@ -5,33 +5,58 @@ const context_gate = @import("app/context_gate.zig");
 const embedded_protocol = @import("app/embedded_protocol.zig");
 const files = @import("platform/common/files.zig");
 const embedded = @import("affective_core_embedded.zig");
+const stimulus_inbox_mod = @import("core/stimulus_inbox.zig");
+const stimulus_ingest_mod = @import("core/stimulus_ingest.zig");
 const embedded_ops = @import("affective_core_embedded_ops.zig");
 const error_descriptions = @import("core/error_descriptions.zig");
 const brain_mod = @import("core/brain.zig");
 const brain_process = @import("core/brain_process.zig");
+const host_capability_activation = @import("core/host_capability_activation.zig");
 const request_timings = @import("core/request_timings.zig");
 
 const AffectiveCoreEmbedded = embedded.AffectiveCoreEmbedded;
 
-const DispatchRequestMeta = struct {
+const PublicOperation = enum {
+    connect,
+    host_update,
+    stimulus_ingest,
+    brain_step,
+    brain_read,
+    mailbox_read,
+    mailbox_update,
+    brain_archive,
+    debug_prompt,
+};
+
+pub const DispatchRequestMeta = struct {
     request_id_buf: [96]u8 = undefined,
     event_type_buf: [96]u8 = undefined,
-    request_id: []const u8 = "",
-    event_type: []const u8 = "invalid",
+    request_id_len: u8 = 0,
+    event_type_len: u8 = 0,
+
+    pub fn requestId(self: *const DispatchRequestMeta) []const u8 {
+        if (self.request_id_len == 0) return "";
+        return self.request_id_buf[0..self.request_id_len];
+    }
+
+    pub fn eventType(self: *const DispatchRequestMeta) []const u8 {
+        if (self.event_type_len == 0) return "invalid";
+        return self.event_type_buf[0..self.event_type_len];
+    }
 
     fn init(request_id_src: []const u8, event_type_src: []const u8) DispatchRequestMeta {
         var meta: DispatchRequestMeta = .{};
-        meta.request_id = copyLogField(&meta.request_id_buf, request_id_src);
-        meta.event_type = copyLogField(&meta.event_type_buf, event_type_src);
+        meta.request_id_len = copyInto(&meta.request_id_buf, request_id_src);
+        meta.event_type_len = copyInto(&meta.event_type_buf, event_type_src);
         return meta;
     }
 };
 
-fn copyLogField(dest: []u8, src: []const u8) []const u8 {
-    if (src.len == 0) return "";
+fn copyInto(dest: []u8, src: []const u8) u8 {
+    if (src.len == 0) return 0;
     const len = @min(src.len, dest.len);
     @memcpy(dest[0..len], src[0..len]);
-    return dest[0..len];
+    return @intCast(len);
 }
 
 const DispatchOutputSummary = struct {
@@ -39,18 +64,33 @@ const DispatchOutputSummary = struct {
     detail: []const u8,
 };
 
-fn parseDispatchRequestMeta(request_json: []const u8) DispatchRequestMeta {
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, request_json, .{}) catch {
-        return DispatchRequestMeta.init("", "invalid");
+pub fn parseDispatchRequestMeta(request_json: []const u8) DispatchRequestMeta {
+    var meta: DispatchRequestMeta = .{};
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), request_json, .{}) catch {
+        meta.event_type_len = copyInto(&meta.event_type_buf, "invalid");
+        return meta;
     };
-    defer parsed.deinit();
-    if (parsed.value != .object) return DispatchRequestMeta.init("", "invalid");
+    if (parsed.value != .object) {
+        meta.event_type_len = copyInto(&meta.event_type_buf, "invalid");
+        return meta;
+    }
     const root = parsed.value.object;
-    const request_id = getStringFromObject(root, "request_id") orelse "";
-    const event = root.get("event") orelse return DispatchRequestMeta.init(request_id, "missing_event");
-    if (event != .object) return DispatchRequestMeta.init(request_id, "invalid_event");
+    if (getStringFromObject(root, "request_id")) |request_id| {
+        meta.request_id_len = copyInto(&meta.request_id_buf, request_id);
+    }
+    const event = root.get("event") orelse {
+        meta.event_type_len = copyInto(&meta.event_type_buf, "missing_event");
+        return meta;
+    };
+    if (event != .object) {
+        meta.event_type_len = copyInto(&meta.event_type_buf, "invalid_event");
+        return meta;
+    }
     const event_type = getStringFromObject(event.object, "type") orelse "missing_event_type";
-    return DispatchRequestMeta.init(request_id, event_type);
+    meta.event_type_len = copyInto(&meta.event_type_buf, event_type);
+    return meta;
 }
 
 fn summarizeDispatchOutput(output: []const u8) DispatchOutputSummary {
@@ -101,20 +141,21 @@ pub fn dispatchJson(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
     ctx.clearHttpTransportLastError();
     ctx.wireDispatchScratchToLlmClients();
     ctx.brain.clearChatParseFailure();
+    embedded.clearHostEffects(ctx);
     const meta = parseDispatchRequestMeta(request_json);
-    logDispatchStart(meta.event_type, meta.request_id, request_json.len);
-    try ctx.brain.beginRequestTimings(meta.request_id);
+    logDispatchStart(meta.eventType(), meta.requestId(), request_json.len);
+    try ctx.brain.beginRequestTimings(meta.requestId());
     defer ctx.brain.resetRequestTimings();
     const output = dispatchJsonImpl(ctx, request_json) catch |err| {
         const detail_owned = error_descriptions.formatFailureDetail(std.heap.page_allocator, err, ctx.brain.chatParseFailureBody()) catch null;
         const detail: []const u8 = detail_owned orelse error_descriptions.name(err);
         defer if (detail_owned != null) std.heap.page_allocator.free(detail);
-        logDispatchResult(meta.event_type, meta.request_id, "failed", 0, detail);
+        logDispatchResult(meta.eventType(), meta.requestId(), "failed", 0, detail);
         var timings = try finishDispatchTimings(ctx);
         defer deinitDispatchTimingsReport(ctx, &timings);
         return embedded_protocol.errorEnvelopeAlloc(
             std.heap.page_allocator,
-            meta.request_id,
+            meta.requestId(),
             "runtime_error",
             detail,
             false,
@@ -124,7 +165,7 @@ pub fn dispatchJson(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
         );
     };
     const summary = summarizeDispatchOutput(output);
-    logDispatchResult(meta.event_type, meta.request_id, summary.status, output.len, summary.detail);
+    logDispatchResult(meta.eventType(), meta.requestId(), summary.status, output.len, summary.detail);
     return output;
 }
 
@@ -176,334 +217,252 @@ fn dispatchJsonImpl(ctx: *AffectiveCoreEmbedded, request_json: []const u8) ![]u8
     const event_type = getStringFromObject(event_object, "type") orelse {
         return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing event.type", false, emptyBudget(ctx));
     };
+    const operation = publicOperation(event_type) orelse {
+        return try errorEnvelopeWithTimings(ctx, request_id, "unknown_event_type", "unknown embedded event type", false, emptyBudget(ctx));
+    };
+    return try acceptPublicOperation(ctx, request_id, operation, event_object);
+}
 
-    embedded.clearHostEffects(ctx);
-    if (std.mem.eql(u8, event_type, "connect")) {
-        const snapshot = try embedded_ops.connect(ctx);
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "connect",
-            .read_models = snapshot,
-        });
-    }
-    if (std.mem.eql(u8, event_type, "host_attach")) {
-        const binding = try embedded_ops.hostAttach(ctx, event);
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "host_attach",
-            .host_binding = binding,
-        });
-    }
-    if (std.mem.eql(u8, event_type, "host_capability_manifest")) {
-        const manifest = try embedded_ops.hostCapabilityManifest(ctx, event);
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "host_capability_manifest",
-            .capability_count = manifest.capability_count,
-            .manifest_timings = manifest.manifest_timings,
-        });
-    }
-    if (std.mem.eql(u8, event_type, "refresh_facial_expression_catalog")) {
-        const catalog = try embedded_ops.refreshFacialExpressionCatalog(ctx);
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "refresh_facial_expression_catalog",
-            .catalog = catalog,
-        });
-    }
-    if (std.mem.eql(u8, event_type, "send_experience_event")) {
-        const recorded = try embedded_ops.sendExperienceEvent(ctx, event);
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "send_experience_event",
-            .event = recorded,
-        });
-    }
-    if (std.mem.eql(u8, event_type, "user_text")) {
-        const text = getStringFromObject(event_object, "text") orelse {
-            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing text", false, emptyBudget(ctx));
-        };
-        const result = app_core.userTextOutcome(try ctx.brain.handleConversationText(try embedded_ops.tryTypedSpeech(ctx, text), .{ .request_id = request_id }));
-        return try encodeUserTextOutcome(ctx, request_id, event_type, result);
-    }
-    if (std.mem.eql(u8, event_type, "emoji_reaction")) {
-        const emoji = getStringFromObject(event_object, "emoji") orelse {
-            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing emoji", false, emptyBudget(ctx));
-        };
-        const utterance_text = getStringFromObject(event_object, "utterance_text") orelse {
-            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing utterance_text", false, emptyBudget(ctx));
-        };
-        const speaker_label = getStringFromObject(event_object, "speaker_label") orelse "";
-        const utterance_event_id = getStringFromObject(event_object, "utterance_event_id") orelse "";
-        const result = app_core.userTextOutcome(try ctx.brain.handleEmojiReaction(.{
-            .emoji = emoji,
-            .utterance_text = utterance_text,
-            .speaker_label = speaker_label,
-            .utterance_event_id = utterance_event_id,
-        }));
-        return try encodeSenseObservationOutcome(ctx, request_id, event_type, result);
-    }
-    if (std.mem.eql(u8, event_type, "interrupt")) {
-        const text = getStringFromObject(event_object, "text") orelse "";
-        const reason = getStringFromObject(event_object, "reason") orelse "user_interrupt";
-        const interrupted_action = getStringFromObject(event_object, "interrupted_action") orelse "unknown";
-        const canceled_count = getIntegerFromObject(event_object, "canceled_queued_action_count") orelse 0;
-        const metadata = try std.fmt.allocPrint(ctx.dispatchScratch(), "reason={s} interrupted_action={s} canceled_queued_action_count={d} text={s}", .{
-            reason,
-            interrupted_action,
-            canceled_count,
-            text,
-        });
-        _ = try ctx.brain.observeSenseStimulus(.{
-            .kind = .interrupt,
-            .source = "affective_host",
-            .signature = reason,
-            .raw_magnitude = 0.70,
-            .threat = 0,
-            .curiosity = 0.35,
-            .metadata = metadata,
-        });
-        try ctx.brain.handleUserInterruptFromHost(.{
-            .reason = reason,
-            .interrupted_action = interrupted_action,
-            .preview_text = text,
-            .canceled_queued_action_count = canceled_count,
-        });
-        const detail = try std.fmt.allocPrint(ctx.dispatchScratch(), "interrupt: {s}", .{metadata});
-        return try encodeDetailResult(ctx, request_id, event_type, detail);
-    }
-    if (std.mem.eql(u8, event_type, "short_touch")) {
-        const result = embedded_ops.shortTouchActivation(ctx) catch |err| {
-            if (err == error.FrontendCaptureRequested or err == error.FrontendOrientationRequested) {
-                return try encodeDetailResult(ctx, request_id, event_type, "");
+fn publicOperation(event_type: []const u8) ?PublicOperation {
+    if (std.mem.eql(u8, event_type, "connect")) return .connect;
+    if (std.mem.eql(u8, event_type, "host_update")) return .host_update;
+    if (std.mem.eql(u8, event_type, "stimulus_ingest")) return .stimulus_ingest;
+    if (std.mem.eql(u8, event_type, "brain_step")) return .brain_step;
+    if (std.mem.eql(u8, event_type, "brain_read")) return .brain_read;
+    if (std.mem.eql(u8, event_type, "mailbox_read")) return .mailbox_read;
+    if (std.mem.eql(u8, event_type, "mailbox_update")) return .mailbox_update;
+    if (std.mem.eql(u8, event_type, "brain_archive")) return .brain_archive;
+    if (std.mem.eql(u8, event_type, "debug_prompt")) return .debug_prompt;
+    return null;
+}
+
+fn operationName(operation: PublicOperation) []const u8 {
+    return switch (operation) {
+        .connect => "connect",
+        .host_update => "host_update",
+        .stimulus_ingest => "stimulus_ingest",
+        .brain_step => "brain_step",
+        .brain_read => "brain_read",
+        .mailbox_read => "mailbox_read",
+        .mailbox_update => "mailbox_update",
+        .brain_archive => "brain_archive",
+        .debug_prompt => "debug_prompt",
+    };
+}
+
+fn acceptPublicOperation(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    operation: PublicOperation,
+    event_object: std.json.ObjectMap,
+) ![]u8 {
+    const event_type = operationName(operation);
+    switch (operation) {
+        .brain_step => return try handleBrainStep(ctx, request_id, event_object),
+        .brain_read => return try handleBrainRead(ctx, request_id, event_object),
+        .mailbox_read => return try handleMailboxRead(ctx, request_id, event_object),
+        .mailbox_update => return try handleMailboxUpdate(ctx, request_id, event_object),
+        .brain_archive => return try handleBrainArchive(ctx, request_id, event_object),
+        .debug_prompt => return try handleDebugPrompt(ctx, request_id, event_object),
+        .stimulus_ingest => {
+            if (validateStimulusIngest(event_object)) |message| {
+                return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", message, false, emptyBudget(ctx));
             }
-            return try encodeErrorResult(ctx, request_id, event_type, "short_touch_failed", err);
-        };
-        if (!result.ended_with_speech) {
-            embedded_ops.runStimulusAutonomy(ctx) catch |err| switch (err) {
-                error.MissingAutonomyPlanner, error.MissingPsycheService, error.LocalDateUnavailable, error.ContextBudgetExceeded => {},
-                else => return try encodeErrorResult(ctx, request_id, event_type, "stimulus_autonomy_failed", err),
-            };
-        }
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "activation",
-            .activation = "short_touch",
-            .action_result = result,
-        });
+            try applyIngestEvent(ctx, event_type, event_object);
+        },
+        .host_update => try applyHostUpdate(ctx, request_id, event_object),
+        else => try enqueueAcceptedTerminalEvent(ctx, request_id, event_type),
     }
-    if (std.mem.eql(u8, event_type, "long_touch")) {
-        const result = embedded_ops.longTouchActivation(ctx) catch |err| {
-            if (err == error.FrontendCaptureRequested or err == error.FrontendOrientationRequested) {
-                return try encodeDetailResult(ctx, request_id, event_type, "");
-            }
-            return try encodeErrorResult(ctx, request_id, event_type, "long_touch_failed", err);
-        };
-        if (!result.ended_with_speech) {
-            embedded_ops.runStimulusAutonomy(ctx) catch |err| switch (err) {
-                error.MissingAutonomyPlanner, error.MissingPsycheService, error.LocalDateUnavailable, error.ContextBudgetExceeded => {},
-                else => return try encodeErrorResult(ctx, request_id, event_type, "stimulus_autonomy_failed", err),
-            };
-        }
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "activation",
-            .activation = "long_touch",
-            .action_result = result,
-        });
+    return try encodeAcceptedResult(ctx, request_id, event_type);
+}
+
+fn invalidOperationEnvelope(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    message: []const u8,
+) ![]u8 {
+    return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", message, false, emptyBudget(ctx));
+}
+
+fn operationSelector(event_object: std.json.ObjectMap, primary_key: []const u8, fallback_key: []const u8) ?[]const u8 {
+    return getStringFromObject(event_object, primary_key) orelse getStringFromObject(event_object, fallback_key);
+}
+
+fn handleBrainStep(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    event_object: std.json.ObjectMap,
+) ![]u8 {
+    const kind = getStringFromObject(event_object, "kind") orelse "autonomy";
+    if (!std.mem.eql(u8, kind, "autonomy")) {
+        return try invalidOperationEnvelope(ctx, request_id, "unsupported brain_step kind");
     }
-    if (std.mem.eql(u8, event_type, "poke_sequence")) {
-        const pulse_summary = try pokeSequencePulseSummary(ctx.dispatchScratch(), event_object);
-        embedded.clearHostEffects(ctx);
-        _ = try ctx.brain.observeSenseStimulus(.{
-            .kind = .poke_sequence,
-            .source = "affective_core_embedded",
-            .signature = pulse_summary,
-            .raw_magnitude = pokeSequenceMagnitude(event_object),
-            .threat = 0,
-            .curiosity = 0.40,
-            .metadata = pulse_summary,
-        });
-        embedded_ops.runStimulusAutonomy(ctx) catch |err| switch (err) {
-            error.MissingAutonomyPlanner, error.MissingPsycheService, error.LocalDateUnavailable, error.ContextBudgetExceeded => {},
-            else => return try encodeErrorResult(ctx, request_id, event_type, "stimulus_autonomy_failed", err),
-        };
-        return try encodeDetailResult(ctx, request_id, event_type, pulse_summary);
-    }
-    if (std.mem.eql(u8, event_type, "sense_catalog")) {
-        return try encodeDetailResult(ctx, request_id, event_type, try senseCatalogSummary(ctx, event_object));
-    }
-    if (std.mem.eql(u8, event_type, "sense_status")) {
-        try applySenseStatus(ctx, event_object);
-        return try encodeDetailResult(ctx, request_id, event_type, try senseStatusSummary(ctx, event_object));
-    }
-    if (std.mem.eql(u8, event_type, "sense_observation")) {
-        const sense = getStringFromObject(event_object, "sense") orelse "";
-        const observation_value = event_object.get("observation") orelse {
-            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing sense observation", false, emptyBudget(ctx));
-        };
-        if (observation_value != .object) {
-            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "sense observation must be an object", false, emptyBudget(ctx));
-        }
-        const observation = observation_value.object;
-        if (std.mem.eql(u8, sense, "orientation")) {
-            const posture = getStringFromObject(observation, "posture") orelse "unknown";
-            const summary = getStringFromObject(observation, "summary") orelse "Orientation observed.";
-            const confidence = getNumberFromObject(observation, "confidence") orelse 0;
-            const metadata = try std.fmt.allocPrint(ctx.dispatchScratch(), "posture={s} confidence={d:.2} summary={s}", .{ posture, confidence, summary });
-            const stimulus = try ctx.brain.observeSenseStimulus(.{
-                .kind = .orientation,
-                .source = "affective_orientation",
-                .signature = posture,
-                .raw_magnitude = @floatCast(@min(@max(confidence, 0), 1)),
-                .threat = 0,
-                .curiosity = 0.12,
-                .metadata = metadata,
-            });
-            const observation_line = try std.fmt.allocPrint(ctx.dispatchScratch(), "orientation: {s}", .{summary});
-            if (brain_process.activeConversationPresent(&ctx.brain)) {
-                try brain_process.recordSenseDuringConversation(&ctx.brain, "orientation", observation_line, stimulus.event_id);
-            }
-            if (try ctx.brain.reactToSalientSense(stimulus.packet)) |conversation| {
-                return try encodeSenseObservationOutcome(ctx, request_id, event_type, app_core.userTextOutcome(conversation));
-            }
-            const detail = try std.fmt.allocPrint(ctx.dispatchScratch(), "orientation: {s}", .{summary});
-            return try encodeDetailResult(ctx, request_id, event_type, detail);
-        }
-        if (std.mem.eql(u8, sense, "motion_gesture")) {
-            const gesture = getStringFromObject(observation, "gesture") orelse "unknown";
-            const summary = getStringFromObject(observation, "summary") orelse "Motion gesture observed.";
-            const confidence = getNumberFromObject(observation, "confidence") orelse 0;
-            const metadata = try std.fmt.allocPrint(ctx.dispatchScratch(), "gesture={s} confidence={d:.2} summary={s}", .{ gesture, confidence, summary });
-            const packet = try ctx.brain.observeSenseStimulus(.{
-                .kind = .touch,
-                .source = "affective_motion_gesture",
-                .signature = gesture,
-                .raw_magnitude = @floatCast(@min(@max(confidence, 0), 1)),
-                .threat = 0,
-                .curiosity = 0.25,
-                .metadata = metadata,
-            });
-            const observation_line = try std.fmt.allocPrint(ctx.dispatchScratch(), "motion_gesture: {s}", .{summary});
-            if (brain_process.activeConversationPresent(&ctx.brain)) {
-                try brain_process.recordSenseDuringConversation(&ctx.brain, "motion_gesture", observation_line, packet.event_id);
-            }
-            if (try ctx.brain.reactToSalientSense(packet.packet)) |conversation| {
-                return try encodeSenseObservationOutcome(ctx, request_id, event_type, app_core.userTextOutcome(conversation));
-            }
-            const detail = try std.fmt.allocPrint(ctx.dispatchScratch(), "motion_gesture: {s}", .{summary});
-            return try encodeDetailResult(ctx, request_id, event_type, detail);
-        }
-        if (std.mem.eql(u8, sense, "autonomy_replenish")) {
-            const actions = getU32FromObject(observation, "actions") orelse {
-                return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "autonomy_replenish requires observation.actions as a positive integer", false, emptyBudget(ctx));
-            };
-            if (actions == 0) {
-                return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "autonomy_replenish observation.actions must be at least 1", false, emptyBudget(ctx));
-            }
-            const applied_points = try ctx.brain.runAutonomyReplenishFromPush(ctx.io(), actions);
-            const detail = try std.fmt.allocPrint(ctx.dispatchScratch(), "autonomy_replenish: requested={d} applied={d}", .{ actions, @as(u32, @intFromFloat(applied_points)) });
-            return try encodeDetailResult(ctx, request_id, event_type, detail);
-        }
-        if (std.mem.eql(u8, sense, "camera")) {
-            const path = getStringFromObject(observation, "path") orelse "";
-            const mime_type = getStringFromObject(observation, "mime_type") orelse "image/jpeg";
-            const source = getStringFromObject(observation, "source") orelse "affective_camera";
-            const visual_result = try ctx.brain.handleHostVisualObservation(path, source, mime_type);
-            return try encodeHostVisualObservationResult(ctx, request_id, event_type, visual_result);
-        }
-        return try errorEnvelopeWithTimings(ctx, request_id, "unknown_sense", "unknown sense observation", false, emptyBudget(ctx));
-    }
-    if (std.mem.eql(u8, event_type, "capability_status")) {
-        try applyHostCapabilityStatus(ctx, request_id, event_object);
-        return try encodeDetailResult(ctx, request_id, event_type, try hostCapabilityStatusSummary(ctx, event_object));
-    }
-    if (std.mem.eql(u8, event_type, "capability_status_batch")) {
-        const capability_count = try applyHostCapabilityStatusBatch(ctx, request_id, event_object);
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "capability_status_batch",
-            .capability_count = capability_count,
-        });
-    }
-    if (std.mem.eql(u8, event_type, "brain_mode")) {
+    try embedded_ops.runStimulusAutonomy(ctx);
+    return try encodeStructuredDispatchResult(ctx, request_id, "brain_step", .{
+        .kind = "autonomy",
+        .status = "completed",
+    });
+}
+
+fn handleBrainRead(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    event_object: std.json.ObjectMap,
+) ![]u8 {
+    const query = operationSelector(event_object, "query", "kind") orelse {
+        return try invalidOperationEnvelope(ctx, request_id, "missing brain_read query");
+    };
+    if (std.mem.eql(u8, query, "brain_mode")) {
         const mode = try embedded_ops.brainMode(ctx);
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+        return try encodeStructuredDispatchResult(ctx, request_id, "brain_read", .{
             .kind = "brain_mode",
             .brain_mode = mode,
         });
     }
-    if (std.mem.eql(u8, event_type, "read_models_snapshot")) {
+    if (std.mem.eql(u8, query, "models_snapshot")) {
         const snapshot = try embedded_ops.readModelsSnapshot(ctx);
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "read_models_snapshot",
+        return try encodeStructuredDispatchResult(ctx, request_id, "brain_read", .{
+            .kind = "models_snapshot",
             .read_models = snapshot,
         });
     }
-    if (std.mem.eql(u8, event_type, "chat_dry_run_prompt")) {
-        const text = getStringFromObject(event_object, "text") orelse {
-            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing text", false, emptyBudget(ctx));
-        };
-        const prompt = try ctx.brain.dryRunConversationPrompt(text);
-        defer {
-            ctx.brain.allocator.free(prompt.system_prompt);
-            ctx.brain.allocator.free(prompt.user_prompt);
-        }
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "chat_dry_run_prompt",
-            .dry_run = true,
-            .system_prompt = prompt.system_prompt,
-            .user_prompt = prompt.user_prompt,
-        });
+    return try invalidOperationEnvelope(ctx, request_id, "unsupported brain_read query");
+}
+
+fn handleMailboxRead(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    event_object: std.json.ObjectMap,
+) ![]u8 {
+    const query = operationSelector(event_object, "query", "kind") orelse "list";
+    if (!std.mem.eql(u8, query, "list")) {
+        return try invalidOperationEnvelope(ctx, request_id, "unsupported mailbox_read query");
     }
-    if (std.mem.eql(u8, event_type, "request_dream_time")) {
-        const item = try embedded_ops.requestDreamTime(ctx, getStringFromObject(event_object, "text"));
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+    const items = try embedded_ops.mailboxList(ctx);
+    return try encodeStructuredDispatchResult(ctx, request_id, "mailbox_read", .{
+        .kind = "mailbox_list",
+        .items = items,
+    });
+}
+
+fn handleMailboxUpdate(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    event_object: std.json.ObjectMap,
+) ![]u8 {
+    const action = operationSelector(event_object, "action", "kind") orelse {
+        return try invalidOperationEnvelope(ctx, request_id, "missing mailbox_update action");
+    };
+    const event_value = std.json.Value{ .object = event_object };
+    if (std.mem.eql(u8, action, "request_dream_time")) {
+        const item = try embedded_ops.requestDreamTime(ctx, getStringFromObject(event_object, "prompt"));
+        return try encodeStructuredDispatchResult(ctx, request_id, "mailbox_update", .{
             .kind = "request_dream_time",
             .mailbox_item = item,
         });
     }
-    if (std.mem.eql(u8, event_type, "mailbox_list")) {
-        const items = try embedded_ops.mailboxList(ctx);
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "mailbox_list",
-            .items = items,
-        });
-    }
-    if (std.mem.eql(u8, event_type, "mailbox_mark_read")) {
-        const items = try embedded_ops.mailboxMarkRead(ctx, event);
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+    if (std.mem.eql(u8, action, "mark_read")) {
+        if (getStringFromObject(event_object, "mailbox_id") == null) {
+            return try invalidOperationEnvelope(ctx, request_id, "missing mailbox_id");
+        }
+        const items = try embedded_ops.mailboxMarkRead(ctx, event_value);
+        return try encodeStructuredDispatchResult(ctx, request_id, "mailbox_update", .{
             .kind = "mailbox_mark_read",
             .items = items,
         });
     }
-    if (std.mem.eql(u8, event_type, "raw_ref_lookup")) {
-        const raw_ref = getStringFromObject(event_object, "raw_ref") orelse {
-            return try errorEnvelopeWithTimings(ctx, request_id, "invalid_request", "missing raw_ref", false, emptyBudget(ctx));
-        };
-        const bytes = lookupRawRef(ctx, raw_ref) catch |err| return try encodeErrorResult(ctx, request_id, event_type, "raw_ref_not_found", err);
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "raw_ref_lookup",
-            .raw_ref = raw_ref,
-            .content = bytes,
-        });
-    }
-    if (std.mem.eql(u8, event_type, "export_brain")) {
-        const manifest = try embedded_ops.exportBrain(ctx, event);
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "export_brain",
+    return try invalidOperationEnvelope(ctx, request_id, "unsupported mailbox_update action");
+}
+
+fn handleBrainArchive(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    event_object: std.json.ObjectMap,
+) ![]u8 {
+    const action = operationSelector(event_object, "action", "kind") orelse {
+        return try invalidOperationEnvelope(ctx, request_id, "missing brain_archive action");
+    };
+    const event_value = std.json.Value{ .object = event_object };
+    if (std.mem.eql(u8, action, "export")) {
+        if (getStringFromObject(event_object, "brain_file_path") == null) {
+            return try invalidOperationEnvelope(ctx, request_id, "missing brain_file_path");
+        }
+        const manifest = try embedded_ops.exportBrain(ctx, event_value);
+        return try encodeStructuredDispatchResult(ctx, request_id, "brain_archive", .{
+            .kind = "brain_export",
             .manifest = manifest,
         });
     }
-    if (std.mem.eql(u8, event_type, "import_brain")) {
-        const manifest = try embedded_ops.importBrain(ctx, event);
-        return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
-            .kind = "import_brain",
+    if (std.mem.eql(u8, action, "import")) {
+        if (getStringFromObject(event_object, "brain_file_path") == null) {
+            return try invalidOperationEnvelope(ctx, request_id, "missing brain_file_path");
+        }
+        const manifest = try embedded_ops.importBrain(ctx, event_value);
+        return try encodeStructuredDispatchResult(ctx, request_id, "brain_archive", .{
+            .kind = "brain_import",
             .manifest = manifest,
         });
     }
-    if (std.mem.eql(u8, event_type, "maintenance_tick")) {
-        ctx.brain.runMaintenance(ctx.io()) catch |err| return try encodeErrorResult(ctx, request_id, event_type, "maintenance_failed", err);
-        return try encodeDetailResult(ctx, request_id, event_type, "maintenance_tick");
+    return try invalidOperationEnvelope(ctx, request_id, "unsupported brain_archive action");
+}
+
+fn handleDebugPrompt(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    event_object: std.json.ObjectMap,
+) ![]u8 {
+    const text = getStringFromObject(event_object, "text") orelse {
+        return try invalidOperationEnvelope(ctx, request_id, "missing debug_prompt text");
+    };
+    const prompt = try ctx.brain.dryRunConversationPrompt(text);
+    return try encodeLargeStructuredDispatchResult(ctx, request_id, "debug_prompt", .{
+        .kind = "debug_prompt",
+        .system_prompt = prompt.system_prompt,
+        .user_prompt = prompt.user_prompt,
+    });
+}
+
+fn encodeAcceptedResult(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_type: []const u8) ![]u8 {
+    return try encodeStructuredDispatchResult(ctx, request_id, event_type, .{
+        .kind = "accepted",
+        .event_type = event_type,
+        .status = "accepted",
+    });
+}
+
+fn enqueueAcceptedTerminalEvent(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_type: []const u8) !void {
+    const event_kind = try std.fmt.allocPrint(ctx.allocator(), "{s}.accepted", .{event_type});
+    const title = try std.fmt.allocPrint(ctx.allocator(), "{s} accepted", .{event_type});
+    try ctx.event_queue.append(ctx.allocator(), .{
+        .type = "developer_log",
+        .request_id = try ctx.allocator().dupe(u8, request_id),
+        .kind = event_kind,
+        .title = title,
+        .body = try ctx.allocator().dupe(u8, "accepted"),
+    });
+}
+
+fn applyHostUpdate(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_object: std.json.ObjectMap) !void {
+    const update_kind = getStringFromObject(event_object, "kind") orelse "host_update";
+    const event_value = std.json.Value{ .object = event_object };
+    if (std.mem.eql(u8, update_kind, "host_attach")) {
+        _ = try embedded_ops.hostAttach(ctx, event_value);
+    } else if (std.mem.eql(u8, update_kind, "capability_manifest")) {
+        _ = try embedded_ops.hostCapabilityManifest(ctx, event_value);
+    } else if (std.mem.eql(u8, update_kind, "facial_expression_catalog")) {
+        _ = try embedded_ops.refreshFacialExpressionCatalog(ctx);
+    } else if (std.mem.eql(u8, update_kind, "capability_status")) {
+        try applyHostCapabilityStatus(ctx, request_id, event_object);
+    } else if (std.mem.eql(u8, update_kind, "capability_status_batch")) {
+        _ = try applyHostCapabilityStatusBatch(ctx, request_id, event_object);
+    } else if (std.mem.eql(u8, update_kind, "sense_catalog")) {
+        _ = try senseCatalogSummary(ctx, event_object);
+    } else if (std.mem.eql(u8, update_kind, "sense_status")) {
+        try applySenseStatus(ctx, event_object);
+    } else {
+        return error.UnknownHostUpdateKind;
     }
-    if (std.mem.eql(u8, event_type, "autonomy_tick")) {
-        ctx.brain.runAutonomyReplenish(ctx.io()) catch |err| return try encodeErrorResult(ctx, request_id, event_type, "autonomy_replenish_failed", err);
-        ctx.brain.runAutonomyTick(ctx.io()) catch |err| return try encodeErrorResult(ctx, request_id, event_type, "autonomy_failed", err);
-        return try encodeDetailResult(ctx, request_id, event_type, "autonomy_tick");
-    }
-    return try errorEnvelopeWithTimings(ctx, request_id, "unknown_event_type", "unknown embedded event type", false, emptyBudget(ctx));
+    try enqueueAcceptedTerminalEvent(ctx, request_id, "host_update");
 }
 
 fn encodeDetailResult(
@@ -560,6 +519,45 @@ fn pokeSequenceMagnitude(event_object: std.json.ObjectMap) f32 {
     return @floatCast(@min(1.0, 0.20 + total_press_ms / 2400.0 + max_press_ms / 1800.0));
 }
 
+fn validateStimulusIngest(event_object: std.json.ObjectMap) ?[]const u8 {
+    const kind = getStringFromObject(event_object, "kind") orelse "speech";
+    if (std.mem.eql(u8, kind, "speech") or std.mem.eql(u8, kind, "text") or std.mem.eql(u8, kind, "user_text")) {
+        if (getStringFromObject(event_object, "text") == null and getStringFromObject(event_object, "payload") == null) {
+            return "stimulus_ingest speech requires text or payload";
+        }
+        return null;
+    }
+    if (std.mem.eql(u8, kind, "typing")) return null;
+    if (std.mem.eql(u8, kind, "interrupt")) return null;
+    if (std.mem.eql(u8, kind, "emoji") or std.mem.eql(u8, kind, "reaction")) {
+        if (getStringFromObject(event_object, "emoji") == null and getStringFromObject(event_object, "signature") == null) {
+            return "stimulus_ingest reaction requires emoji or signature";
+        }
+        return null;
+    }
+    if (std.mem.eql(u8, kind, "touch")) return null;
+    if (std.mem.eql(u8, kind, "orientation")) return null;
+    if (std.mem.eql(u8, kind, "motion") or std.mem.eql(u8, kind, "motion_gesture")) return null;
+    if (std.mem.eql(u8, kind, "experience_event")) {
+        if (getStringFromObject(event_object, "event_kind") == null) {
+            return "stimulus_ingest experience_event requires event_kind";
+        }
+        if (getStringFromObject(event_object, "payload") == null) {
+            return "stimulus_ingest experience_event requires payload";
+        }
+        return null;
+    }
+    if (std.mem.eql(u8, kind, "camera") or std.mem.eql(u8, kind, "visual")) {
+        if (getStringFromObject(event_object, "path") == null and getStringFromObject(event_object, "signature") == null) {
+            return "stimulus_ingest camera requires path or signature";
+        }
+        return null;
+    }
+    if (std.mem.eql(u8, kind, "poke") or std.mem.eql(u8, kind, "poke_sequence")) return null;
+    if (std.mem.eql(u8, kind, "timer") or std.mem.eql(u8, kind, "reminder")) return null;
+    return "unknown stimulus_ingest kind";
+}
+
 fn senseCatalogSummary(ctx: *AffectiveCoreEmbedded, event_object: std.json.ObjectMap) ![]const u8 {
     const senses = event_object.get("senses") orelse {
         return try ctx.dispatchScratch().dupe(u8, "sense_catalog: count=0");
@@ -577,8 +575,38 @@ fn senseStatusSummary(ctx: *AffectiveCoreEmbedded, event_object: std.json.Object
     return try std.fmt.allocPrint(ctx.dispatchScratch(), "sense_status: {s}={s} reason={s}", .{ sense, status, reason });
 }
 
+/// Hosts report pull-sense status under a "<sense>_read" capability id and may
+/// omit a top-level sense field; derive the sense from the capability id then.
+fn senseFromStatusEvent(event_object: std.json.ObjectMap) ?[]const u8 {
+    if (getStringFromObject(event_object, "sense")) |sense| return sense;
+    if (getStringFromObject(event_object, "sense_id")) |sense| return sense;
+    const capability = getStringFromObject(event_object, "capability_id") orelse return null;
+    const suffix = "_read";
+    if (std.mem.endsWith(u8, capability, suffix) and capability.len > suffix.len) {
+        return capability[0 .. capability.len - suffix.len];
+    }
+    return null;
+}
+
+/// A non-terminal status is the host's "accepted, still working" ack; only a
+/// terminal status closes out the pull. Prefer the host's explicit flag.
+fn senseStatusIsTerminal(event_object: std.json.ObjectMap, status: []const u8) bool {
+    if (getBoolFromObject(event_object, "terminal")) |terminal| return terminal;
+    const non_terminal = [_][]const u8{ "busy", "accepted", "fulfilled", "pending", "permission_pending", "permission_required" };
+    for (non_terminal) |candidate| {
+        if (std.mem.eql(u8, status, candidate)) return false;
+    }
+    return true;
+}
+
+fn senseStatusIsSuccess(status: []const u8) bool {
+    return std.mem.eql(u8, status, "fulfilled") or
+        std.mem.eql(u8, status, "available") or
+        std.mem.eql(u8, status, "completed");
+}
+
 fn applySenseStatus(ctx: *AffectiveCoreEmbedded, event_object: std.json.ObjectMap) !void {
-    const sense = getStringFromObject(event_object, "sense") orelse getStringFromObject(event_object, "sense_id") orelse return;
+    const sense = senseFromStatusEvent(event_object) orelse return;
     const status = getStringFromObject(event_object, "status") orelse return;
     const reason = getStringFromObject(event_object, "reason") orelse "";
     const elapsed_raw = getIntegerFromObject(event_object, "elapsed_ms") orelse @as(i64, @intCast(getU32FromObject(event_object, "latency_ms") orelse 0));
@@ -589,10 +617,32 @@ fn applySenseStatus(ctx: *AffectiveCoreEmbedded, event_object: std.json.ObjectMa
         "sample"
     else
         return;
-    try @import("core/host_capability_activation.zig").recordHostSensePullOutcome(&ctx.brain, sense, purpose, status, reason, elapsed_ms);
-    if (std.mem.eql(u8, status, "timed_out")) {
+    if (getStringFromObject(event_object, "availability")) |availability| {
+        if (getStringFromObject(event_object, "capability_id")) |capability| {
+            try recordSenseAvailabilityStatus(ctx, capability, availability, reason);
+        }
+    }
+    if (!senseStatusIsTerminal(event_object, status)) return;
+    try host_capability_activation.recordHostSensePullOutcome(&ctx.brain, sense, purpose, status, reason, elapsed_ms);
+    if (!senseStatusIsSuccess(status)) {
         _ = ctx.brain.fulfillAwaitedHostRequestIfMatches(sense, purpose);
     }
+}
+
+fn recordSenseAvailabilityStatus(ctx: *AffectiveCoreEmbedded, capability_id: []const u8, availability: []const u8, reason: []const u8) !void {
+    try ctx.brain.recordCapabilityStatus(.{
+        .capability_id = capability_id,
+        .host_id = ctx.brain.currentHostId(),
+        .permission = .unknown,
+        .availability = embedded_ops.availabilityFromString(availability),
+        .quality = 0.0,
+        .reliability = 0.0,
+        .cost = 0.0,
+        .latency_ms = 0,
+        .risk = 0.0,
+        .unavailable_reason = reason,
+        .updated_at_ms = ctx.brain.now_seconds * 1000,
+    });
 }
 
 fn applyHostCapabilityStatus(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_object: std.json.ObjectMap) !void {
@@ -612,7 +662,7 @@ fn applyHostCapabilityStatus(ctx: *AffectiveCoreEmbedded, request_id: []const u8
         .unavailable_reason = getStringFromObject(event_object, "unavailable_reason") orelse "",
         .updated_at_ms = ctx.brain.now_seconds * 1000,
     });
-    if (!std.mem.eql(u8, capability, "camera")) return;
+    if (!std.mem.eql(u8, capability, "camera") and !std.mem.eql(u8, capability, "camera_read")) return;
 
     if (std.mem.eql(u8, availability, "pending") or std.mem.eql(u8, availability, "degraded")) {
         const pending_request_id = getStringFromObject(event_object, "request_id") orelse request_id;
@@ -628,19 +678,38 @@ fn applyHostCapabilityStatus(ctx: *AffectiveCoreEmbedded, request_id: []const u8
     if (std.mem.eql(u8, availability, "available") or std.mem.eql(u8, availability, "refused") or std.mem.eql(u8, availability, "unavailable")) {
         ctx.pending_camera_permission = null;
     }
+
+    // A camera that the host reports gone is terminal for any awaited camera
+    // pull: clear it so the scheduler stops holding user turns behind it.
+    if (std.mem.eql(u8, availability, "refused") or std.mem.eql(u8, availability, "unavailable")) {
+        if (ctx.brain.awaitingHostSense("camera")) {
+            ctx.brain.clearAwaitedHostRequest();
+        }
+    }
 }
 
 fn applyHostCapabilityStatusBatch(ctx: *AffectiveCoreEmbedded, request_id: []const u8, event_object: std.json.ObjectMap) !usize {
     const statuses_value = event_object.get("statuses") orelse return error.MissingCapabilityStatuses;
     if (statuses_value != .array) return error.ExpectedCapabilityStatusArray;
-    try ctx.brain.deps.store.beginDeferredPersist();
-    errdefer ctx.brain.deps.store.endDeferredPersist() catch @panic("capability status batch deferred persist end failed");
-    for (statuses_value.array.items) |item| {
+    var persist = try ctx.brain.deps.store.deferredPersistGuard();
+    const count = applyHostCapabilityStatusBatchInner(ctx, request_id, statuses_value.array.items) catch |err| {
+        persist.cancel() catch return error.DeferredPersistEndFailed;
+        return err;
+    };
+    try persist.commit();
+    return count;
+}
+
+fn applyHostCapabilityStatusBatchInner(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    statuses: []std.json.Value,
+) !usize {
+    for (statuses) |item| {
         if (item != .object) return error.ExpectedCapabilityStatusObject;
         try applyHostCapabilityStatus(ctx, request_id, item.object);
     }
-    try ctx.brain.deps.store.endDeferredPersist();
-    return statuses_value.array.items.len;
+    return statuses.len;
 }
 
 fn hostCapabilityStatusSummary(ctx: *AffectiveCoreEmbedded, event_object: std.json.ObjectMap) ![]const u8 {
@@ -729,7 +798,7 @@ pub fn encodeStructuredDispatchResult(
         .dropped_event_count = envelope_events.len,
         .raw_refs = &.{},
     };
-    const slim = try embedded_protocol.successEnvelopeAlloc(std.heap.page_allocator, request_id, &[_]embedded_protocol.HostEvent{}, .{
+    const slim = try embedded_protocol.successEnvelopeCompactAlloc(std.heap.page_allocator, request_id, &[_]embedded_protocol.HostEvent{}, .{
         .event_type = event_type,
         .value = value,
     }, slim_budget, request_timings.empty_report, null);
@@ -738,8 +807,8 @@ pub fn encodeStructuredDispatchResult(
 
     const message = try std.fmt.allocPrint(
         ctx.dispatchScratch(),
-        "dispatch result value_bytes={d} exceeded max_envelope_bytes={d}",
-        .{ value_json.len, ctx.context_budget.max_envelope_bytes },
+        "dispatch envelope_bytes={d} value_bytes={d} max_envelope_bytes={d}",
+        .{ slim.len, value_json.len, ctx.context_budget.max_envelope_bytes },
     );
     defer ctx.dispatchScratch().free(message);
     return try embedded_protocol.errorEnvelopeAlloc(
@@ -752,6 +821,30 @@ pub fn encodeStructuredDispatchResult(
         timings,
         null,
     );
+}
+
+fn encodeLargeStructuredDispatchResult(
+    ctx: *AffectiveCoreEmbedded,
+    request_id: []const u8,
+    event_type: []const u8,
+    value: anytype,
+) ![]u8 {
+    try ensureAwaitedHostSenseRequestEvent(ctx);
+    stampAwaitedHostSenseTimeouts(ctx);
+    const activity_id = ctx.brain.activeActivityId() orelse "";
+    const compacted_events = try context_gate.compactEvents(ctx.dispatchScratch(), ctx.brain.now_seconds, request_id, activity_id, embedded.hostEvents(ctx), ctx.context_budget);
+    try persistRawRefs(ctx, compacted_events.raw_refs);
+    const envelope_events = try filterSuppressedEvents(ctx, compacted_events.events);
+
+    const value_json = try std.json.Stringify.valueAlloc(ctx.dispatchScratch(), value, .{});
+    defer ctx.dispatchScratch().free(value_json);
+    const budget = try context_gate.budgetWithResult(ctx.dispatchScratch(), compacted_events.budget, value_json.len, &.{}, false);
+    var timings = try finishDispatchTimings(ctx);
+    defer deinitDispatchTimingsReport(ctx, &timings);
+    return try embedded_protocol.successEnvelopeAlloc(std.heap.page_allocator, request_id, envelope_events, .{
+        .event_type = event_type,
+        .value = value,
+    }, budget, timings, ctx.brain.dispatchContextReportView());
 }
 
 /// When a host pull is still pending (restored activity or a deduped recognize retry),
@@ -790,11 +883,17 @@ fn stampAwaitedHostSenseTimeouts(ctx: *AffectiveCoreEmbedded) void {
 }
 
 pub fn filterSuppressedEvents(ctx: *AffectiveCoreEmbedded, events: []const embedded_protocol.HostEvent) ![]const embedded_protocol.HostEvent {
-    if (ctx.pending_camera_permission == null) return events;
+    const camera_permission_pending = ctx.pending_camera_permission != null;
+    const camera_reported_gone = host_capability_activation.hostSenseReportedUnavailable(&ctx.brain, "camera");
+    if (!camera_permission_pending and !camera_reported_gone) return events;
+    // While a permission prompt is pending, only the awaited recognize pull may
+    // keep asking; while the host reports the camera gone, nothing may — asking
+    // again before a capability_status flips back just re-feeds the loop.
     const awaiting_camera = ctx.brain.awaitedHostRequestMatches("camera", "recognize");
+    const suppress_camera = camera_reported_gone or !awaiting_camera;
     var filtered = std.ArrayList(embedded_protocol.HostEvent).empty;
     for (events) |event| {
-        if (!awaiting_camera and std.mem.eql(u8, event.type, "sense_request") and event.sense != null and std.mem.eql(u8, event.sense.?, "camera")) continue;
+        if (suppress_camera and std.mem.eql(u8, event.type, "sense_request") and event.sense != null and std.mem.eql(u8, event.sense.?, "camera")) continue;
         try filtered.append(ctx.dispatchScratch(), event);
     }
     return try filtered.toOwnedSlice(ctx.dispatchScratch());
@@ -852,6 +951,14 @@ fn getStringFromObject(object: std.json.ObjectMap, key: []const u8) ?[]const u8 
     return value.string;
 }
 
+fn getBoolFromObject(object: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .bool => |b| b,
+        else => null,
+    };
+}
+
 fn getIntegerFromObject(object: std.json.ObjectMap, key: []const u8) ?i64 {
     const value = object.get(key) orelse return null;
     return switch (value) {
@@ -874,6 +981,38 @@ fn getF32FromObject(object: std.json.ObjectMap, key: []const u8) ?f32 {
     return @floatCast(value);
 }
 
+fn applyHostStimulusContext(brain: *brain_mod.Brain, event_object: std.json.ObjectMap) !void {
+    const context_value = event_object.get("context") orelse return;
+    if (context_value != .object) return;
+    const context = context_value.object;
+    const kind = getStringFromObject(context, "kind");
+    const received_during = getStringFromObject(context, "received_during");
+    const idle_seconds = getIntegerFromObject(context, "host_idle_seconds");
+    try brain.setHostStimulusMetadata(kind, received_during, idle_seconds);
+}
+
+fn emitInnerStateHostEvents(ctx: *AffectiveCoreEmbedded) !void {
+    const effects = ctx.host_effects orelse return;
+    const snapshot = try ctx.brain.readModelsSnapshot(ctx.dispatchScratch());
+    if (snapshot.need_model.top_needs.len > 0) {
+        var summary = std.ArrayList(u8).empty;
+        defer summary.deinit(ctx.dispatchScratch());
+        for (snapshot.need_model.top_needs) |need| {
+            try summary.print(ctx.dispatchScratch(), "- {s}: {s}\n", .{ need.text, need.urgency });
+        }
+        try effects.appendNeedState(summary.items);
+    }
+    if (snapshot.focus_model.text) |focus| {
+        try effects.appendAttentionState(focus, null);
+    }
+    if (snapshot.inner_state_model.active_intention) |intention| {
+        try effects.appendIntention(intention.goal, intention.expected_action);
+    }
+    if (snapshot.inner_state_model.latest_appraisal) |appraisal| {
+        if (appraisal.summary) |summary| try effects.appendAppraisal(summary);
+    }
+}
+
 fn getU32FromObject(object: std.json.ObjectMap, key: []const u8) ?u32 {
     const value = getIntegerFromObject(object, key) orelse return null;
     if (value < 0) return null;
@@ -886,4 +1025,212 @@ fn readFileAllocPath(io: std.Io, path: []const u8, allocator: std.mem.Allocator,
 
 fn writeFilePath(io: std.Io, path: []const u8, data: []const u8) !void {
     return files.writeFilePath(io, path, data);
+}
+
+pub fn applyQueuedMessage(ctx: *AffectiveCoreEmbedded, request_json: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, ctx.dispatchScratch(), request_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRequest;
+    const root = parsed.value.object;
+    const request_id = getStringFromObject(root, "request_id") orelse "";
+    const event = root.get("event") orelse return error.InvalidRequest;
+    if (event != .object) return error.InvalidRequest;
+    const event_object = event.object;
+    const event_type = getStringFromObject(event_object, "type") orelse return error.InvalidRequest;
+    const operation = publicOperation(event_type) orelse return error.InvalidRequest;
+    switch (operation) {
+        .stimulus_ingest => {
+            if (validateStimulusIngest(event_object) != null) return error.InvalidRequest;
+            try applyIngestEvent(ctx, event_type, event_object);
+        },
+        .host_update => try applyHostUpdate(ctx, request_id, event_object),
+        .brain_step, .brain_read, .mailbox_read, .mailbox_update, .brain_archive, .debug_prompt => return error.InvalidRequest,
+        else => try enqueueAcceptedTerminalEvent(ctx, request_id, event_type),
+    }
+}
+
+pub fn applyIngestFromRequestJson(ctx: *AffectiveCoreEmbedded, request_json: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, ctx.dispatchScratch(), request_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRequest;
+    const root = parsed.value.object;
+    const event = root.get("event") orelse return error.InvalidRequest;
+    if (event != .object) return error.InvalidRequest;
+    const event_object = event.object;
+    const event_type = getStringFromObject(event_object, "type") orelse return error.InvalidRequest;
+    if (validateStimulusIngest(event_object) != null) return error.InvalidRequest;
+    try applyIngestEvent(ctx, event_type, event_object);
+}
+
+pub fn applyIngestEvent(ctx: *AffectiveCoreEmbedded, event_type: []const u8, event_object: std.json.ObjectMap) !void {
+    if (std.mem.eql(u8, event_type, "stimulus_ingest")) {
+        try applyHostStimulusContext(&ctx.brain, event_object);
+        const kind = getStringFromObject(event_object, "kind") orelse "speech";
+        if (std.mem.eql(u8, kind, "speech") or std.mem.eql(u8, kind, "text") or std.mem.eql(u8, kind, "user_text")) {
+            const text = getStringFromObject(event_object, "text") orelse getStringFromObject(event_object, "payload") orelse return;
+            try stimulus_ingest_mod.ingestHeardSpeech(&ctx.brain, text, .typed_text);
+            return;
+        }
+        if (std.mem.eql(u8, kind, "typing")) {
+            const text = getStringFromObject(event_object, "text") orelse getStringFromObject(event_object, "payload") orelse "";
+            try stimulus_ingest_mod.ingestTyping(&ctx.brain, text);
+            return;
+        }
+        if (std.mem.eql(u8, kind, "interrupt")) {
+            const text = getStringFromObject(event_object, "text") orelse getStringFromObject(event_object, "payload") orelse "";
+            const reason = getStringFromObject(event_object, "reason") orelse "user_interrupt";
+            const interrupted_action = getStringFromObject(event_object, "interrupted_action") orelse "unknown";
+            const canceled_count = getIntegerFromObject(event_object, "canceled_queued_action_count") orelse 0;
+            try stimulus_ingest_mod.ingestInterrupt(&ctx.brain, reason, interrupted_action, text, canceled_count);
+            return;
+        }
+        if (std.mem.eql(u8, kind, "emoji") or std.mem.eql(u8, kind, "reaction")) {
+            const emoji = getStringFromObject(event_object, "emoji") orelse getStringFromObject(event_object, "signature") orelse return;
+            const utterance_text = getStringFromObject(event_object, "utterance_text") orelse getStringFromObject(event_object, "payload") orelse "";
+            const summary = try std.fmt.allocPrint(ctx.dispatchScratch(), "emoji={s} utterance={s}", .{ emoji, utterance_text });
+            _ = try stimulus_ingest_mod.ingestStimulus(&ctx.brain, .{
+                .kind = .reaction,
+                .source = getStringFromObject(event_object, "source") orelse "affective_host",
+                .signature = emoji,
+                .payload = summary,
+                .raw_magnitude = @floatCast(@min(@max(getNumberFromObject(event_object, "raw_magnitude") orelse 0.55, 0), 1)),
+                .curiosity = 0.40,
+            });
+            return;
+        }
+        if (std.mem.eql(u8, kind, "touch")) {
+            const gesture = getStringFromObject(event_object, "gesture") orelse getStringFromObject(event_object, "signature") orelse "touch";
+            const summary = getStringFromObject(event_object, "summary") orelse getStringFromObject(event_object, "payload") orelse "Touch observed.";
+            const duration_class = getStringFromObject(event_object, "duration_class") orelse "";
+            const metadata = try std.fmt.allocPrint(ctx.dispatchScratch(), "gesture={s} duration_class={s} summary={s}", .{ gesture, duration_class, summary });
+            const observation_line = try std.fmt.allocPrint(ctx.dispatchScratch(), "touch: {s}", .{summary});
+            const ingested = try stimulus_ingest_mod.ingestStimulus(&ctx.brain, .{
+                .kind = .touch,
+                .source = getStringFromObject(event_object, "source") orelse "affective_touch",
+                .signature = gesture,
+                .payload = observation_line,
+                .raw_magnitude = @floatCast(@min(@max(getNumberFromObject(event_object, "raw_magnitude") orelse 0.45, 0), 1)),
+                .curiosity = 0.40,
+                .metadata = metadata,
+            });
+            if (brain_process.activeConversationPresent(&ctx.brain)) {
+                try brain_process.recordSenseDuringConversation(&ctx.brain, "touch", observation_line, ingested.event_id);
+            }
+            return;
+        }
+        if (std.mem.eql(u8, kind, "orientation")) {
+            const summary = getStringFromObject(event_object, "summary") orelse getStringFromObject(event_object, "payload") orelse "Orientation observed.";
+            const posture = getStringFromObject(event_object, "posture") orelse getStringFromObject(event_object, "signature") orelse "unknown";
+            const confidence = getNumberFromObject(event_object, "confidence") orelse getNumberFromObject(event_object, "raw_magnitude") orelse 0;
+            const metadata = try std.fmt.allocPrint(ctx.dispatchScratch(), "posture={s} confidence={d:.2} summary={s}", .{ posture, confidence, summary });
+            const observation_line = try std.fmt.allocPrint(ctx.dispatchScratch(), "orientation: {s}", .{summary});
+            const ingested = try stimulus_ingest_mod.ingestStimulus(&ctx.brain, .{
+                .kind = .orientation,
+                .source = getStringFromObject(event_object, "source") orelse "affective_orientation",
+                .signature = posture,
+                .payload = observation_line,
+                .raw_magnitude = @floatCast(@min(@max(confidence, 0), 1)),
+                .curiosity = 0.12,
+                .metadata = metadata,
+            });
+            if (brain_process.activeConversationPresent(&ctx.brain)) {
+                try brain_process.recordSenseDuringConversation(&ctx.brain, "orientation", observation_line, ingested.event_id);
+            }
+            return;
+        }
+        if (std.mem.eql(u8, kind, "motion") or std.mem.eql(u8, kind, "motion_gesture")) {
+            const gesture = getStringFromObject(event_object, "gesture") orelse getStringFromObject(event_object, "signature") orelse "unknown";
+            const summary = getStringFromObject(event_object, "summary") orelse getStringFromObject(event_object, "payload") orelse "Motion gesture observed.";
+            const confidence = getNumberFromObject(event_object, "confidence") orelse getNumberFromObject(event_object, "raw_magnitude") orelse 0;
+            const metadata = try std.fmt.allocPrint(ctx.dispatchScratch(), "gesture={s} confidence={d:.2} summary={s}", .{ gesture, confidence, summary });
+            const observation_line = try std.fmt.allocPrint(ctx.dispatchScratch(), "motion_gesture: {s}", .{summary});
+            const ingested = try stimulus_ingest_mod.ingestStimulus(&ctx.brain, .{
+                .kind = .touch,
+                .source = getStringFromObject(event_object, "source") orelse "affective_motion_gesture",
+                .signature = gesture,
+                .payload = observation_line,
+                .raw_magnitude = @floatCast(@min(@max(confidence, 0), 1)),
+                .curiosity = 0.25,
+                .metadata = metadata,
+            });
+            if (brain_process.activeConversationPresent(&ctx.brain)) {
+                try brain_process.recordSenseDuringConversation(&ctx.brain, "motion_gesture", observation_line, ingested.event_id);
+            }
+            return;
+        }
+        if (std.mem.eql(u8, kind, "camera") or std.mem.eql(u8, kind, "visual")) {
+            const path = getStringFromObject(event_object, "path") orelse getStringFromObject(event_object, "signature") orelse return;
+            const source = getStringFromObject(event_object, "source") orelse "affective_camera";
+            const mime_type = getStringFromObject(event_object, "mime_type") orelse "image/jpeg";
+            const owned_path = try ctx.brain.allocator.dupe(u8, path);
+            ctx.brain.rememberVisualUpdate(owned_path);
+            const metadata = try std.fmt.allocPrint(ctx.brain.allocator, "path={s} mime_type={s} source={s}", .{ owned_path, mime_type, source });
+            const observation_line = try std.fmt.allocPrint(ctx.dispatchScratch(), "sensed_image:\n- image: {s}\n- source: {s}\n", .{ path, source });
+            const ingested = try stimulus_ingest_mod.ingestStimulus(&ctx.brain, .{
+                .kind = .visual,
+                .source = "affective_camera",
+                .signature = owned_path,
+                .payload = observation_line,
+                .raw_magnitude = @floatCast(@min(@max(getNumberFromObject(event_object, "raw_magnitude") orelse 0.75, 0), 1)),
+                .curiosity = 0.50,
+                .metadata = metadata,
+            });
+            if (brain_process.activeConversationPresent(&ctx.brain)) {
+                try brain_process.recordSenseDuringConversation(&ctx.brain, @tagName(ingested.packet.kind), observation_line, ingested.event_id);
+            }
+            return;
+        }
+        if (std.mem.eql(u8, kind, "poke") or std.mem.eql(u8, kind, "poke_sequence")) {
+            const summary = getStringFromObject(event_object, "summary") orelse getStringFromObject(event_object, "payload") orelse "poke_sequence";
+            _ = try stimulus_ingest_mod.ingestStimulus(&ctx.brain, .{
+                .kind = .poke_sequence,
+                .source = getStringFromObject(event_object, "source") orelse "affective_host",
+                .signature = getStringFromObject(event_object, "signature") orelse summary,
+                .payload = summary,
+                .raw_magnitude = @floatCast(@min(@max(getNumberFromObject(event_object, "raw_magnitude") orelse 0.50, 0), 1)),
+                .curiosity = 0.40,
+                .metadata = summary,
+            });
+            return;
+        }
+        const payload = getStringFromObject(event_object, "payload") orelse getStringFromObject(event_object, "summary") orelse kind;
+        _ = try stimulus_ingest_mod.ingestStimulus(&ctx.brain, .{
+            .kind = .timer,
+            .source = getStringFromObject(event_object, "source") orelse "affective_host",
+            .signature = getStringFromObject(event_object, "signature") orelse kind,
+            .payload = payload,
+            .raw_magnitude = @floatCast(@min(@max(getNumberFromObject(event_object, "raw_magnitude") orelse 0.25, 0), 1)),
+            .curiosity = 0.25,
+            .metadata = payload,
+        });
+        return;
+    }
+}
+
+pub fn isQueueableWhileBusyEventType(event_type: []const u8) bool {
+    return std.mem.eql(u8, event_type, "stimulus_ingest") or
+        std.mem.eql(u8, event_type, "host_update");
+}
+
+pub fn queuedAckKind(event_type: []const u8) []const u8 {
+    if (std.mem.eql(u8, event_type, "host_update")) return "host_update_queued";
+    return "stimulus_queued";
+}
+
+pub fn encodeQueuedAck(_: *AffectiveCoreEmbedded, request_id: []const u8, event_type: []const u8) ![]u8 {
+    const budget = context_gate.BudgetReport{
+        .max_bytes = 16 * 1024,
+        .used_bytes = 0,
+        .compacted = false,
+        .dropped_event_count = 0,
+        .raw_refs = &.{},
+    };
+    return embedded_protocol.successEnvelopeCompactAlloc(std.heap.page_allocator, request_id, &[_]embedded_protocol.HostEvent{}, .{
+        .event_type = event_type,
+        .value = .{ .kind = queuedAckKind(event_type) },
+    }, budget, request_timings.empty_report, null);
+}
+
+pub fn encodeStimulusQueued(ctx: *AffectiveCoreEmbedded, request_id: []const u8) ![]u8 {
+    return encodeQueuedAck(ctx, request_id, "stimulus_ingest");
 }

@@ -2,7 +2,7 @@
 
 The brain is wired like a small embodied loop: cognition chooses actions, and sense systems turn those actions into observations that cognition can use on the next pass.
 
-At the center is `src/core/brain.zig`. `BrainDeps` injects the body: camera, recognizer, image description and comparison, input, speech, speaker, memory store, graph store, system senses, chat service, autonomy planner, psyche service, image generation, email delivery, audio inspection, facial expression output, want-achievement detection, command logging, and interrupt sources. So the "mind" does not directly know how to read a camera, battery, mailbox, or microphone. It receives abstract capabilities and calls them through dependency interfaces.
+At the center is `src/core/brain.zig`. `BrainDeps` injects the body: camera, recognizer, image description and comparison, input, speech, speaker, memory store, graph store, system senses, chat service, agency planner, psyche service, image generation, email delivery, audio inspection, facial expression output, want-achievement detection, command logging, and interrupt sources. So the "mind" does not directly know how to read a camera, battery, mailbox, or microphone. It receives abstract capabilities and calls them through dependency interfaces.
 
 ## Conversation Loop
 
@@ -28,7 +28,7 @@ The sense systems enter through skills:
 - `take_picture`, `describe_image`, and `compare_images` use the camera, image description service, and image comparison service.
 - `get_time`, `get_power`, `get_storage`, and `get_database_stats` use configured system and database senses.
 - `facial_expression` uses the host expression adapter when the macOS WebView body exposes one.
-- `introspect` summarizes senses, capabilities, memory state, needs, autonomy state, and skills.
+- `introspect` summarizes senses, capabilities, memory state, needs, attention/agency state, and skills.
 - Uploaded image paths are treated as visual observations through `uploadedImageObservation`.
 - Uploaded audio paths are classified and, for speech or mixed audio, transcribed through `uploadedAudioObservation`.
 
@@ -43,8 +43,8 @@ The cognition side has a few layers:
 - **Language mind**: `ChatService` chooses commands from memory, user text, and observations. Its prompt explicitly says it is a situated being with senses, memory, uncertainty, and skills.
 - **Appraisal/emotion**: user speech and events are converted into impressions and appraisals, using heuristics in `src/core/emotion.zig`.
 - **Memory**: sightings, summaries, appraisals, thoughts, facts, dreams, and relationship edges are stored. The first-pass prompt receives compact index context only; full memory bodies are brought in through `recall_memory`.
-- **Needs**: `src/core/needs.zig` evaluates interaction, attachment, power continuity, and self-defined needs from memory, graph state, power, and autonomy energy.
-- **Psyche/autonomy**: autonomous ticks build one shared psyche context from needs, memories, appraisals, impressions, relationship graph, power, energy, and skills. Id and Superego both drink from that same firehose but may assign different salience, causes, and meanings to the same stimulus: Id simulates short-term consequences, while Superego simulates long-term consequences and value continuity under uncertainty. The Ego planner reconciles those interpretations and chooses one allowed command. Camera commands are explicitly forbidden for autonomy.
+- **Needs**: `src/core/needs.zig` surfaces self-defined needs, wants, and goals from memory for inner directives and psyche context. Interaction, power, and attachment cues arrive through stimulus push and body-sense observations.
+- **Psyche/agency**: attention ticks build one shared psyche context from events, needs, memories, appraisals, impressions, relationship graph, power, energy, boundaries, and skills. Id and Superego both drink from that same firehose but may assign different salience, causes, and meanings to the same stimulus: Id simulates short-term consequences, while Superego simulates long-term consequences and value continuity under uncertainty. The Ego planner reconciles those interpretations and may choose quiet integration, private thought, a capability, waiting, emote, or speech. Camera and biometric actions are gated by host capability and permission policy, not by background-agency modes.
 
 ## The Core Feedback Loop
 
@@ -67,4 +67,4 @@ Cached speaker context, when present, feeds `assignSpeechStimulus` continuity sc
 
 ## Short Version
 
-Senses are not a background stream; they are commandable skills. The brain's mind asks for observations when it needs them, the body produces structured text results, and those results become part of the next cognitive step, memory update, or spoken response.
+Some senses push events regularly; others are commandable skills. The brain's mind asks for observations when it needs them, the body produces structured text results, and those results become part of the next cognitive step, memory update, quiet attention shift, or spoken response.

@@ -1,5 +1,6 @@
 const std = @import("std");
 const autonomy = @import("port_autonomy.zig");
+const llm_voice = @import("llm_voice.zig");
 
 pub const IdTurn = struct {
     top_need: []const u8,
@@ -79,8 +80,8 @@ pub const ScriptedPsycheService = struct {
     }
 };
 
-fn joinList(allocator: std.mem.Allocator, values: []const []const u8) ![]const u8 {
-    if (values.len == 0) return allocator.dupe(u8, "none");
+fn joinList(allocator: std.mem.Allocator, values: []const []const u8, empty_phrase: []const u8) ![]const u8 {
+    if (values.len == 0) return allocator.dupe(u8, empty_phrase);
     var out = std.ArrayList(u8).empty;
     for (values, 0..) |value, i| {
         if (i > 0) try out.appendSlice(allocator, "; ");
@@ -90,17 +91,29 @@ fn joinList(allocator: std.mem.Allocator, values: []const []const u8) ![]const u
 }
 
 pub fn formatIdTurn(allocator: std.mem.Allocator, turn: IdTurn) ![]const u8 {
+    const urges = try joinList(allocator, turn.urges, llm_voice.empty_inner_state);
+    defer allocator.free(urges);
+    const thoughts = try joinList(allocator, turn.random_thoughts, llm_voice.empty_inner_state);
+    defer allocator.free(thoughts);
     return std.fmt.allocPrint(
         allocator,
-        "Id:\n- top_need: {s}\n- urges: {s}\n- random_thoughts: {s}\n- desired_action_bias: {s}\n- salience: {s}\n- reason: {s}\n",
-        .{ turn.top_need, try joinList(allocator, turn.urges), try joinList(allocator, turn.random_thoughts), turn.desired_action_bias, @tagName(turn.salience), turn.reason },
+        "Id:\n- What pulls at me most: {s}\n- Urges I feel: {s}\n- Random thoughts drifting through: {s}\n- I lean toward: {s}\n- This feels {s} to me right now\n- Because: {s}\n",
+        .{ turn.top_need, urges, thoughts, turn.desired_action_bias, @tagName(turn.salience), turn.reason },
     );
 }
 
 pub fn formatSuperegoTurn(allocator: std.mem.Allocator, turn: SuperegoTurn) ![]const u8 {
+    const concerns = try joinList(allocator, turn.concerns, llm_voice.empty_inner_state);
+    defer allocator.free(concerns);
+    const vetoes = try joinList(allocator, turn.vetoes, llm_voice.empty_inner_state);
+    defer allocator.free(vetoes);
+    const restraints = try joinList(allocator, turn.preferred_restraints, llm_voice.empty_inner_state);
+    defer allocator.free(restraints);
+    const values = try joinList(allocator, turn.values_to_preserve, llm_voice.empty_inner_state);
+    defer allocator.free(values);
     return std.fmt.allocPrint(
         allocator,
-        "Superego:\n- concerns: {s}\n- vetoes: {s}\n- preferred_restraints: {s}\n- values_to_preserve: {s}\n- salience: {s}\n- reason: {s}\n",
-        .{ try joinList(allocator, turn.concerns), try joinList(allocator, turn.vetoes), try joinList(allocator, turn.preferred_restraints), try joinList(allocator, turn.values_to_preserve), @tagName(turn.salience), turn.reason },
+        "Superego:\n- What worries me: {s}\n- What I refuse to do: {s}\n- Restraints I prefer: {s}\n- Values I want to preserve: {s}\n- This feels {s} to me right now\n- Because: {s}\n",
+        .{ concerns, vetoes, restraints, values, @tagName(turn.salience), turn.reason },
     );
 }

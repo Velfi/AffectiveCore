@@ -96,6 +96,7 @@ pub const RandomProviderChatService = struct {
             chatJsonSchema();
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
+            if (self.parse_failure_brain) |brain| brain.pollStimulusInbox() catch {};
             const content = try self.provider_client.completeText(allocator, .{
                 .subsystem = "conversation",
                 .system_prompt = prompt.system_prompt,
@@ -118,15 +119,19 @@ pub const RandomProviderChatService = struct {
                 return err;
             };
             validateChatDeliveryContext(stimulus_kind, observations, turn_result.action_pressures.len) catch |err| {
-                reportChatParseError("conversation", "host", "host_llm_complete", err, content);
-                chat_port.freeActionProposals(allocator, turn_result.action_pressures);
-                allocator.free(turn_result.user_summary);
-                allocator.free(turn_result.brain_summary);
-                if (service_errors.shouldRetryChatParse(err, attempt)) {
-                    service_errors.logChatParseRetry("conversation", "host", "host_llm_complete", attempt);
-                    continue;
+                if (err == error.InvalidChatAction and stimulus_kind == .host_sense_delivery) {
+                    std.debug.print("chat delivery context advisory: {s}\n", .{@errorName(err)});
+                } else {
+                    reportChatParseError("conversation", "host", "host_llm_complete", err, content);
+                    chat_port.freeActionProposals(allocator, turn_result.action_pressures);
+                    allocator.free(turn_result.user_summary);
+                    allocator.free(turn_result.brain_summary);
+                    if (service_errors.shouldRetryChatParse(err, attempt)) {
+                        service_errors.logChatParseRetry("conversation", "host", "host_llm_complete", attempt);
+                        continue;
+                    }
+                    return err;
                 }
-                return err;
             };
             const turn = applyQualityPolicy(self.provider_client.llm_quality, turn_result);
             if (turn.reasoning_effort) |effort| self.reasoning_effort = effort;
@@ -167,12 +172,52 @@ pub fn validateChatDeliveryContext(
     if (action_count > 0) return error.InvalidChatAction;
 }
 
-fn validateActionPressureWire(pressure: ActionPressureWire) !void {
+fn trimmedTextsEqualIgnoreCase(a: []const u8, b: []const u8) bool {
+    const trimmed_a = std.mem.trim(u8, a, " \r\n\t");
+    const trimmed_b = std.mem.trim(u8, b, " \r\n\t");
+    if (trimmed_a.len == 0 or trimmed_b.len == 0) return false;
+    return std.ascii.eqlIgnoreCase(trimmed_a, trimmed_b);
+}
+
+fn alnumEchoCount(text: []const u8) usize {
+    var count: usize = 0;
+    for (text) |c| {
+        if (std.ascii.isAlphanumeric(c)) count += 1;
+    }
+    return count;
+}
+
+fn textsEchoEachOther(a: []const u8, b: []const u8) bool {
+    if (alnumEchoCount(a) < 6 or alnumEchoCount(b) < 6) return false;
+    var ia: usize = 0;
+    var ib: usize = 0;
+    while (true) {
+        while (ia < a.len and !std.ascii.isAlphanumeric(a[ia])) : (ia += 1) {}
+        while (ib < b.len and !std.ascii.isAlphanumeric(b[ib])) : (ib += 1) {}
+        if (ia >= a.len and ib >= b.len) return true;
+        if (ia >= a.len or ib >= b.len) return false;
+        if (std.ascii.toLower(a[ia]) != std.ascii.toLower(b[ib])) return false;
+        ia += 1;
+        ib += 1;
+    }
+}
+
+fn validateActionPressureWire(pressure: ActionPressureWire, user_text: []const u8) !void {
     if (isForbiddenChatActionName(pressure.action)) return error.InvalidChatAction;
     if (capability_registry.actionForCapabilityId(pressure.action)) |known| {
         if (known == .recognize and pressure.text != null) {
             const text = std.mem.trim(u8, pressure.text.?, " \r\n\t");
             if (text.len > 0) return error.InvalidChatAction;
+        }
+        if (known == .say and pressure.text != null) {
+            const text = pressure.text.?;
+            if (textsEchoEachOther(text, user_text)) return error.InvalidChatAction;
+            if (pressure.query != null) {
+                const query = pressure.query.?;
+                if (trimmedTextsEqualIgnoreCase(text, user_text) and !trimmedTextsEqualIgnoreCase(text, query)) {
+                    return error.InvalidChatAction;
+                }
+            }
         }
     }
 }
@@ -399,7 +444,7 @@ fn deriveBrainSummaryFromActionPressures(allocator: std.mem.Allocator, action_pr
 }
 
 fn chatTurnFromWire(allocator: std.mem.Allocator, wire: ChatWire, user_text: []const u8) !ChatTurn {
-    for (wire.action_pressures) |pressure| try validateActionPressureWire(pressure);
+    for (wire.action_pressures) |pressure| try validateActionPressureWire(pressure, user_text);
     var action_pressures = try allocator.alloc(ActionProposal, wire.action_pressures.len);
     for (wire.action_pressures, 0..) |pressure, i| {
         const resolved_action = capability_registry.actionForCapabilityId(pressure.action);

@@ -134,6 +134,31 @@ test "recognize skips re-identify when current frame is already in observations"
     try std.testing.expect(batch.spoken_text == null);
 }
 
+test "recognize does not dedup stale recognition marker without a current frame" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/unknown_01.jpg", &.{}, &store, &desc);
+
+    var observations = std.ArrayList(u8).empty;
+    defer observations.deinit(allocator);
+    try observations.appendSlice(
+        allocator,
+        "Current speaker recognition: unknown; name=unknown; person_id=none; confidence=0.00; people_count=0; image=stale/frame.jpg; interpretation=face_unmatched.\n",
+    );
+
+    try std.testing.expect(!brain.recognitionAlreadyInObservations(observations.items));
+
+    var proposals = [_]chat_mod.ActionProposal{
+        .{ .action = .recognize },
+    };
+    _ = try brain.executeActionProposals(&proposals, &observations);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "recognition_dedup:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "Current speaker recognition:") != null);
+}
+
 test "frontend camera pull observation completes the awaited recognition" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -385,6 +410,33 @@ test "unknown face after hello skips follow-up deliberation" {
     const visual_line = try brain.recognizeFromCapturedPath("fixtures/visitors/unknown_01.jpg");
     const resumed = brain.continueConversationAfterAwaitedVisual(visual_line);
     try std.testing.expectError(error.NoActiveActivity, resumed);
+    try std.testing.expectEqual(@as(usize, 1), chat.calls);
+}
+
+test "unknown face host delivery after hello does not trigger salient reconsideration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/unknown_01.jpg", &.{}, &store, &desc);
+    var pull_camera = support.FrontendPullCamera{};
+    brain.deps.camera = pull_camera.camera();
+    var chat = support.ScriptedRecognizeThenSayChatService{ .say_text = "Hello." };
+    brain.deps.chat_service = chat.service();
+
+    _ = try brain.handleConversationText(try input_mod.HeardSpeech.typed(allocator, "Hello Geisha"), .{});
+    try std.testing.expect(brain.conversationAwaitingHost());
+
+    const visual_result = try brain.handleHostVisualObservation(
+        "fixtures/visitors/unknown_01.jpg",
+        "affective_requested_capture",
+        "image/jpeg",
+    );
+    switch (visual_result) {
+        .recognition_only, .detail_only => {},
+        else => return error.UnexpectedVisualResult,
+    }
     try std.testing.expectEqual(@as(usize, 1), chat.calls);
 }
 

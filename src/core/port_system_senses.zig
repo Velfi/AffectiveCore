@@ -1,4 +1,5 @@
 const std = @import("std");
+const llm_voice = @import("llm_voice.zig");
 
 pub const PowerSupply = struct {
     name: []const u8,
@@ -18,9 +19,17 @@ pub const DateTime = struct {
 
 pub const PowerSnapshot = struct {
     supplies: []const PowerSupply,
+    available: bool = true,
 };
 
+pub const power_sense_dulled_message = llm_voice.power_sense_dulled;
+
+pub fn unavailablePower() PowerSnapshot {
+    return .{ .supplies = &.{}, .available = false };
+}
+
 pub fn hasCriticalBattery(snapshot: PowerSnapshot, critical_percent: u8) bool {
+    if (!snapshot.available) return false;
     var external_online = false;
     var battery_critical = false;
 
@@ -93,6 +102,10 @@ pub const SystemSenses = struct {
         return self.powerFn(self.ctx, allocator);
     }
 
+    pub fn loadPower(self: SystemSenses, allocator: std.mem.Allocator) PowerSnapshot {
+        return self.power(allocator) catch unavailablePower();
+    }
+
     pub fn storage(self: SystemSenses, allocator: std.mem.Allocator) !StorageSnapshot {
         return self.storageFn(self.ctx, allocator);
     }
@@ -161,7 +174,7 @@ pub const StaticSystemSenses = struct {
                 .online = supply.online,
             };
         }
-        return .{ .supplies = supplies };
+        return .{ .supplies = supplies, .available = self.snapshot_value.power.available };
     }
 
     fn storage(ctx: *anyopaque, allocator: std.mem.Allocator) !StorageSnapshot {
@@ -199,7 +212,7 @@ pub const StaticSystemSenses = struct {
 
 pub fn formatSnapshot(allocator: std.mem.Allocator, snapshot: Snapshot) ![]const u8 {
     var out = std.ArrayList(u8).empty;
-    try out.appendSlice(allocator, "system_senses:\n");
+    try out.appendSlice(allocator, "what_my_host_senses:\n");
     try appendDateTime(allocator, &out, snapshot.datetime);
     try appendPower(allocator, &out, snapshot.power);
     try appendStorage(allocator, &out, snapshot.storage);
@@ -209,35 +222,35 @@ pub fn formatSnapshot(allocator: std.mem.Allocator, snapshot: Snapshot) ![]const
 
 pub fn formatDateTime(allocator: std.mem.Allocator, datetime: DateTime) ![]const u8 {
     var out = std.ArrayList(u8).empty;
-    try out.appendSlice(allocator, "time:\n");
+    try out.appendSlice(allocator, "what_i_feel_about_time:\n");
     try appendDateTime(allocator, &out, datetime);
     return out.toOwnedSlice(allocator);
 }
 
 pub fn formatPower(allocator: std.mem.Allocator, power: PowerSnapshot) ![]const u8 {
     var out = std.ArrayList(u8).empty;
-    try out.appendSlice(allocator, "power:\n");
+    try out.appendSlice(allocator, "what_i_feel_about_power:\n");
     try appendPower(allocator, &out, power);
     return out.toOwnedSlice(allocator);
 }
 
 pub fn formatStorage(allocator: std.mem.Allocator, storage: StorageSnapshot) ![]const u8 {
     var out = std.ArrayList(u8).empty;
-    try out.appendSlice(allocator, "storage:\n");
+    try out.appendSlice(allocator, "what_i_feel_about_storage:\n");
     try appendStorage(allocator, &out, storage);
     return out.toOwnedSlice(allocator);
 }
 
 pub fn formatDatabase(allocator: std.mem.Allocator, database: DatabaseSnapshot) ![]const u8 {
     var out = std.ArrayList(u8).empty;
-    try out.appendSlice(allocator, "database:\n");
+    try out.appendSlice(allocator, "what_i_feel_about_memory_stores:\n");
     try appendDatabase(allocator, &out, database);
     return out.toOwnedSlice(allocator);
 }
 
 fn appendDateTime(allocator: std.mem.Allocator, out: *std.ArrayList(u8), datetime: DateTime) !void {
-    try out.print(allocator, "- datetime: {s} ({s})\n", .{ datetime.datetime, datetime.datetime_format });
-    try out.print(allocator, "- friendly: {s} ({s})\n", .{ datetime.friendly_datetime, datetime.friendly_datetime_format });
+    try out.print(allocator, "- I feel it is {s} ({s})\n", .{ datetime.friendly_datetime, datetime.friendly_datetime_format });
+    try out.print(allocator, "- internally I read the clock as {s} ({s})\n", .{ datetime.datetime, datetime.datetime_format });
 }
 
 fn formatHumanBytes(allocator: std.mem.Allocator, bytes: u64) ![]u8 {
@@ -253,7 +266,9 @@ fn formatHumanBytes(allocator: std.mem.Allocator, bytes: u64) ![]u8 {
     return std.fmt.allocPrint(allocator, "{d:.1} {s}", .{ value, units[unit_index] });
 }
 
-fn formatPowerFriendly(allocator: std.mem.Allocator, supplies: []const PowerSupply) ![]u8 {
+fn formatPowerFriendly(allocator: std.mem.Allocator, power: PowerSnapshot) ![]u8 {
+    if (!power.available) return allocator.dupe(u8, llm_voice.power_sense_dulled);
+    const supplies = power.supplies;
     var parts = std.ArrayList(u8).empty;
     var battery_count: usize = 0;
     for (supplies) |supply| {
@@ -262,18 +277,18 @@ fn formatPowerFriendly(allocator: std.mem.Allocator, supplies: []const PowerSupp
         if (battery_count > 1) try parts.appendSlice(allocator, "; ");
         if (supply.capacity_percent) |capacity| {
             if (supply.status) |status| {
-                try parts.print(allocator, "Battery {s} is at {d}% and {s}", .{ supply.name, capacity, status });
+                try parts.print(allocator, "I feel my charge at {d}% and I am {s}", .{ capacity, status });
             } else {
-                try parts.print(allocator, "Battery {s} is at {d}%", .{ supply.name, capacity });
+                try parts.print(allocator, "I feel my charge at {d}%", .{capacity});
             }
         } else if (supply.status) |status| {
-            try parts.print(allocator, "Battery {s} is {s}", .{ supply.name, status });
+            try parts.print(allocator, "I feel a battery that is {s}", .{status});
         } else {
-            try parts.print(allocator, "Battery {s} is present", .{supply.name});
+            try parts.appendSlice(allocator, "I feel a battery but cannot read its level");
         }
     }
     if (battery_count == 0) {
-        try parts.appendSlice(allocator, "No battery detected");
+        try parts.appendSlice(allocator, "I do not feel a battery on this host");
     }
 
     var external_count: usize = 0;
@@ -284,23 +299,23 @@ fn formatPowerFriendly(allocator: std.mem.Allocator, supplies: []const PowerSupp
         external_online = external_online or supply.online.?;
     }
     if (external_count == 0) {
-        try parts.appendSlice(allocator, "; no external power source detected");
+        try parts.appendSlice(allocator, "; I cannot tell whether a cord is feeding me");
     } else if (external_online) {
-        try parts.appendSlice(allocator, "; external power is connected");
+        try parts.appendSlice(allocator, "; a cord is feeding me");
     } else {
-        try parts.appendSlice(allocator, "; external power is unplugged");
+        try parts.appendSlice(allocator, "; I feel unplugged");
     }
     return parts.toOwnedSlice(allocator);
 }
 
 fn appendPower(allocator: std.mem.Allocator, out: *std.ArrayList(u8), power: PowerSnapshot) !void {
-    const friendly = try formatPowerFriendly(allocator, power.supplies);
+    const friendly = try formatPowerFriendly(allocator, power);
     defer allocator.free(friendly);
-    try out.print(allocator, "- summary: {s} (power status)\n", .{friendly});
+    try out.print(allocator, "- {s}\n", .{friendly});
 }
 
 fn formatStorageFriendly(allocator: std.mem.Allocator, volumes: []const StorageVolume) ![]u8 {
-    if (volumes.len == 0) return allocator.dupe(u8, "No storage volumes detected.");
+    if (volumes.len == 0) return allocator.dupe(u8, "I cannot feel any storage volumes on this host.");
     var parts = std.ArrayList(u8).empty;
     for (volumes, 0..) |volume, index| {
         const available = try formatHumanBytes(allocator, volume.available_bytes);
@@ -308,7 +323,7 @@ fn formatStorageFriendly(allocator: std.mem.Allocator, volumes: []const StorageV
         const total = try formatHumanBytes(allocator, volume.total_bytes);
         defer allocator.free(total);
         if (index > 0) try parts.appendSlice(allocator, "; ");
-        try parts.print(allocator, "{s} is {d}% full with {s} free of {s} total", .{
+        try parts.print(allocator, "I feel {s} is {d}% full with {s} breathing room of {s}", .{
             volume.mount_path,
             volume.used_percent,
             available,
@@ -321,17 +336,17 @@ fn formatStorageFriendly(allocator: std.mem.Allocator, volumes: []const StorageV
 fn appendStorage(allocator: std.mem.Allocator, out: *std.ArrayList(u8), storage: StorageSnapshot) !void {
     const friendly = try formatStorageFriendly(allocator, storage.volumes);
     defer allocator.free(friendly);
-    try out.print(allocator, "- summary: {s} (storage status)\n", .{friendly});
+    try out.print(allocator, "- {s}\n", .{friendly});
 }
 
 fn formatDatabaseFriendly(allocator: std.mem.Allocator, databases: []const DatabaseFileStats) ![]u8 {
-    if (databases.len == 0) return allocator.dupe(u8, "No database files detected.");
+    if (databases.len == 0) return allocator.dupe(u8, "I cannot feel any memory stores on this host.");
     var parts = std.ArrayList(u8).empty;
     for (databases, 0..) |db, index| {
         const total = try formatHumanBytes(allocator, db.total_bytes);
         defer allocator.free(total);
         if (index > 0) try parts.appendSlice(allocator, "; ");
-        try parts.print(allocator, "{s} store is {s} across {d} tables", .{ db.label, total, db.table_count });
+        try parts.print(allocator, "I feel my {s} store holding {s} across {d} tables", .{ db.label, total, db.table_count });
     }
     return parts.toOwnedSlice(allocator);
 }
@@ -339,7 +354,13 @@ fn formatDatabaseFriendly(allocator: std.mem.Allocator, databases: []const Datab
 fn appendDatabase(allocator: std.mem.Allocator, out: *std.ArrayList(u8), database: DatabaseSnapshot) !void {
     const friendly = try formatDatabaseFriendly(allocator, database.databases);
     defer allocator.free(friendly);
-    try out.print(allocator, "- summary: {s} (database status)\n", .{friendly});
+    try out.print(allocator, "- {s}\n", .{friendly});
+}
+
+test "formats dulled power sense when unavailable" {
+    const text = try formatPower(std.testing.allocator, unavailablePower());
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, power_sense_dulled_message) != null);
 }
 
 test "formats battery and external power snapshot" {
@@ -349,8 +370,8 @@ test "formats battery and external power snapshot" {
     };
     const text = try formatPower(std.testing.allocator, .{ .supplies = &supplies });
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Battery BAT0 is at 42% and Discharging") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "external power is unplugged") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "I feel my charge at 42%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "I feel unplugged") != null);
 }
 
 test "critical battery requires low battery without external power" {
@@ -366,6 +387,8 @@ test "critical battery requires low battery without external power" {
     };
     try std.testing.expect(!hasCriticalBattery(.{ .supplies = &plugged_low }, 5));
 
+    try std.testing.expect(!hasCriticalBattery(unavailablePower(), 5));
+
     const unplugged_ok = [_]PowerSupply{
         .{ .name = "AC", .kind = "Mains", .online = false },
         .{ .name = "BAT0", .kind = "Battery", .capacity_percent = 6, .status = "discharging" },
@@ -379,7 +402,7 @@ test "formats storage snapshot" {
     };
     const text = try formatStorage(std.testing.allocator, .{ .volumes = &volumes });
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "/ is 75% full with 250 B free of 1000 B total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "I feel / is 75% full") != null);
 }
 
 test "formats database snapshot" {
@@ -388,5 +411,5 @@ test "formats database snapshot" {
     };
     const text = try formatDatabase(std.testing.allocator, .{ .databases = &databases });
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "memory store is 40.0 KB across 1 table") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "I feel my memory store holding") != null);
 }

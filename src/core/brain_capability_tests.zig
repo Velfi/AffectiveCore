@@ -166,6 +166,73 @@ test "capability registry canonicalizes aliases and manifest statuses" {
     try std.testing.expect(capability_registry.lookup("speech") != null);
 }
 
+test "recordCapabilityStatus re-upsert does not use invalidated prior slices" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+
+    const host_id = "ios-host";
+    try brain.recordCapabilityStatus(.{
+        .capability_id = "recognize",
+        .host_id = host_id,
+        .permission = .granted,
+        .availability = .available,
+        .quality = 0.50,
+        .reliability = 0.50,
+        .updated_at_ms = 1_000,
+    });
+    try brain.recordCapabilityStatus(.{
+        .capability_id = "recognize",
+        .host_id = host_id,
+        .permission = .granted,
+        .availability = .available,
+        .quality = 0.90,
+        .reliability = 0.90,
+        .updated_at_ms = 2_000,
+    });
+    try std.testing.expectEqual(@as(usize, 1), store.capability_statuses.items.len);
+    try std.testing.expect(store.capability_statuses.items[0].quality > 0.85);
+}
+
+test "observed latency refresh survives capability status re-upsert" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var store = TestStore.init(allocator);
+    var desc = openai.TestDescriptionService{};
+    var brain = makeBrain(allocator, "fixtures/visitors/known_01.jpg", &.{}, &store, &desc);
+    brain.now_seconds = 1_782_000_000;
+
+    const host_id = brain.currentHostId();
+    try brain.recordCapabilityStatus(.{
+        .capability_id = "recognize",
+        .host_id = host_id,
+        .permission = .granted,
+        .availability = .available,
+        .quality = 0.70,
+        .reliability = 0.70,
+        .latency_ms = 2_000,
+        .updated_at_ms = brain.now_seconds * 1000,
+    });
+    try brain.recordCapabilityStatus(.{
+        .capability_id = "recognize",
+        .host_id = host_id,
+        .permission = .granted,
+        .availability = .available,
+        .quality = 0.75,
+        .reliability = 0.75,
+        .latency_ms = 2_000,
+        .updated_at_ms = brain.now_seconds * 1000,
+    });
+    const request = try brain.recordCapabilityRequest("recognize", "probe", &.{});
+    brain.now_seconds += 4;
+    _ = try brain.recordCapabilityResult(request, .completed, "ok", "");
+    try std.testing.expectEqual(@as(u32, 3_000), store.capability_statuses.items[0].latency_ms);
+}
+
 test "mailbox mark read persists read_at_ms" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

@@ -59,9 +59,9 @@ test "get_time reports date time only" {
 
     _ = try brain.executeActionProposals(commands[0..], &observations);
 
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "time:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "datetime: 2026-06-23T12:30:00-05:00 (ISO-8601 local)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "friendly: June 23, 2026 at 12:30 PM (local long date and time)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "what_i_feel_about_time:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "I feel it is June 23, 2026 at 12:30 PM") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "internally I read the clock as 2026-06-23T12:30:00-05:00") != null);
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "battery_BAT0") == null);
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "external_power") == null);
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "storage_/") == null);
@@ -79,9 +79,9 @@ test "get_power reports battery and plugged in state" {
 
     _ = try brain.executeActionProposals(commands[0..], &observations);
 
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "power:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "Battery BAT0 is at 42% and Discharging") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "external power is connected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "what_i_feel_about_power:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "I feel my charge at 42%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "a cord is feeding me") != null);
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "storage_/") == null);
 }
 
@@ -97,8 +97,8 @@ test "get_storage reports storage fullness only" {
 
     _ = try brain.executeActionProposals(commands[0..], &observations);
 
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "storage:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "/ is 75% full with 250 B free of 1000 B total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "what_i_feel_about_storage:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "I feel / is 75% full") != null);
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "battery_BAT0") == null);
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "external_power") == null);
 }
@@ -115,9 +115,9 @@ test "get_database_stats reports sqlite database stats only" {
 
     _ = try brain.executeActionProposals(commands[0..], &observations);
 
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "database:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "memory store is 40.0 KB across 1 table") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "relationship_graph store is 48.0 KB across 4 tables") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "what_i_feel_about_memory_stores:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "I feel my memory store holding") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "I feel my relationship_graph store holding") != null);
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "battery_BAT0") == null);
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "storage_/") == null);
 }
@@ -135,7 +135,7 @@ test "facial expression is unavailable without output" {
     _ = try brain.executeActionProposals(commands[0..], &observations);
 
     try std.testing.expect(std.mem.indexOf(u8, observations.items, "skill_failed: facial_expression: unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "facial expression output is not configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "cannot show expressions on the avatar through this host") != null);
 }
 
 test "facial expression shows valid sprites with default duration" {
@@ -366,10 +366,10 @@ test "runtime conversation pass executes five sense proposals" {
     var observations = std.ArrayList(u8).empty;
     const result = try runtime_bridge.runConversationPass(&brain, "memory", &.{}, "test your senses", &observations, 0);
     try std.testing.expectEqual(@as(usize, 5), result.turn.action_pressures.len);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "time:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "power:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "storage:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "database:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "what_i_feel_about_time:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "what_i_feel_about_power:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "what_i_feel_about_storage:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "what_i_feel_about_memory_stores:") != null);
 }
 
 test "conversation runtime forces interaction origin when autonomy mode is off" {
@@ -385,7 +385,7 @@ test "conversation runtime forces interaction origin when autonomy mode is off" 
     var observations = std.ArrayList(u8).empty;
     const result = try runtime_bridge.runConversationPass(&brain, "memory", &.{}, "poll senses", &observations, 0);
     _ = result;
-    try std.testing.expect(std.mem.indexOf(u8, observations.items, "time:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, observations.items, "what_i_feel_about_time:") != null);
 }
 
 const ScriptedAutonomyOriginSenseChatService = struct {
@@ -424,7 +424,7 @@ const ScriptedSenseThenReportChatService = struct {
                 .turn_complete = false,
             };
         }
-        try std.testing.expect(std.mem.indexOf(u8, observations, "time:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, observations, "what_i_feel_about_time:") != null);
         var pressures = try allocator.alloc(chat_mod.ActionProposal, 1);
         pressures[0] = .{ .action = .say, .text = try allocator.dupe(u8, "The clock reads 2026-06-23.") };
         return .{

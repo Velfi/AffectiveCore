@@ -115,7 +115,7 @@ test "introspection summarizes memory and senses" {
 
     const needs = try brain.introspect("needs");
     try std.testing.expect(std.mem.indexOf(u8, needs, "inner_directives:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, needs, "self_wants:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, needs, "what_i_want:") != null);
     try std.testing.expect(std.mem.indexOf(u8, needs, "self_defined_want:want_music") != null);
 
     const senses = try brain.introspect("senses");

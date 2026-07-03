@@ -157,7 +157,7 @@ test "want achievement reinforcement is proportional to want salience and score"
     try std.testing.expect(wantReinforcementStrength(high) > wantReinforcementStrength(low));
 }
 
-test "want achievement rejects unknown want id" {
+test "want achievement ignores unknown want id" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -181,7 +181,10 @@ test "want achievement rejects unknown want id" {
         .confidence = 0.90,
         .evidence = "done",
     }};
-    try std.testing.expectError(error.UnknownWantAchievementMemoryId, brain.detectWantAchievements("done"));
+    const count = try brain.detectWantAchievements("done");
+    try std.testing.expectEqual(@as(usize, 0), count);
+    try std.testing.expectEqual(@as(usize, 1), store.memories.items.len);
+    try std.testing.expectEqual(@as(usize, 0), store.appraisals.items.len);
 }
 
 test "want achievement no match leaves memory and appraisals unchanged" {
@@ -209,4 +212,3 @@ test "want achievement no match leaves memory and appraisals unchanged" {
     try std.testing.expectEqual(@as(usize, 1), store.memories.items.len);
     try std.testing.expectEqual(@as(usize, 0), store.appraisals.items.len);
 }
-
