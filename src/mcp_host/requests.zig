@@ -39,6 +39,13 @@ pub fn readModelsSnapshot(request_id: []const u8) ![]const u8 {
     });
 }
 
+pub fn exportBrain(request_id: []const u8, brain_file_path: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(std.heap.page_allocator, "{{\"api_version\":1,\"request_id\":{s},\"event\":{{\"type\":\"brain_archive\",\"action\":\"export\",\"brain_file_path\":{s}}}}}", .{
+        try jsonString(request_id),
+        try jsonString(brain_file_path),
+    });
+}
+
 pub fn requestDreamTime(request_id: []const u8, text: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(std.heap.page_allocator, "{{\"api_version\":1,\"request_id\":{s},\"event\":{{\"type\":\"mailbox_update\",\"action\":\"request_dream_time\",\"prompt\":{s}}}}}", .{
         try jsonString(request_id),

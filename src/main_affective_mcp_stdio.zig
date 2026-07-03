@@ -175,6 +175,23 @@ fn dispatchTool(allocator: std.mem.Allocator, session: *mcp_host.session.Session
             defer std.heap.page_allocator.free(json);
             break :blk try session.dispatch(json);
         }
+        if (std.mem.eql(u8, name, "memory_inspect_safe")) {
+            const json = try mcp_host.requests.readModelsSnapshot(request_id);
+            defer std.heap.page_allocator.free(json);
+            const snapshot = try session.dispatch(json);
+            break :blk try mcp_host.admin_tools.memoryInspectSafe(session.arena.allocator(), snapshot, args);
+        }
+        if (std.mem.eql(u8, name, "session_metadata_get")) {
+            break :blk try mcp_host.admin_tools.metadataGet(session.arena.allocator(), session.io, session.brain_root);
+        }
+        if (std.mem.eql(u8, name, "session_metadata_set")) {
+            break :blk try mcp_host.admin_tools.metadataSet(session.arena.allocator(), session.io, session.brain_root, args);
+        }
+        if (std.mem.eql(u8, name, "export_brain")) {
+            const json = try mcp_host.requests.exportBrain(request_id, getString(args, "brain_file_path") orelse getString(args, "output_path") orelse return error.MissingBrainFilePath);
+            defer std.heap.page_allocator.free(json);
+            break :blk try session.dispatch(json);
+        }
         if (std.mem.eql(u8, name, "conversation_text")) {
             break :blk try session.conversationText(getString(args, "text") orelse return error.MissingText, request_id);
         }
@@ -206,6 +223,10 @@ fn tools(allocator: std.mem.Allocator) ![]const Tool {
         .{ .name = "short_touch", .description = "Send a short touch stimulus to the brain.", .schema_json = "{\"type\":\"object\",\"properties\":{\"request_id\":{\"type\":\"string\"}}}" },
         .{ .name = "sense_observation", .description = "Send a camera image observation to the brain.", .schema_json = "{\"type\":\"object\",\"required\":[\"image_path\"],\"properties\":{\"request_id\":{\"type\":\"string\"},\"image_path\":{\"type\":\"string\"}}}" },
         .{ .name = "read_models_snapshot", .description = "Read the brain's compact model snapshot.", .schema_json = "{\"type\":\"object\",\"properties\":{\"request_id\":{\"type\":\"string\"}}}" },
+        .{ .name = "memory_inspect_safe", .description = "Read privacy-aware memory/session counts without raw memory text.", .schema_json = "{\"type\":\"object\",\"properties\":{\"request_id\":{\"type\":\"string\"},\"include_text\":{\"type\":\"boolean\"}}}" },
+        .{ .name = "session_metadata_get", .description = "Read lightweight host session metadata such as active identity.", .schema_json = "{\"type\":\"object\",\"properties\":{}}" },
+        .{ .name = "session_metadata_set", .description = "Persist lightweight host session metadata such as active identity.", .schema_json = "{\"type\":\"object\",\"properties\":{\"active_identity\":{\"type\":\"string\"},\"continuity_thread\":{\"type\":\"string\"},\"notes\":{\"type\":\"string\"}}}" },
+        .{ .name = "export_brain", .description = "Export Brain-owned state to a portable .brain archive without host secrets.", .schema_json = "{\"type\":\"object\",\"required\":[\"brain_file_path\"],\"properties\":{\"request_id\":{\"type\":\"string\"},\"brain_file_path\":{\"type\":\"string\"},\"output_path\":{\"type\":\"string\"}}}" },
         .{ .name = "conversation_text", .description = "Run a synchronous conversation turn and return the brain's spoken response.", .schema_json = "{\"type\":\"object\",\"required\":[\"text\"],\"properties\":{\"request_id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}}}" },
         .{ .name = "brain_step", .description = "Run one embedded autonomy brain step.", .schema_json = "{\"type\":\"object\",\"properties\":{\"request_id\":{\"type\":\"string\"}}}" },
         .{ .name = "request_dream_time", .description = "Ask the brain to enter dream-time processing.", .schema_json = "{\"type\":\"object\",\"properties\":{\"request_id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}}}" },
@@ -274,7 +295,7 @@ test "tools/list includes Codex stdio tools" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const listed = try tools(allocator);
-    const expected = [_][]const u8{ "connect", "host_attach", "user_text", "short_touch", "sense_observation", "read_models_snapshot", "conversation_text", "brain_step", "request_dream_time", "drain", "shutdown" };
+    const expected = [_][]const u8{ "connect", "host_attach", "user_text", "short_touch", "sense_observation", "read_models_snapshot", "memory_inspect_safe", "session_metadata_get", "session_metadata_set", "export_brain", "conversation_text", "brain_step", "request_dream_time", "drain", "shutdown" };
     for (expected) |name| {
         var found = false;
         for (listed) |tool| {

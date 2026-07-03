@@ -10,6 +10,7 @@ const schema = @import("storage/schema.zig");
 const json_store = @import("storage/json_store.zig");
 const brain_storage = @import("storage/brain_storage.zig");
 const input_mod = @import("platform/common/input.zig");
+const admin_tools = @import("mcp_host/admin_tools.zig");
 const mcp_tools = @import("main_mcp_tools.zig");
 const mcp_utils = @import("main_mcp_utils.zig");
 const main_http_transport = @import("main_http_transport.zig");
@@ -118,6 +119,9 @@ const Server = struct {
         if (std.mem.eql(u8, operation, "request_dream_time")) return self.requestDreamTime(mcp_utils.getString(args, "text"));
         if (std.mem.eql(u8, operation, "brain_mode")) return self.brainMode();
         if (std.mem.eql(u8, operation, "read_models_snapshot")) return self.readModelsSnapshot();
+        if (std.mem.eql(u8, operation, "memory_inspect_safe")) return self.memoryInspectSafe(args);
+        if (std.mem.eql(u8, operation, "session_metadata_get")) return admin_tools.metadataGet(self.allocator, self.io, self.brain.cfg.brain_root);
+        if (std.mem.eql(u8, operation, "session_metadata_set")) return admin_tools.metadataSet(self.allocator, self.io, self.brain.cfg.brain_root, args);
         if (std.mem.eql(u8, operation, "set_runtime_option")) return self.setRuntimeOption(args);
         if (std.mem.eql(u8, operation, "mailbox_list")) return self.mailboxList();
         if (std.mem.eql(u8, operation, "mailbox_mark_read")) return self.mailboxMarkRead(try mcp_utils.requireString(args, "mailbox_id"));
@@ -204,6 +208,11 @@ const Server = struct {
     fn readModelsSnapshot(self: *Server) ![]const u8 {
         const snapshot = try self.brain.readModelsSnapshot(self.allocator);
         return std.json.Stringify.valueAlloc(self.allocator, struct { read_models: @TypeOf(snapshot) }{ .read_models = snapshot }, .{ .whitespace = .indent_2 });
+    }
+
+    fn memoryInspectSafe(self: *Server, args: std.json.Value) ![]const u8 {
+        const snapshot = try self.readModelsSnapshot();
+        return try admin_tools.memoryInspectSafe(self.allocator, snapshot, args);
     }
 
     fn setRuntimeOption(self: *Server, args: std.json.Value) ![]const u8 {

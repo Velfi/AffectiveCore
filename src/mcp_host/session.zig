@@ -34,6 +34,9 @@ pub const Session = struct {
     mock_host: ?*mock_host.MockHost,
     live_host: ?*live_host.LiveHost,
     handle: *AffectiveCoreEmbedded,
+    io: std.Io,
+    brain_root: []const u8,
+    brain_id: []const u8,
     host_setup_done: bool = false,
 
     pub fn open(io: std.Io, options: Options) !Session {
@@ -114,6 +117,9 @@ pub const Session = struct {
             .mock_host = mock,
             .live_host = live,
             .handle = handle.?,
+            .io = io,
+            .brain_root = brain_root,
+            .brain_id = try allocator.dupe(u8, options.brain_id),
         };
     }
 

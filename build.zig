@@ -126,7 +126,7 @@ pub fn build(b: *std.Build) void {
         .name = "affective-core-session",
         .linkage = .static,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main_session.zig"),
+            .root_source_file = b.path("src/main_session_lib.zig"),
             .target = target,
             .optimize = optimize,
         }),

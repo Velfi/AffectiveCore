@@ -2,6 +2,7 @@ const std = @import("std");
 
 const files = @import("platform/common/files.zig");
 const live_host = @import("mcp_host/live_host.zig");
+const admin_tools = @import("mcp_host/admin_tools.zig");
 const protocol = @import("session/protocol.zig");
 const requests = @import("mcp_host/requests.zig");
 
@@ -257,7 +258,7 @@ pub fn main(init: std.process.Init) !void {
         };
         defer parsed.deinit();
         var shutdown = false;
-        if (try handleMcpRequest(allocator, &bsp, &bsp_reader_state.interface, parsed.value, &shutdown)) |response| {
+        if (try handleMcpRequest(allocator, &bsp, &bsp_reader_state.interface, options, parsed.value, &shutdown)) |response| {
             try sendMcpMessage(io, response);
         }
         if (shutdown) break;
@@ -299,7 +300,7 @@ fn parseOptions(allocator: std.mem.Allocator, args: *std.process.Args.Iterator, 
     return options;
 }
 
-fn handleMcpRequest(allocator: std.mem.Allocator, bsp: *BspClient, bsp_reader: *std.Io.Reader, request: std.json.Value, shutdown: *bool) !?[]u8 {
+fn handleMcpRequest(allocator: std.mem.Allocator, bsp: *BspClient, bsp_reader: *std.Io.Reader, options: Options, request: std.json.Value, shutdown: *bool) !?[]u8 {
     if (request != .object) return try mcpError(allocator, .null, -32600, "request must be an object");
     const object = request.object;
     const id = object.get("id") orelse std.json.Value.null;
@@ -311,7 +312,7 @@ fn handleMcpRequest(allocator: std.mem.Allocator, bsp: *BspClient, bsp_reader: *
         const params = try expectObject(params_value);
         const name = try requireStringValue(params.get("name"), "name");
         const args = params.get("arguments") orelse std.json.Value.null;
-        const result_json = dispatchTool(allocator, bsp, bsp_reader, name, args, shutdown) catch |err| {
+        const result_json = dispatchTool(allocator, bsp, bsp_reader, options, name, args, shutdown) catch |err| {
             const message = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
             return try mcpError(allocator, id, -32000, message);
         };
@@ -322,7 +323,7 @@ fn handleMcpRequest(allocator: std.mem.Allocator, bsp: *BspClient, bsp_reader: *
     return try mcpError(allocator, id, -32601, "unknown method");
 }
 
-fn dispatchTool(allocator: std.mem.Allocator, bsp: *BspClient, bsp_reader: *std.Io.Reader, name: []const u8, args: std.json.Value, shutdown: *bool) ![]u8 {
+fn dispatchTool(allocator: std.mem.Allocator, bsp: *BspClient, bsp_reader: *std.Io.Reader, options: Options, name: []const u8, args: std.json.Value, shutdown: *bool) ![]u8 {
     const request_id = getString(args, "request_id") orelse "affective-mcp-tool";
     if (std.mem.eql(u8, name, "connect")) return try bsp.dispatch(bsp_reader, try requests.connect(request_id));
     if (std.mem.eql(u8, name, "host_attach")) return try bsp.dispatch(bsp_reader, try hostAttachRequest(request_id, getString(args, "host_id") orelse "affective-mcp"));
@@ -330,6 +331,13 @@ fn dispatchTool(allocator: std.mem.Allocator, bsp: *BspClient, bsp_reader: *std.
     if (std.mem.eql(u8, name, "short_touch")) return try bsp.dispatch(bsp_reader, try requests.shortTouch(request_id));
     if (std.mem.eql(u8, name, "sense_observation")) return try bsp.dispatch(bsp_reader, try requests.senseObservationCamera(request_id, getString(args, "image_path") orelse return error.MissingImagePath));
     if (std.mem.eql(u8, name, "read_models_snapshot")) return try bsp.dispatch(bsp_reader, try requests.readModelsSnapshot(request_id));
+    if (std.mem.eql(u8, name, "memory_inspect_safe")) {
+        const snapshot = try bsp.dispatch(bsp_reader, try requests.readModelsSnapshot(request_id));
+        return try admin_tools.memoryInspectSafe(allocator, snapshot, args);
+    }
+    if (std.mem.eql(u8, name, "session_metadata_get")) return try admin_tools.metadataGet(allocator, bsp.io, options.brain_root);
+    if (std.mem.eql(u8, name, "session_metadata_set")) return try admin_tools.metadataSet(allocator, bsp.io, options.brain_root, args);
+    if (std.mem.eql(u8, name, "export_brain")) return try bsp.dispatch(bsp_reader, try requests.exportBrain(request_id, getString(args, "brain_file_path") orelse getString(args, "output_path") orelse return error.MissingBrainFilePath));
     if (std.mem.eql(u8, name, "conversation_text")) return try bsp.conversationText(bsp_reader, request_id, getString(args, "text") orelse return error.MissingText);
     if (std.mem.eql(u8, name, "brain_step")) return try bsp.dispatch(bsp_reader, try requests.brainStep(request_id));
     if (std.mem.eql(u8, name, "request_dream_time")) return try bsp.dispatch(bsp_reader, try requests.requestDreamTime(request_id, getString(args, "text") orelse ""));
@@ -350,6 +358,10 @@ fn tools(allocator: std.mem.Allocator) ![]const Tool {
         .{ .name = "short_touch", .description = "Send a short touch activation to the brain.", .schema_json = "{\"type\":\"object\",\"properties\":{\"request_id\":{\"type\":\"string\"}}}" },
         .{ .name = "sense_observation", .description = "Send a camera image observation to the brain.", .schema_json = "{\"type\":\"object\",\"required\":[\"image_path\"],\"properties\":{\"request_id\":{\"type\":\"string\"},\"image_path\":{\"type\":\"string\"}}}" },
         .{ .name = "read_models_snapshot", .description = "Read the brain's compact model snapshot.", .schema_json = "{\"type\":\"object\",\"properties\":{\"request_id\":{\"type\":\"string\"}}}" },
+        .{ .name = "memory_inspect_safe", .description = "Read privacy-aware memory/session counts without raw memory text.", .schema_json = "{\"type\":\"object\",\"properties\":{\"request_id\":{\"type\":\"string\"},\"include_text\":{\"type\":\"boolean\"}}}" },
+        .{ .name = "session_metadata_get", .description = "Read lightweight host session metadata such as active identity.", .schema_json = "{\"type\":\"object\",\"properties\":{}}" },
+        .{ .name = "session_metadata_set", .description = "Persist lightweight host session metadata such as active identity.", .schema_json = "{\"type\":\"object\",\"properties\":{\"active_identity\":{\"type\":\"string\"},\"continuity_thread\":{\"type\":\"string\"},\"notes\":{\"type\":\"string\"}}}" },
+        .{ .name = "export_brain", .description = "Export Brain-owned state to a portable .brain archive without host secrets.", .schema_json = "{\"type\":\"object\",\"required\":[\"brain_file_path\"],\"properties\":{\"request_id\":{\"type\":\"string\"},\"brain_file_path\":{\"type\":\"string\"},\"output_path\":{\"type\":\"string\"}}}" },
         .{ .name = "conversation_text", .description = "Run a synchronous conversation turn and return the brain's spoken response.", .schema_json = "{\"type\":\"object\",\"required\":[\"text\"],\"properties\":{\"request_id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}}}" },
         .{ .name = "brain_step", .description = "Run one embedded autonomy brain step.", .schema_json = "{\"type\":\"object\",\"properties\":{\"request_id\":{\"type\":\"string\"}}}" },
         .{ .name = "request_dream_time", .description = "Ask the brain to enter dream-time processing.", .schema_json = "{\"type\":\"object\",\"properties\":{\"request_id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}}}" },
@@ -467,7 +479,7 @@ test "tools/list includes TCP MCP tools" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const listed = try tools(arena.allocator());
-    const expected = [_][]const u8{ "connect", "host_attach", "user_text", "short_touch", "sense_observation", "read_models_snapshot", "conversation_text", "brain_step", "request_dream_time", "drain", "shutdown" };
+    const expected = [_][]const u8{ "connect", "host_attach", "user_text", "short_touch", "sense_observation", "read_models_snapshot", "memory_inspect_safe", "session_metadata_get", "session_metadata_set", "export_brain", "conversation_text", "brain_step", "request_dream_time", "drain", "shutdown" };
     for (expected) |name| {
         var found = false;
         for (listed) |tool| {

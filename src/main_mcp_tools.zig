@@ -18,6 +18,9 @@ pub fn tools(allocator: std.mem.Allocator) ![]const Tool {
         .{ .name = "request_dream_time", .description = "Enter Dream Time and deliver any resulting Brain-owned mailbox item.", .schema_json = "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}}}" },
         .{ .name = "brain_mode", .description = "Return the current Brain mode.", .schema_json = "{\"type\":\"object\",\"properties\":{}}" },
         .{ .name = "read_models_snapshot", .description = "Return compact read models derived from Brain event and memory state.", .schema_json = "{\"type\":\"object\",\"properties\":{}}" },
+        .{ .name = "memory_inspect_safe", .description = "Return privacy-aware memory/session counts without raw memory text.", .schema_json = "{\"type\":\"object\",\"properties\":{\"include_text\":{\"type\":\"boolean\"}}}" },
+        .{ .name = "session_metadata_get", .description = "Read lightweight host session metadata such as active identity.", .schema_json = "{\"type\":\"object\",\"properties\":{}}" },
+        .{ .name = "session_metadata_set", .description = "Persist lightweight host session metadata such as active identity.", .schema_json = "{\"type\":\"object\",\"properties\":{\"active_identity\":{\"type\":\"string\"},\"continuity_thread\":{\"type\":\"string\"},\"notes\":{\"type\":\"string\"}}}" },
         .{ .name = "set_runtime_option", .description = "Update persisted runtime or LLM quality preferences for the active brain.", .schema_json = "{\"type\":\"object\",\"properties\":{\"llm_quality\":{\"type\":\"string\",\"enum\":[\"frugal\",\"auto\",\"best\"]},\"reasoning_effort\":{\"type\":\"string\"},\"psyche_reasoning_effort\":{\"type\":\"string\"},\"ai_mode\":{\"type\":\"string\"},\"capacity\":{\"type\":\"object\",\"properties\":{\"activity_stack_max\":{\"type\":\"integer\"},\"focus_slots_max\":{\"type\":\"integer\"},\"memory_selected_max\":{\"type\":\"integer\"},\"memory_prefilter_max\":{\"type\":\"integer\"},\"candidate_actions_max\":{\"type\":\"integer\"},\"open_loops_soft_max\":{\"type\":\"integer\"},\"conversation_summaries_in_context_max\":{\"type\":\"integer\"},\"chat_context_tokens_max\":{\"type\":\"integer\"},\"dispatch_envelope_bytes_max\":{\"type\":\"integer\"},\"dispatch_event_count_max\":{\"type\":\"integer\"}}}}}" },
         .{ .name = "mailbox_list", .description = "List Brain-owned mailbox items.", .schema_json = "{\"type\":\"object\",\"properties\":{}}" },
         .{ .name = "mailbox_mark_read", .description = "Record that a mailbox item was read by the host.", .schema_json = "{\"type\":\"object\",\"required\":[\"mailbox_id\"],\"properties\":{\"mailbox_id\":{\"type\":\"string\"}}}" },
@@ -35,7 +38,7 @@ pub fn tools(allocator: std.mem.Allocator) ![]const Tool {
 }
 
 pub fn toolNames() []const []const u8 {
-    return &.{ "connect", "host_attach", "host_capability_manifest", "refresh_facial_expression_catalog", "send_experience_event", "user_text", "emoji_reaction", "request_dream_time", "brain_mode", "read_models_snapshot", "set_runtime_option", "mailbox_list", "mailbox_mark_read", "capability_status", "capability_status_batch", "export_brain", "import_brain" };
+    return &.{ "connect", "host_attach", "host_capability_manifest", "refresh_facial_expression_catalog", "send_experience_event", "user_text", "emoji_reaction", "request_dream_time", "brain_mode", "read_models_snapshot", "memory_inspect_safe", "session_metadata_get", "session_metadata_set", "set_runtime_option", "mailbox_list", "mailbox_mark_read", "capability_status", "capability_status_batch", "export_brain", "import_brain" };
 }
 
 test "mcp tools expose typed brain operations" {
@@ -51,6 +54,9 @@ test "mcp tools expose typed brain operations" {
         "request_dream_time",
         "brain_mode",
         "read_models_snapshot",
+        "memory_inspect_safe",
+        "session_metadata_get",
+        "session_metadata_set",
         "set_runtime_option",
         "mailbox_list",
         "mailbox_mark_read",

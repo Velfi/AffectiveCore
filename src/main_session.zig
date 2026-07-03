@@ -589,6 +589,71 @@ fn toEmbeddedString(bytes: []const u8) embedded.AffectiveCoreEmbeddedString {
     return .{ .ptr = if (bytes.len == 0) null else bytes.ptr, .len = bytes.len };
 }
 
+// In-process boot shim (see include/affective_core_session.h). Hosts that link
+// libaffective-core-session.a call affective_session_start to boot a loopback
+// BSP listener inside their own process instead of spawning an executable.
+const shim_no_listener: i64 = -1;
+var shim_listener_fd = std.atomic.Value(i64).init(shim_no_listener);
+
+export fn affective_session_start(config_json: ?[*:0]const u8) i32 {
+    // Session configuration arrives via the BSP session.create message on the
+    // TCP connection; the argument exists only to keep the ABI stable.
+    _ = config_json;
+    const listener_fd = openLoopbackListener(0) catch return -2;
+    if (shim_listener_fd.cmpxchgStrong(shim_no_listener, listener_fd, .acq_rel, .acquire) != null) {
+        _ = posix.system.close(listener_fd);
+        return -1;
+    }
+    const port = listenerPort(listener_fd) catch {
+        shim_listener_fd.store(shim_no_listener, .release);
+        _ = posix.system.close(listener_fd);
+        return -3;
+    };
+    const thread = std.Thread.spawn(.{}, shimServeLoop, .{ listener_fd, port }) catch {
+        shim_listener_fd.store(shim_no_listener, .release);
+        _ = posix.system.close(listener_fd);
+        return -4;
+    };
+    thread.detach();
+    return @intCast(port);
+}
+
+export fn affective_session_stop() void {
+    const fd = shim_listener_fd.swap(shim_no_listener, .acq_rel);
+    if (fd != shim_no_listener) {
+        _ = posix.system.close(@intCast(fd));
+    }
+}
+
+fn shimServeLoop(listener_fd: posix.fd_t, port: u16) void {
+    while (true) {
+        const stream_fd = acceptLoopbackClient(listener_fd) catch return;
+        serveShimClient(stream_fd, port);
+    }
+}
+
+fn serveShimClient(stream_fd: posix.fd_t, port: u16) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var io_threaded = std.Io.Threaded.init_single_threaded;
+    defer io_threaded.deinit();
+    const io = io_threaded.io();
+
+    const stream_address = net.IpAddress.parseIp4("127.0.0.1", port) catch unreachable;
+    var stream = net.Stream{ .socket = .{ .handle = stream_fd, .address = stream_address } };
+    defer stream.close(io);
+
+    var env = std.process.Environ.Map.init(allocator);
+    if (std.c.getenv("AFFECTIVE_BSP_DISPATCH_MODE")) |mode| {
+        env.put("AFFECTIVE_BSP_DISPATCH_MODE", std.mem.span(mode)) catch return;
+    }
+    var server = SessionServer.init(allocator, io, stream, port, &env) catch return;
+    defer server.deinit();
+    server.serve() catch {};
+}
+
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();

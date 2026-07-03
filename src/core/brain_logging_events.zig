@@ -112,7 +112,10 @@ pub fn logCapabilityResult(self: *Brain, proposal: chat_mod.ActionProposal, resu
         .tags = @constCast(&[_][]const u8{ "capability", @tagName(proposal.action) }),
     });
     const event_text = try std.fmt.allocPrint(self.allocator, "action={s}\nresult:\n{s}", .{ @tagName(proposal.action), result });
-    _ = try self.detectWantAchievements(event_text);
+    _ = self.detectWantAchievements(event_text) catch |err| {
+        self.traceError("want_achievement.post_action", err);
+        return;
+    };
 }
 
 pub fn logMaintenanceCapabilityRequested(self: *Brain, command: []const u8) !void {
